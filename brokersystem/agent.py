@@ -935,7 +935,7 @@ class Agent:
         return len(cls._automatic_built_agents) > 0
 
     @classmethod
-    def make(cls, name: str, **agent_kwargs: dict[str, Any]):
+    def make(cls, name: str, **agent_kwargs: Any):
         def make_func(func: Callable[..., dict[str, Any] | None]):
             # automatic_flag = "_automatic" in agent_kwargs and agent_kwargs["_automatic"]
             agent = AgentConstructor.make(name=name, job_func=func, kwargs=agent_kwargs)
