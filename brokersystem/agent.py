@@ -297,9 +297,8 @@ class TemplateContainer:
             super().__setattr__(key, value)
             return
         if not isinstance(value, ValueTemplate):
-            logger.error(
+            logger.exception(
                 f"You can only set ValueTemplate object(such as Number or Table) for input, condition and output: {key} ({type(value)})",
-                stack_info=True,
             )
             return
         self._container_dict[key] = value
@@ -394,12 +393,11 @@ class AgentInterface:
         if "make_config" not in self.func_dict and (
             self.secret_token == "" or self.name is None
         ):
-            logger.error("Secret_token and name should be specified.", stack_info=True)
+            logger.exception("Secret_token and name should be specified.")
             return
         if "job_func" not in self.func_dict:
-            logger.error(
-                "job execution function is required: Prepare a decorated function with @job_func.",
-                stack_info=True,
+            logger.exception(
+                "job execution function is required: Prepare a decorated function with @job_func."
             )
             return
         self.make_config()
@@ -408,9 +406,7 @@ class AgentInterface:
         if "make_config" in self.func_dict:
             self.func_dict["make_config"]()
             if self.name is None:
-                logger.error(
-                    "Agent's name should be set in config function", stack_info=True
-                )
+                logger.exception("Agent's name should be set in config function")
         config_dict = dict[str, Any]()
         for item_type in ["input", "condition", "output"]:
             config_dict[item_type] = getattr(
@@ -446,7 +442,7 @@ class AgentInterface:
 
     def cast(self, key: str, input_value: Any):
         if key not in self.input:
-            logger.error(f"{key} is not registered as input.", stack_info=True)
+            logger.exception(f"{key} is not registered as input.")
             raise Exception
         return self.input[key].cast(input_value)
 
@@ -674,12 +670,12 @@ class Agent:
                 logger.debug(f"TOKEN {self.access_token}")
                 return True
             elif "status" in response and response["status"] == "error":
-                logger.error(response["error_msg"], stack_info=True)
+                logger.exception(response["error_msg"])
                 break
             else:
                 logger.warning("Cannot connect to the broker system.")
             time.sleep(3)
-        logger.error("Stop try connecting to the broker system.", stack_info=True)
+        logger.exception("Stop try connecting to the broker system.")
         return False
 
     def heartbeat(self):
@@ -729,7 +725,7 @@ class Agent:
         try:
             logger.debug(f"Message: {message}")
             if "msg_type" not in message or "body" not in message:
-                logger.error(f"Wrong message format: {message}", stack_info=True)
+                logger.exception(f"Wrong message format: {message}")
                 return
             if message["msg_type"] == "negotiation_request":
                 self.process_negotiation_request(message["body"])
@@ -761,9 +757,8 @@ class Agent:
         if msg == "ok" and self.interface.has_func("negotiation"):
             msg, response = self.interface.func_dict["negotiation"](request, response)
             if msg not in ["ok", "need_revision", "ng"]:
-                logger.error(
-                    f"Negotiation func in {self.interface.name} returns a wrong msg: should be one of 'ok', 'need_revision' or 'ng'",
-                    stack_info=True,
+                logger.exception(
+                    f"Negotiation func in {self.interface.name} returns a wrong msg: should be one of 'ok', 'need_revision' or 'ng'"
                 )
 
         if msg == "ok" and self.interface.has_func("charge_func"):
@@ -826,7 +821,7 @@ class Agent:
             assert self.register_config()
             return self.post(uri, payload)
         elif response.status_code != 200:
-            logger.error(f"{response.status_code}: {uri} {payload}", stack_info=True)
+            logger.exception(f"{response.status_code}: {uri} {payload}")
             return {}
         obj = response.json()
         assert isinstance(obj, dict), f"Response was not a dict: {obj}"
@@ -849,7 +844,7 @@ class Agent:
             assert self.register_config()
             return self.get(uri)
         elif response.status_code != 200:
-            logger.error(response.status_code, stack_info=True)
+            logger.exception(response.status_code)
             if self.polling_interval < 10:
                 self.polling_interval += 1
             return {}
@@ -1373,7 +1368,7 @@ class Broker:
             logger.exception("Connection error on post request")
             raise
         if response.status_code != 200:
-            logger.error(response.status_code, stack_info=True)
+            logger.exception(response.status_code)
             return {}
         obj = response.json()
         assert isinstance(obj, dict), f"Response was not a dict: {obj}"
@@ -1392,7 +1387,7 @@ class Broker:
             return {}
 
         if response.status_code != 200:
-            logger.error(response.status_code, stack_info=True)
+            logger.exception(response.status_code)
             return {}
         obj = response.json()
         assert isinstance(obj, dict), f"Response was not a dict: {obj}"
