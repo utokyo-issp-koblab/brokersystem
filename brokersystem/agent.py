@@ -1352,9 +1352,16 @@ class Broker:
         return response
 
     @property
-    def header(self):
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        headers.update({"authorization": f"Basic {self.auth}"})
+    def header_auth(self) -> dict[str, str]:
+        return {"authorization": f"Basic {self.auth}"}
+
+    @property
+    def header(self) -> dict[str, str]:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            **self.header_auth,
+        }
         return headers
 
     def post(self, uri: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1383,11 +1390,13 @@ class Broker:
                 f"{self.broker_url}/api/v1/client/{uri}", headers=self.header
             )
         except requests.exceptions.ConnectionError:
-            logger.exception("Connection error on get request")
+            logger.exception(f"Connection error on get request; {uri=}")
             return {}
 
         if response.status_code != 200:
-            logger.exception(response.status_code)
+            logger.exception(
+                f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
+            )
             return {}
         obj = response.json()
         assert isinstance(obj, dict), f"Response was not a dict: {obj}"
@@ -1395,6 +1404,22 @@ class Broker:
             isinstance(k, str) for k in obj.keys()
         ), f"Some of response keys were not str: {obj.keys()}"
         return obj
+
+    def get_file(self, uri: str) -> requests.Response:
+        try:
+            response = requests.get(
+                f"{self.broker_url}/api/v1/client/{uri}", headers=self.header_auth
+            )
+        except requests.exceptions.ConnectionError:
+            logger.exception(f"Connection error on get request; {uri=}")
+            raise Exception("Connection error")
+
+        if response.status_code != 200:
+            logger.exception(
+                f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
+            )
+            raise Exception("Not 200")
+        return response
 
 
 class AgentManager:
