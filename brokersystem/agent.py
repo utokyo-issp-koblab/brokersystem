@@ -9,7 +9,7 @@ from datetime import timedelta
 from os import PathLike
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import pandas as pd
 import PIL.Image
@@ -18,39 +18,55 @@ from logzero import logger
 
 from . import __version__
 
+JsonDict = dict[str, Any]
+JsonPayload = dict[str, Any]
+BinaryData = bytes | bytearray | memoryview
+AgentFactory = Callable[[Callable[..., JsonDict | None]], Callable[..., "Agent"]]
+
 
 class ValueTemplate:
-    def __init__(self, unit: str | None = None):
-        self.type = self.__class__.__name__.lower()
-        self.unit = unit
-        self.constraint_dict = dict[str, Any]()
-        self.item_type = None
+    """Base schema item for inputs/conditions/outputs.
 
-    def set_constraint(self, key: str, value: Any):
+    Stores the value type, optional unit, and type-specific constraints.
+    Subclasses implement type-specific casting and output formatting.
+    """
+
+    def __init__(self, unit: str | None = None) -> None:
+        self.type: str = self.__class__.__name__.lower()
+        self.unit: str | None = unit
+        self.constraint_dict: dict[str, Any] = {}
+        self.item_type: str | None = None
+
+    def set_constraint(self, key: str, value: Any) -> None:
+        """Register a constraint if the value is not None."""
         if value is not None:
             self.constraint_dict[key] = value
 
     @property
-    def format_dict(self) -> dict[str, Any]:
-        format = {"@type": self.type, "@unit": self.unit}
+    def format_dict(self) -> JsonDict:
+        """Return the schema fragment used by the broker protocol."""
+        format_dict = {"@type": self.type, "@unit": self.unit}
         if self.item_type == "input":
-            format.update(
+            format_dict.update(
                 {"@necessity": "required", "@constraints": self.constraint_dict}
             )
         if self.item_type == "output":
-            format.update({})
-        return format
+            format_dict.update({})
+        return format_dict
 
-    def cast(self, value: Any):
+    def cast(self, value: Any) -> Any:
+        """Cast/validate a request value for this template."""
         return value
 
     def format_for_output(
-        self, value: Any, uploader: Callable[[str, bytes], dict[str, Any]]
-    ):
+        self, value: Any, uploader: Callable[[str, bytes], JsonDict]
+    ) -> tuple[Any, JsonDict]:
+        """Format an output value and return (value, format_dict)."""
         format_dict = {"@type": self.type, "@unit": self.unit}
         return value, format_dict
 
-    def set_item_type(self, item_type: str):
+    def set_item_type(self, item_type: str) -> None:
+        """Mark whether this template is used for input/condition/output."""
         self.item_type = item_type
 
     @classmethod
@@ -59,7 +75,8 @@ class ValueTemplate:
         value: Any,
         unit_callback_func: Callable[[str], str | None] | None = None,
         key: str | None = None,
-    ):
+    ) -> "ValueTemplate":
+        """Infer a template class from a Python value."""
         unit = None
         if isinstance(value, (int, float)):
             if unit_callback_func is not None and key is not None:
@@ -95,7 +112,10 @@ class ValueTemplate:
         assert False, f"Cannot find a matching value template... {value}:{type(value)}"
 
     @classmethod
-    def from_dict(cls, format_dict: dict[str, Any], unit_dict: dict[str, str | None]):
+    def from_dict(
+        cls, format_dict: JsonDict, unit_dict: dict[str, str | None]
+    ) -> "ValueTemplate":
+        """Build a template from a broker-side schema dict."""
         match format_dict["@type"]:
             case "number":
                 template = Number()
@@ -124,22 +144,25 @@ class ValueTemplate:
 
 
 class Number(ValueTemplate):
+    """Numeric template with optional min/max bounds."""
+
     def __init__(
         self,
         value: int | float | None = None,
         unit: str | None = None,
         min: int | float | None = None,
         max: int | float | None = None,
-    ):
+    ) -> None:
         super().__init__(unit)
         self.set_constraint("default", value)
         self.set_constraint("min", min)
         self.set_constraint("max", max)
 
-    def cast(self, value: Any):
+    def cast(self, value: Any) -> int | float:
+        """Cast to int/float and validate min/max constraints."""
         try:
             value = int(value)
-        except:
+        except Exception:
             value = float(value)
         assert not (
             "min" in self.constraint_dict and value < self.constraint_dict["min"]
@@ -151,24 +174,30 @@ class Number(ValueTemplate):
 
 
 class Range(ValueTemplate):
+    """Range template expressed as min/max for UI purposes."""
+
     def __init__(
         self,
         range_min: int | float | None = None,
         range_max: int | float | None = None,
         unit: str | None = None,
-    ):
+    ) -> None:
         super().__init__(unit)
         self.set_constraint("default", {"min": range_min, "max": range_max})
 
 
 class String(ValueTemplate):
-    def __init__(self, string: str | None = None):
+    """String template with an optional default value."""
+
+    def __init__(self, string: str | None = None) -> None:
         super().__init__()
         self.set_constraint("default", string)
 
 
 class File(ValueTemplate):
-    def __init__(self, file_type: str):
+    """File template supporting binary uploads and file ids."""
+
+    def __init__(self, file_type: str) -> None:
         super().__init__()
         if file_type in ["png", "jpeg", "gif"]:
             self.type = "image"
@@ -177,10 +206,11 @@ class File(ValueTemplate):
 
     def format_for_output(
         self,
-        value: bytes | PathLike[str] | str,
-        uploader: Callable[[str, bytes], dict[str, Any]],
-    ):
-        if isinstance(value, bytes | bytearray | memoryview):
+        value: BinaryData | PathLike[str] | str,
+        uploader: Callable[[str, bytes], JsonDict],
+    ) -> tuple[Any, JsonDict]:
+        """Upload a file and return the broker-side file id."""
+        if isinstance(value, (bytes, bytearray, memoryview)):
             binary_data = value
         else:
             try:
@@ -210,6 +240,8 @@ class File(ValueTemplate):
                 case _ as unknown_type:
                     raise NotImplementedError(f"Unknown file type: {unknown_type}")
 
+        if not isinstance(binary_data, bytes):
+            binary_data = bytes(binary_data)
         response = uploader(self.file_type, binary_data)
         logger.debug("upload result: %s", response)
         assert "file_id" in response
@@ -219,38 +251,46 @@ class File(ValueTemplate):
 
 
 class Choice(ValueTemplate):
-    def __init__(self, choices: Iterable[int | float | str], unit: str | None = None):
+    """Choice template with a fixed list of valid values."""
+
+    def __init__(
+        self, choices: Iterable[int | float | str], unit: str | None = None
+    ) -> None:
         super().__init__(unit)
         self.set_constraint("choices", list(choices))
 
-    def cast(self, value: Any):
+    def cast(self, value: Any) -> int | float | str:
+        """Cast input to numeric if possible and validate membership."""
         try:
             value = int(value)
-        except:
+        except Exception:
             pass
         try:
             value = float(value)
-        except:
+        except Exception:
             pass
         assert value in self.constraint_dict["choices"]
         return value
 
 
 class Table(ValueTemplate):
+    """Table template for tabular outputs (supports graph metadata)."""
+
     def __init__(
         self,
         unit_dict: Mapping[str, str | None],
         graph: Mapping[str, Any] | None = None,
-    ):
+    ) -> None:
         super().__init__(unit=None)
-        self.unit_dict = dict(unit_dict)
-        self.graph = graph
+        self.unit_dict: dict[str, str | None] = dict(unit_dict)
+        self.graph: Mapping[str, Any] | None = graph
 
-    def cast(self, value: Any):
+    def cast(self, value: Any) -> Any:
+        """Table inputs are validated by higher-level logic."""
         return value
 
     @property
-    def format_dict(self):
+    def format_dict(self) -> JsonDict:
         format_dict = super().format_dict
         format_dict["@table"] = list(self.unit_dict.keys())
         format_dict["_unit_dict"] = self.unit_dict
@@ -262,7 +302,10 @@ class Table(ValueTemplate):
             }
         return format_dict
 
-    def format_for_output(self, value, uploader):
+    def format_for_output(
+        self, value: Any, uploader: Callable[[str, bytes], JsonDict]
+    ) -> tuple[Any, JsonDict]:
+        """Convert a table value into the broker output schema."""
         format_dict = self.format_dict
         if isinstance(value, pd.DataFrame):
             value = value.to_dict(orient="list")
@@ -286,13 +329,15 @@ class Table(ValueTemplate):
 
 
 class TemplateContainer:
-    def __init__(self, item_type: str):
-        self._container_dict = dict[str, ValueTemplate]()
-        self._value_keys = set[str]()
-        self._table_keys = set[str]()
-        self._item_type = item_type
+    """Holds ValueTemplate objects for a specific schema section."""
 
-    def __setattr__(self, key: str, value: Any):
+    def __init__(self, item_type: str) -> None:
+        self._container_dict: dict[str, ValueTemplate] = {}
+        self._value_keys: set[str] = set()
+        self._table_keys: set[str] = set()
+        self._item_type: str = item_type
+
+    def __setattr__(self, key: str, value: Any) -> None:
         if key.startswith("_"):
             super().__setattr__(key, value)
             return
@@ -308,7 +353,8 @@ class TemplateContainer:
             self._value_keys.add(key)
         value.set_item_type(self._item_type)
 
-    def _get_template(self):
+    def _get_template(self) -> JsonDict:
+        """Serialize the container into the broker schema format."""
         match self._item_type:
             case "input":
                 format_keys = ["@type", "@unit", "@necessity", "@constraints"]
@@ -344,7 +390,8 @@ class TemplateContainer:
                     template_dict[fkey][key] = fvalue
         return template_dict
 
-    def _load(self, config_dict: Mapping[str, Any]):
+    def _load(self, config_dict: Mapping[str, Any]) -> None:
+        """Populate the container from a broker schema dict."""
         for key in config_dict["@keys"]:
             format_dict = {
                 prop_key: config_dict[prop_key][key]
@@ -357,7 +404,7 @@ class TemplateContainer:
                 self, key, ValueTemplate.from_dict(format_dict, config_dict["@unit"])
             )
 
-    def __contains__(self, key: str):
+    def __contains__(self, key: str) -> bool:
         return key in self._container_dict
 
     def __getitem__(self, key: str) -> ValueTemplate:
@@ -365,30 +412,36 @@ class TemplateContainer:
 
 
 class ValueContainer:
-    def __init__(self, value_dict: Mapping[str, Any]):
-        self._container_dict = dict(value_dict)
+    """Simple accessor wrapper for broker result dicts."""
 
-    def __getattr__(self, key: str):
+    def __init__(self, value_dict: Mapping[str, Any]) -> None:
+        self._container_dict: dict[str, Any] = dict(value_dict)
+
+    def __getattr__(self, key: str) -> Any:
         if key.startswith("_"):
             raise AttributeError(f"{key}")
         return self._container_dict[key]
 
-    def __getitem__(self, key: str):
+    def __getitem__(self, key: str) -> Any:
         return self._container_dict[key]
 
 
 class AgentInterface:
-    def __init__(self):
-        self.secret_token = ""
-        self.name: str | None = None
-        self.charge = 10000
-        self.convention = ""
-        self.description = ""
-        self.input = TemplateContainer("input")
-        self.condition = TemplateContainer("condition")
-        self.output = TemplateContainer("output")
+    """In-memory representation of agent settings and schemas."""
 
-    def prepare(self, func_dict: Mapping[str, Callable[..., Any]]):
+    def __init__(self) -> None:
+        self.secret_token: str = ""
+        self.name: str | None = None
+        self.charge: int = 10000
+        self.convention: str = ""
+        self.description: str = ""
+        self.input: TemplateContainer = TemplateContainer("input")
+        self.condition: TemplateContainer = TemplateContainer("condition")
+        self.output: TemplateContainer = TemplateContainer("output")
+        self.func_dict: dict[str, Callable[..., Any]] = {}
+
+    def prepare(self, func_dict: Mapping[str, Callable[..., Any]]) -> None:
+        """Validate required agent hooks and refresh config templates."""
         self.func_dict = dict(func_dict)
         if "make_config" not in self.func_dict and (
             self.secret_token == "" or self.name is None
@@ -402,7 +455,8 @@ class AgentInterface:
             return
         self.make_config()
 
-    def make_config(self, for_registration: bool = False):
+    def make_config(self, for_registration: bool = False) -> JsonDict:
+        """Build the agent config payload sent to the broker."""
         if "make_config" in self.func_dict:
             self.func_dict["make_config"]()
             if self.name is None:
@@ -428,7 +482,8 @@ class AgentInterface:
     def has_func(self, func_name: str) -> bool:
         return func_name in self.func_dict
 
-    def validate(self, input_dict: dict[str, Any]):
+    def validate(self, input_dict: JsonDict) -> tuple[str, JsonDict]:
+        """Validate a request payload and return (msg, input_template)."""
         template_dict = self.input._get_template()
         msg = "ok"
         for key in template_dict["@keys"]:
@@ -440,7 +495,8 @@ class AgentInterface:
                     msg = "need_revision"
         return msg, template_dict
 
-    def cast(self, key: str, input_value: Any):
+    def cast(self, key: str, input_value: Any) -> Any:
+        """Cast a request field according to its template."""
         if key not in self.input:
             logger.exception(f"{key} is not registered as input.")
             raise Exception
@@ -448,9 +504,10 @@ class AgentInterface:
 
     def format_for_output(
         self,
-        result_dict: dict[str, Any],
-        uploader: Callable[[str, bytes], dict[str, Any]],
-    ):
+        result_dict: JsonDict,
+        uploader: Callable[[str, bytes], JsonDict],
+    ) -> JsonDict:
+        """Convert raw job results to the broker output schema."""
         output_dict = {
             "@unit": {},
             "@type": {},
@@ -494,9 +551,11 @@ class AgentInterface:
 
 
 class DummyJob:
+    """Fallback job used during local config generation."""
+
     _to_show_i_am_job_class = True
 
-    def __init__(self, request_params: Any, config: dict[str, str]):
+    def __init__(self, request_params: Any, config: dict[str, str]) -> None:
         class DummyAgentInterface:
             def __init__(self):
                 self.secret_token = config["secret_token"]
@@ -513,35 +572,38 @@ class DummyJob:
         self,
         msg: str | None = None,
         progress: float | None = None,
-        result: dict[str, Any] | None = None,
-    ):
+        result: JsonDict | None = None,
+    ) -> None:
         logger.info(f"[DUMMY JOB] REPORT: {msg}, {progress}, {result}")
 
-    def __getitem__(self, key: str):
+    def __getitem__(self, key: str) -> int:
         return 0
 
-    def __contains__(self, key: str):
+    def __contains__(self, key: str) -> bool:
         return True
 
 
 class Job:
+    """Runtime job wrapper used by agent job functions."""
+
     _to_show_i_am_job_class = True
 
-    def __init__(self, agent: "Agent", negotiation_id: str, request: dict[str, Any]):
+    def __init__(self, agent: "Agent", negotiation_id: str, request: JsonDict) -> None:
         self._agent = agent
         self._negotiation_id = negotiation_id
         self._request = request
-        self._result_dict = {}
-        self._status = "init"
-        self.id = negotiation_id
+        self._result_dict: JsonDict = {}
+        self._status: str = "init"
+        self.id: str = negotiation_id
 
     def report(
         self,
         msg: str | None = None,
         progress: float | None = None,
-        result: dict[str, Any] | None = None,
-    ):
-        payload = dict[str, Any](
+        result: JsonDict | None = None,
+    ) -> None:
+        """Post a progress or result update to the broker."""
+        payload: JsonDict = dict(
             negotiation_id=self._negotiation_id, status=self._status
         )
         if msg is not None:
@@ -559,10 +621,12 @@ class Job:
 
         self._agent.post("report", payload)
 
-    def msg(self, msg: str):
+    def msg(self, msg: str) -> None:
+        """Send a message-only update."""
         self.report(msg=msg)
 
-    def progress(self, progress: float, msg: str | None = None):
+    def progress(self, progress: float, msg: str | None = None) -> None:
+        """Send a progress update (0..1)."""
         self.report(progress=progress, msg=msg)
 
     def periodic_report(
@@ -571,7 +635,8 @@ class Job:
         interval: timedelta = timedelta(seconds=2),
         callback_func: Callable[..., str] | None = None,
         **kwargs: Any,
-    ):
+    ) -> None:
+        """Send periodic progress updates until job completion."""
         if "start_time" not in kwargs:
             kwargs["start_time"] = time.perf_counter()
         if self._status not in ["done", "error"]:
@@ -596,30 +661,36 @@ class Job:
             timer.daemon = True
             timer.start()
 
-    def __getitem__(self, key: str):
+    def __getitem__(self, key: str) -> Any:
         return self._agent.interface.cast(key, self._request[key])
 
-    def __contains__(self, key: str):
+    def __contains__(self, key: str) -> bool:
         return key in self._request
 
-    def _set_status(self, status: str):
+    def _set_status(self, status: str) -> None:
         self._status = status
 
 
 class Agent:
+    """Agent runtime that connects to broker and handles negotiation/contract flow."""
+
     RESTART_INTERVAL_CRITERIA = 30
     HEARTBEAT_INTERVAL = 2
-    _automatic_built_agents = dict[str, "Agent"]()
+    _automatic_built_agents: dict[str, "Agent"] = {}
 
-    def __init__(self, broker_url: str):
+    def __init__(self, broker_url: str) -> None:
         self._to_show_i_am_agent_instance = True
-        self.broker_url = broker_url
-        self.access_token = None
-        self.agent_funcs = {}
-        self.running = False
-        self.interface = AgentInterface()
+        self.broker_url: str = broker_url
+        self.access_token: str | None = None
+        self.agent_funcs: dict[str, Callable[..., Any]] = {}
+        self.running: bool = False
+        self.interface: AgentInterface = AgentInterface()
+        self.auth: str = ""
+        self.polling_interval: int = 0
+        self.last_heartbeat: float = 0.0
 
-    def run(self, _automatic: bool = False):
+    def run(self, _automatic: bool = False) -> None:
+        """Start the agent loop and block until shutdown if not automatic."""
         if self.running:
             return
         self.interface.prepare(self.agent_funcs)
@@ -640,7 +711,8 @@ class Agent:
                     self.goodbye()
 
     @classmethod
-    def start(cls):
+    def start(cls) -> None:
+        """Start all auto-built agents and block until interrupted."""
         agent_list = list[Agent]()
         try:
             for agent in cls._automatic_built_agents.values():
@@ -652,10 +724,12 @@ class Agent:
             for agent in agent_list:
                 agent.goodbye()
 
-    def goodbye(self):
+    def goodbye(self) -> None:
+        """Stop agent loops and allow threads to exit."""
         self.running = False
 
-    def register_config(self):
+    def register_config(self) -> bool:
+        """Register agent config and obtain an access token."""
         for _ in range(5):
             response = self.post(
                 "config",
@@ -678,7 +752,8 @@ class Agent:
         logger.exception("Stop try connecting to the broker system.")
         return False
 
-    def heartbeat(self):
+    def heartbeat(self) -> None:
+        """Monitor heartbeat and trigger reconnection if needed."""
         restart_timer = None
         while self.running:
             if (
@@ -698,7 +773,8 @@ class Agent:
                 restart_timer = None
             time.sleep(self.HEARTBEAT_INTERVAL)
 
-    def connect(self):
+    def connect(self) -> None:
+        """Poll the agent message box and dispatch handlers."""
         while self.running:
             self.last_heartbeat = time.perf_counter()
             try:
@@ -712,6 +788,7 @@ class Agent:
             time.sleep(self.polling_interval)
 
     def check_msgbox(self) -> list[Any]:
+        """Fetch queued messages from the broker."""
         response = self.get("msgbox")
         if len(response) > 0:
             messages = response["messages"]
@@ -721,7 +798,8 @@ class Agent:
             return messages
         return []
 
-    def process_message(self, message: Mapping[str, Any]):
+    def process_message(self, message: Mapping[str, Any]) -> None:
+        """Dispatch a broker message to the appropriate handler."""
         try:
             logger.debug(f"Message: {message}")
             if "msg_type" not in message or "body" not in message:
@@ -736,7 +814,8 @@ class Agent:
         except:
             logger.exception(f"Error occured during process_message; {message=}")
 
-    def process_negotiation_request(self, body: Mapping[str, Any]):
+    def process_negotiation_request(self, body: Mapping[str, Any]) -> None:
+        """Respond with config to a negotiation request."""
         negotiation_id = body["negotiation_id"]
         response = self.interface.make_config()
         self.post(
@@ -748,7 +827,8 @@ class Agent:
             },
         )
 
-    def process_negotiation(self, body: Mapping[str, Any]):
+    def process_negotiation(self, body: Mapping[str, Any]) -> None:
+        """Validate input and respond to a negotiation request."""
         negotiation_id = body["negotiation_id"]
         response = self.interface.make_config()
         request = body["request"]
@@ -771,7 +851,8 @@ class Agent:
             {"msg": msg, "negotiation_id": negotiation_id, "response": response},
         )
 
-    def process_contract(self, msg: Mapping[str, Any]):
+    def process_contract(self, msg: Mapping[str, Any]) -> None:
+        """Run the job function and report progress/results."""
         st = time.perf_counter()
         negotiation_id = msg["negotiation_id"]
         request = msg["request"]
@@ -793,7 +874,8 @@ class Agent:
             job.report(msg="Error occured during the job.", progress=-1)
         logger.debug(f"{negotiation_id} took {time.perf_counter()-st:.3f} s.")
 
-    def header(self, basic_auth: bool = False, upload: bool = False):
+    def header(self, basic_auth: bool = False, upload: bool = False) -> JsonDict:
+        """Return request headers for JSON or multipart uploads."""
         if upload:
             headers = {}
         else:
@@ -805,9 +887,8 @@ class Agent:
 
         return headers
 
-    def post(
-        self, uri: str, payload: dict[str, Any], basic_auth: bool = False
-    ) -> dict[str, Any]:
+    def post(self, uri: str, payload: JsonDict, basic_auth: bool = False) -> JsonDict:
+        """POST to the agent API and return JSON response."""
         try:
             response = requests.post(
                 f"{self.broker_url}/api/v1/agent/{uri}",
@@ -830,7 +911,8 @@ class Agent:
         ), f"Some of response keys were not str: {obj.keys()}"
         return obj
 
-    def get(self, uri: str, basic_auth: bool = False) -> dict[str, Any]:
+    def get(self, uri: str, basic_auth: bool = False) -> JsonDict:
+        """GET from the agent API and return JSON response."""
         try:
             response = requests.get(
                 f"{self.broker_url}/api/v1/agent/{uri}", headers=self.header(basic_auth)
@@ -856,7 +938,8 @@ class Agent:
         ), f"Some of response keys were not str: {obj.keys()}"
         return obj
 
-    def upload(self, file_type: str, binary_data: bytes) -> dict[str, Any]:
+    def upload(self, file_type: str, binary_data: bytes) -> JsonDict:
+        """Upload a binary payload and return the broker file id."""
         file_name = "__file_name__"
         mime_dict = {
             "png": "image/png",
@@ -879,11 +962,14 @@ class Agent:
             return {}
         return response.json()
 
-    def register_func(self, func_name: str, func: Callable[..., Any]):
+    def register_func(self, func_name: str, func: Callable[..., Any]) -> None:
+        """Register a handler function on the agent."""
         self.agent_funcs[func_name] = func
 
     ##### wrapper functions #####
-    def config(self, func: Callable[[], None]):
+    def config(self, func: Callable[[], None]) -> Callable[[], None]:
+        """Decorator for the configuration builder."""
+
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
 
@@ -893,24 +979,30 @@ class Agent:
     def negotiation(
         self,
         func: Callable[
-            [dict[str, Any], dict[str, Any]],
-            tuple[Literal["ok", "need_revision", "ng"], dict[str, Any]],
+            [JsonDict, JsonDict],
+            tuple[Literal["ok", "need_revision", "ng"], JsonDict],
         ],
-    ):
+    ) -> Callable[..., Any]:
+        """Decorator for custom negotiation logic."""
+
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
 
         self.register_func("negotiation", wrapper)
         return wrapper
 
-    def charge_func(self, func: Callable[[dict[str, Any]], int]):
+    def charge_func(self, func: Callable[[JsonDict], int]) -> Callable[..., Any]:
+        """Decorator for custom charge calculation."""
+
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
 
         self.register_func("charge_func", wrapper)
         return wrapper
 
-    def job_func(self, func: Callable[..., dict[str, Any] | None]):
+    def job_func(self, func: Callable[..., JsonDict | None]) -> Callable[..., Any]:
+        """Decorator for the main job function."""
+
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
 
@@ -918,7 +1010,8 @@ class Agent:
         return wrapper
 
     @classmethod
-    def _automatic_run(cls):
+    def _automatic_run(cls) -> list["Agent"]:
+        """Run auto-built agents without interactive input."""
         agent_list = list[Agent]()
         for agent in cls._automatic_built_agents.values():
             agent.run(_automatic=True)
@@ -926,12 +1019,15 @@ class Agent:
         return agent_list
 
     @classmethod
-    def _is_automatic_mode(cls):
+    def _is_automatic_mode(cls) -> bool:
+        """Return True if any auto-built agents exist."""
         return len(cls._automatic_built_agents) > 0
 
     @classmethod
-    def make(cls, name: str, **agent_kwargs: Any):
-        def make_func(func: Callable[..., dict[str, Any] | None]):
+    def make(cls, name: str, **agent_kwargs: Any) -> AgentFactory:
+        """Decorator-based factory for auto-built agents."""
+
+        def make_func(func: Callable[..., JsonDict | None]):
             # automatic_flag = "_automatic" in agent_kwargs and agent_kwargs["_automatic"]
             agent = AgentConstructor.make(name=name, job_func=func, kwargs=agent_kwargs)
             # agent.run(_automatic=automatic_flag)
@@ -950,7 +1046,10 @@ class Agent:
         return make_func
 
     @classmethod
-    def add_config(cls, broker_url: str | None = None, secret_token: str | None = None):
+    def add_config(
+        cls, broker_url: str | None = None, secret_token: str | None = None
+    ) -> Callable[..., Callable[..., Any]]:
+        """Decorator to inject broker_url/secret_token into a job func."""
         config_dict = dict[str, str]()
         if broker_url is not None:
             config_dict["broker_url"] = broker_url
@@ -1026,26 +1125,29 @@ class Agent:
 
 
 class AgentConstructor:
+    """Builds agent config interactively and wires it to an Agent instance."""
+
     def __init__(
         self,
         name: str,
-        job_func: Callable[..., dict[str, Any] | None],
+        job_func: Callable[..., JsonDict | None],
         kwargs: Mapping[str, Any],
-    ):
-        self.name = name
-        self.job_func = job_func
-        self.kwargs = dict(kwargs)
-        self.config = dict[str, Any]()
-        self.config_changed = False
-        self.agent = None
+    ) -> None:
+        self.name: str = name
+        self.job_func: Callable[..., JsonDict | None] = job_func
+        self.kwargs: dict[str, Any] = dict(kwargs)
+        self.config: JsonDict = {}
+        self.config_changed: bool = False
+        self.agent: Agent | None = None
 
     @classmethod
     def make(
         cls,
         name: str,
-        job_func: Callable[..., dict[str, Any] | None],
+        job_func: Callable[..., JsonDict | None],
         kwargs: Mapping[str, Any],
-    ):
+    ) -> Agent:
+        """Create a configured Agent from a job function."""
         constructor = cls(name, job_func, kwargs)
         constructor.load_config()
         constructor.config["name"] = name
@@ -1062,7 +1164,8 @@ class AgentConstructor:
         constructor.agent.register_func("job_func", constructor.agent_job_func)
         return constructor.agent
 
-    def investigate_job_func(self):
+    def investigate_job_func(self) -> None:
+        """Run the job function once to infer input/output schemas."""
         input_params = self.fill_input_params()
         if self.config_changed:
             self.dump_config()
@@ -1079,21 +1182,25 @@ class AgentConstructor:
             result = {}
         self.fill_output_format(result)
 
-    def fill_input_params(self):
+    def fill_input_params(self) -> JsonDict:
+        """Interactively populate input schema and return defaults."""
         if "input" not in self.config:
             self.config["input"] = {"@keys": []}
         if "condition" not in self.config:
             self.config["condition"] = {"@keys": []}
+        input_config = cast(dict[str, Any], self.config.get("input", {}))
+        constraints = cast(dict[str, Any], input_config.get("@constraints", {}))
         container = TemplateContainer("input")
         updated = False
-        keys_to_remove = set(self.config["input"]["@keys"])
+        input_keys = cast(list[str], input_config.get("@keys", []))
+        keys_to_remove = set(input_keys)
         default_value_dict = dict[str, Any]()
         for key in self.job_func_keys:
             if key in ["job"]:
                 continue
             if key in keys_to_remove:
                 keys_to_remove.discard(key)
-            if key not in self.config["input"]["@keys"]:
+            if key not in input_keys:
                 if not updated:
                     print("")
                     print("--- Input ---")
@@ -1107,20 +1214,19 @@ class AgentConstructor:
                     ]
                 self.config_changed = True
             else:
-                if "default" in self.config["input"]["@constraints"][key]:
-                    default_value_dict[key] = self.config["input"]["@constraints"][key][
-                        "default"
-                    ]
-                elif "choices" in self.config["input"]["@constraints"][key]:
-                    default_value_dict[key] = self.config["input"]["@constraints"][key][
-                        "choices"
-                    ][0]
+                constraint = cast(dict[str, Any], constraints.get(key, {}))
+                if "default" in constraint:
+                    default_value_dict[key] = constraint["default"]
+                elif "choices" in constraint:
+                    default_value_dict[key] = constraint["choices"][0]
         if updated:
             self.merge_config_and_container("input", container)
         self.remove_unused_keys("input", keys_to_remove)
         return default_value_dict
 
-    def merge_config_and_container(self, item_type: str, container: TemplateContainer):
+    def merge_config_and_container(
+        self, item_type: str, container: TemplateContainer
+    ) -> None:
         template_dict = container._get_template()
         for key, value in template_dict.items():
             assert key.startswith("@"), "Property keys should start with @"
@@ -1134,7 +1240,7 @@ class AgentConstructor:
                 s = set(self.config[item_type][key])
                 self.config[item_type][key] = list(s.union(value))
 
-    def remove_unused_keys(self, item_type: str, keys_to_remove: set[str]):
+    def remove_unused_keys(self, item_type: str, keys_to_remove: set[str]) -> None:
         if len(keys_to_remove) == 0:
             return
         for property_key in self.config[item_type]:
@@ -1148,7 +1254,8 @@ class AgentConstructor:
                     s.discard(key)
                     self.config[item_type][property_key] = list(s)
 
-    def fill_output_format(self, result: dict[str, Any]):
+    def fill_output_format(self, result: JsonDict) -> None:
+        """Infer output schema from a job function result."""
         if "output" not in self.config:
             self.config["output"] = {"@keys": []}
         updated = False
@@ -1178,7 +1285,8 @@ class AgentConstructor:
             self.merge_config_and_container("output", container)
         self.remove_unused_keys("output", keys_to_remove)
 
-    def ask_input_format(self, key: str):
+    def ask_input_format(self, key: str) -> ValueTemplate:
+        """Prompt for input template details when missing in config."""
         while True:
             value_type = input(
                 f"Select the value type of \"{key}\" ('n':Number, 's': String, 'c': Choice):"
@@ -1210,13 +1318,16 @@ class AgentConstructor:
             )
             print("")
             return String(string=default_value)
+        raise AssertionError("Unreachable input format branch")
 
-    def ask_output_format(self, key: str):
+    def ask_output_format(self, key: str) -> str | None:
+        """Prompt for output unit metadata."""
         unit = input(f'Unit of "{key}" (empty if none) > ')
         print("")
         return unit
 
-    def load_config(self):
+    def load_config(self) -> None:
+        """Load config JSON if it exists; otherwise start fresh."""
         self.config_changed = False
         try:
             with self.config_path.open() as f:
@@ -1224,7 +1335,8 @@ class AgentConstructor:
         except:
             self.config = {}
 
-    def fill_config(self):
+    def fill_config(self) -> None:
+        """Fill required top-level config values (broker_url, secret_token, etc.)."""
         broker_url = self.fill_config_item("broker_url")
         assert broker_url.startswith("http"), "broker_url should be properly specified."
         secret_token = self.fill_config_item("secret_token")
@@ -1233,7 +1345,8 @@ class AgentConstructor:
         assert charge > 0, "charge should be larger than 0"
         _ = self.fill_config_item("description")
 
-    def fill_config_item(self, key: str, astype: type = str):
+    def fill_config_item(self, key: str, astype: type = str) -> Any:
+        """Read a config item from decorator, kwargs, or user input."""
         if hasattr(self.job_func, "_additional_config") and key in getattr(
             self.job_func, "_additional_config"
         ):
@@ -1249,7 +1362,8 @@ class AgentConstructor:
             self.config_changed = True
         return self.config[key]
 
-    def make_config_func(self):
+    def make_config_func(self) -> None:
+        """Apply loaded config values to the Agent instance."""
         assert self.agent is not None, "Agent has not been properly prepared."
         keys = ["name", "secret_token", "charge", "description"]
         for key in keys:
@@ -1259,7 +1373,8 @@ class AgentConstructor:
         for item_type in item_types:
             getattr(self.agent, item_type)._load(self.config[item_type])
 
-    def agent_job_func(self, job: Job):
+    def agent_job_func(self, job: Job) -> JsonDict:
+        """Adapter that calls the original job function."""
         assert self.agent is not None, "Agent has not been properly prepared."
         input_params = self.job_to_params(job)
         if "estimated_time" in self.kwargs:
@@ -1269,14 +1384,15 @@ class AgentConstructor:
             result = {}
         return result
 
-    def job_to_params(self, job: Job):
+    def job_to_params(self, job: Job) -> JsonDict:
         input_keys = self.job_func_keys
         params = {key: job[key] for key in input_keys if key in job}
         if "job" in input_keys:
             params["job"] = job
         return params
 
-    def dump_config(self):
+    def dump_config(self) -> None:
+        """Persist config JSON to disk."""
         self.config_path.parent.mkdir(exist_ok=True)
 
         with self.config_path.open("w") as f:
@@ -1284,23 +1400,25 @@ class AgentConstructor:
         self.config_changed = False
 
     @property
-    def job_func_keys(self):
+    def job_func_keys(self) -> list[str]:
         if hasattr(self.job_func, "_original_keys"):
             return getattr(self.job_func, "_original_keys")
         return list(inspect.signature(self.job_func).parameters)
 
     @property
-    def config_path(self):
+    def config_path(self) -> Path:
         return Path(f"./configs/{self.name}.json")
 
 
 class Broker:
+    """Client for the broker-side API used by end users."""
+
     def __init__(
         self,
         job: Job | None = None,
         broker_url: str | None = None,
         auth: str | None = None,
-    ):
+    ) -> None:
         if job is None:
             assert broker_url is not None and auth is not None
             self.broker_url = broker_url
@@ -1311,7 +1429,8 @@ class Broker:
         else:
             raise TypeError
 
-    def ask(self, agent_id: str, request: dict[str, Any]) -> dict[str, Any]:
+    def ask(self, agent_id: str, request: JsonDict) -> JsonDict:
+        """Full flow helper: negotiate -> contract -> wait for result."""
         response = self.negotiate(agent_id, request)
         if "negotiation_id" not in response:
             raise Exception(f"Cannot communicate with Agent {agent_id}")
@@ -1328,15 +1447,23 @@ class Broker:
 
         return result
 
-    def negotiate(self, agent_id: str, request: dict[str, Any]):
+    def negotiate(self, agent_id: str, request: JsonDict) -> JsonDict:
+        """Start negotiation and send the first request."""
         response = self.post("negotiate", {"agent_id": agent_id, "request": request})
         return response
 
-    def contract(self, negotiation_id: str):
+    def begin_negotiation(self, agent_id: str) -> JsonDict:
+        """Begin negotiation to fetch input schema before sending a request."""
+        response = self.post("negotiation/begin", {"agent_id": agent_id})
+        return response
+
+    def contract(self, negotiation_id: str) -> JsonDict:
+        """Request a contract for a negotiated job."""
         response = self.post("contract", {"negotiation_id": negotiation_id})
         return response
 
-    def get_result(self, negotiation_id: str):
+    def get_result(self, negotiation_id: str) -> JsonDict:
+        """Poll the broker for results until done/error."""
         msg = ""
         while True:
             response = self.get(f"result/{negotiation_id}")
@@ -1364,7 +1491,8 @@ class Broker:
         }
         return headers
 
-    def post(self, uri: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def post(self, uri: str, payload: JsonDict) -> JsonDict:
+        """POST to the client API and return JSON."""
         try:
             response = requests.post(
                 f"{self.broker_url}/api/v1/client/{uri}",
@@ -1384,7 +1512,8 @@ class Broker:
         ), f"Some of response keys were not str: {obj.keys()}"
         return obj
 
-    def get(self, uri: str) -> dict[str, Any]:
+    def get(self, uri: str) -> JsonDict:
+        """GET from the client API and return JSON."""
         try:
             response = requests.get(
                 f"{self.broker_url}/api/v1/client/{uri}", headers=self.header
@@ -1406,6 +1535,7 @@ class Broker:
         return obj
 
     def get_file(self, uri: str) -> requests.Response:
+        """Download a file from the client API and return a raw Response."""
         try:
             response = requests.get(
                 f"{self.broker_url}/api/v1/client/{uri}", headers=self.header_auth
@@ -1422,15 +1552,182 @@ class Broker:
         return response
 
 
+class BrokerAdmin:
+    """Client for broker automation endpoints (/api/v1/broker)."""
+
+    def __init__(self, broker_url: str, token: str) -> None:
+        self.broker_url = broker_url
+        self.token = token
+
+    @property
+    def header(self) -> dict[str, str]:
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "authorization": f"Token {self.token}",
+        }
+
+    @property
+    def header_auth(self) -> dict[str, str]:
+        return {"authorization": f"Token {self.token}"}
+
+    def _request_json(
+        self, method: str, uri: str, payload: JsonDict | None = None
+    ) -> JsonDict:
+        try:
+            response = requests.request(
+                method,
+                f"{self.broker_url}/api/v1/broker/{uri}",
+                json=payload,
+                headers=self.header,
+            )
+        except requests.exceptions.ConnectionError:
+            logger.exception(f"Connection error on {method} request; {uri=}")
+            return {}
+
+        if response.status_code != 200:
+            logger.exception(
+                f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
+            )
+            return {}
+
+        obj = response.json()
+        assert isinstance(obj, dict), f"Response was not a dict: {obj}"
+        assert all(
+            isinstance(k, str) for k in obj.keys()
+        ), f"Some of response keys were not str: {obj.keys()}"
+        return obj
+
+    def _request_raw(self, uri: str) -> requests.Response:
+        try:
+            response = requests.get(
+                f"{self.broker_url}/api/v1/broker/{uri}", headers=self.header_auth
+            )
+        except requests.exceptions.ConnectionError:
+            logger.exception(f"Connection error on get request; {uri=}")
+            raise Exception("Connection error")
+
+        if response.status_code != 200:
+            logger.exception(
+                f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
+            )
+            raise Exception("Not 200")
+
+        return response
+
+    # Board + results
+    def board(self) -> JsonDict:
+        """Return the board listing (agents + active flag)."""
+        return self._request_json("GET", "board")
+
+    def list_results(self) -> JsonDict:
+        """Return the result list for the current user."""
+        return self._request_json("GET", "results")
+
+    # Agents
+    def list_agents(self) -> JsonDict:
+        """Return agents visible to the current user."""
+        return self._request_json("GET", "agents")
+
+    def get_agent(self, agent_id: str) -> JsonDict:
+        """Return details for a specific agent."""
+        return self._request_json("GET", f"agents/{agent_id}")
+
+    def create_agent(self, name: str, agent_type: str, category: str) -> JsonDict:
+        """Create a new agent owned by the current user."""
+        payload = {
+            "servicer_agent": {"name": name, "type": agent_type, "category": category}
+        }
+        return self._request_json("POST", "agents", payload)
+
+    def update_agent(self, agent_id: str, **fields: Any) -> JsonDict:
+        """Update an existing agent (name/type/category/valid)."""
+        return self._request_json(
+            "PATCH", f"agents/{agent_id}", {"servicer_agent": fields}
+        )
+
+    def delete_agent(self, agent_id: str) -> JsonDict:
+        """Delete an agent owned by the current user."""
+        return self._request_json("DELETE", f"agents/{agent_id}")
+
+    def download_agent_template(self, agent_id: str, simple: bool = False) -> str:
+        """Download the agent Python template as text."""
+        path = (
+            f"agents/{agent_id}/template_simple"
+            if simple
+            else f"agents/{agent_id}/template"
+        )
+        response = self._request_raw(path)
+        return response.text
+
+    # Access tokens
+    def list_access_tokens(self) -> JsonDict:
+        """List broker access tokens for the current user."""
+        return self._request_json("GET", "access_tokens")
+
+    def issue_access_token(self, label: str) -> JsonDict:
+        """Issue a new access token with a label."""
+        return self._request_json("POST", "access_tokens", {"label": label})
+
+    def revoke_access_token(self, token: str) -> JsonDict:
+        """Revoke an existing access token."""
+        return self._request_json("DELETE", f"access_tokens/{token}")
+
+    # User profile
+    def get_user(self) -> JsonDict:
+        """Return the current user's profile."""
+        return self._request_json("GET", "user")
+
+    def create_user(self, name: str, affiliation: str | None = None) -> JsonDict:
+        """Create a user record for the current auth id if missing."""
+        payload = {"user": {"name": name, "affiliation": affiliation}}
+        return self._request_json("POST", "user", payload)
+
+    def update_user(
+        self, name: str | None = None, affiliation: str | None = None
+    ) -> JsonDict:
+        """Update the current user's profile fields."""
+        payload: JsonDict = {"user": {}}
+        if name is not None:
+            payload["user"]["name"] = name
+        if affiliation is not None:
+            payload["user"]["affiliation"] = affiliation
+        return self._request_json("PATCH", "user", payload)
+
+    # Admin/self endpoints
+    def list_users(self) -> JsonDict:
+        """List users (admin sees all; non-admin sees self)."""
+        return self._request_json("GET", "users")
+
+    def get_user_by_id(self, user_id: str) -> JsonDict:
+        """Fetch a specific user by id."""
+        return self._request_json("GET", f"users/{user_id}")
+
+    def update_user_by_id(self, user_id: str, **fields: Any) -> JsonDict:
+        """Update a user by id (self-only unless admin rules change)."""
+        return self._request_json("PATCH", f"users/{user_id}", {"user": fields})
+
+    def delete_user(self, user_id: str) -> JsonDict:
+        """Delete a user by id (self-only)."""
+        return self._request_json("DELETE", f"users/{user_id}")
+
+    def deposit_user(self, user_id: str) -> JsonDict:
+        """Deposit points to a user (self-only in current policy)."""
+        return self._request_json("POST", f"users/{user_id}/deposit")
+
+
 class AgentManager:
+    """Watches a directory and auto-runs agent modules."""
+
     WATCHING_INTERVAL = 5
 
-    def __init__(self, dir_path: PathLike[str] | str = Path(".")):
-        self.dir_path = Path(dir_path)
-        self.agents = dict[Path, dict[str, Any]]()
+    def __init__(self, dir_path: PathLike[str] | str = Path(".")) -> None:
+        self.dir_path: Path = Path(dir_path)
+        self.agents: dict[Path, dict[str, Any]] = {}
         self.start_watching_loop()
 
-    def start_watching_loop(self):
+    def start_watching_loop(self) -> None:
+        """Start the file watch loop and manage agent lifecycles."""
         while True:
             try:
                 self.dog_watching()
@@ -1441,7 +1738,8 @@ class AgentManager:
         for k in self.agents.keys():
             self.stop(k)
 
-    def dog_watching(self):
+    def dog_watching(self) -> None:
+        """Scan directory changes and start/stop agents accordingly."""
         exisiting_files = set(self.dir_path.glob("*.py"))
         current_files = set(self.agents.keys())
         new_files = exisiting_files - current_files
@@ -1456,6 +1754,8 @@ class AgentManager:
             self.agents.pop(file)
 
     def run_module(self, module: ModuleType) -> Agent | list[Agent] | None:
+        """Run an Agent instance or automatic Agent class from a module."""
+
         def is_agent(obj):
             return hasattr(obj, "_to_show_i_am_agent_instance")
 
@@ -1478,7 +1778,8 @@ class AgentManager:
                 return getattr(agent_class, "_automatic_run")()
         return None
 
-    def load(self, file: Path):
+    def load(self, file: Path) -> None:
+        """Load an agent module and start it if possible."""
         self.agents[file] = {"mtime": file.stat().st_mtime}
         try:
             module_name = file.as_posix().replace(".py", "").replace("/", ".")
@@ -1496,7 +1797,8 @@ class AgentManager:
         except:
             logger.exception(f"load failed: {file=}")
 
-    def check_for_update(self, file: Path):
+    def check_for_update(self, file: Path) -> None:
+        """Reload and restart an agent when its file changes."""
         try:
             mtime = file.stat().st_mtime
             if mtime == self.agents[file]["mtime"]:
@@ -1523,7 +1825,8 @@ class AgentManager:
         except:
             logger.exception(f"check_for_update failed: {file=}")
 
-    def stop(self, file: Path):
+    def stop(self, file: Path) -> None:
+        """Stop a running agent for the given file."""
         try:
             if "agent" in self.agents[file]:
                 if isinstance(self.agents[file]["agent"], list):
@@ -1535,11 +1838,13 @@ class AgentManager:
             logger.exception(f"stop failed: {file=}")
 
 
-def batch_run():
+def batch_run() -> None:
+    """CLI entrypoint for auto-running agents in a directory."""
     AgentManager()
 
 
-def main():
+def main() -> None:
+    """Console entrypoint for the brokersystem package."""
     from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 
     parser = ArgumentParser(
