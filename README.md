@@ -22,6 +22,17 @@ Python module for connecting to a broker server as an agent. The broker server m
 
   Interface for uploading a file.
 
+## Development
+
+Use Poetry for local tooling.
+
+- Install deps: `poetry install`
+- Format (black): `poetry run black .`
+- Type check (pyright): `poetry run pyright`
+- Tests (pytest): `poetry run pytest`
+- Combined check (suggested order): `poetry run black .` → `poetry run pyright` → `poetry run pytest`
+- Cross-platform runner: `python scripts/check.py` (use `--check` for CI-style formatting check)
+
 ### Version history
 
 - 0.2.0 Add file transfer functionality. Still $\alpha$ version.
