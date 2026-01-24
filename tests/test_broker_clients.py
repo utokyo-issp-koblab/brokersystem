@@ -1,3 +1,5 @@
+import json
+
 import responses
 
 from brokersystem.agent import Broker, BrokerAdmin
@@ -105,7 +107,24 @@ def test_broker_admin_agents_and_tokens() -> None:
     )
 
     assert admin.list_agents() == {"agents": []}
-    assert admin.create_agent("name", "predict", "cat")["agent"]["id"] == "a1"
+    assert (
+        admin.create_agent("name", "predict", "cat", is_public=False)["agent"]["id"]
+        == "a1"
+    )
+    create_call = next(
+        call
+        for call in responses.calls
+        if call.request.method == "POST"
+        and call.request.url == f"{BROKER_URL}/api/v1/broker/agents"
+    )
+    body = create_call.request.body
+    assert body is not None
+    if isinstance(body, bytes):
+        body_text = body.decode("utf-8")
+    else:
+        body_text = body
+    payload = json.loads(body_text)
+    assert payload["servicer_agent"]["is_public"] is False
     assert admin.update_agent("a1", name="updated")["agent"]["name"] == "updated"
     assert admin.delete_agent("a1")["status"] == "ok"
 

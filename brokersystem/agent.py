@@ -1633,15 +1633,26 @@ class BrokerAdmin:
         """Return details for a specific agent."""
         return self._request_json("GET", f"agents/{agent_id}")
 
-    def create_agent(self, name: str, agent_type: str, category: str) -> JsonDict:
-        """Create a new agent owned by the current user."""
-        payload = {
-            "servicer_agent": {"name": name, "type": agent_type, "category": category}
+    def create_agent(
+        self,
+        name: str,
+        agent_type: str,
+        category: str,
+        is_public: bool = True,
+    ) -> JsonDict:
+        """Create a new agent owned by the current user (defaults to public)."""
+        payload: JsonDict = {
+            "servicer_agent": {
+                "name": name,
+                "type": agent_type,
+                "category": category,
+                "is_public": is_public,
+            }
         }
         return self._request_json("POST", "agents", payload)
 
     def update_agent(self, agent_id: str, **fields: Any) -> JsonDict:
-        """Update an existing agent (name/type/category/valid)."""
+        """Update an existing agent (name/type/category/is_public)."""
         return self._request_json(
             "PATCH", f"agents/{agent_id}", {"servicer_agent": fields}
         )
