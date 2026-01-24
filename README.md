@@ -1,5 +1,7 @@
 # brokersystem
 
+[![CI](https://github.com/utokyo-issp-koblab/brokersystem/actions/workflows/ci.yml/badge.svg)](https://github.com/utokyo-issp-koblab/brokersystem/actions/workflows/ci.yml)
+
 This is an UNOFFICIAL fork of [brokersystem · PyPI](https://pypi.org/project/brokersystem/).
 
 # Broker System
