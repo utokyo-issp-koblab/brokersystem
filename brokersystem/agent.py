@@ -23,6 +23,18 @@ JsonPayload = dict[str, Any]
 BinaryData = bytes | bytearray | memoryview
 AgentFactory = Callable[[Callable[..., JsonDict | None]], Callable[..., "Agent"]]
 
+USER_INFO_FIELDS = ("user_id", "email", "name_affiliation")
+
+
+def _normalize_user_info_fields(fields: Iterable[str]) -> list[str]:
+    """Normalize user info request fields to supported values."""
+    normalized: list[str] = []
+    for field in fields:
+        value = str(field)
+        if value in USER_INFO_FIELDS and value not in normalized:
+            normalized.append(value)
+    return normalized
+
 
 class ValueTemplate:
     """Base schema item for inputs/conditions/outputs.
@@ -435,6 +447,7 @@ class AgentInterface:
         self.charge: int = 10000
         self.convention: str = ""
         self.description: str = ""
+        self.user_info_request: list[str] = []
         self.input: TemplateContainer = TemplateContainer("input")
         self.condition: TemplateContainer = TemplateContainer("condition")
         self.output: TemplateContainer = TemplateContainer("output")
@@ -468,6 +481,8 @@ class AgentInterface:
             )()
 
         config_dict["charge"] = self.charge
+        if self.user_info_request:
+            config_dict["user_info_request"] = list(self.user_info_request)
         if for_registration:
             config_dict["module_version"] = (
                 __version__  # pyright: ignore[reportUndefinedVariable]
@@ -666,6 +681,14 @@ class Job:
 
     def __contains__(self, key: str) -> bool:
         return key in self._request
+
+    @property
+    def user_info(self) -> JsonDict:
+        """User info injected by the broker (email may be an empty string)."""
+        value = self._request.get("_user_info")
+        if isinstance(value, dict):
+            return value
+        return {}
 
     def _set_status(self, status: str) -> None:
         self._status = status
@@ -1123,6 +1146,35 @@ class Agent:
     def charge(self, charge: int):
         self.interface.charge = charge
 
+    @property
+    def user_info_request(self) -> list[str]:
+        return list(self.interface.user_info_request)
+
+    @user_info_request.setter
+    def user_info_request(self, fields: Iterable[str]) -> None:
+        self.interface.user_info_request = _normalize_user_info_fields(fields)
+
+    def request_user_info(
+        self,
+        *,
+        user_id: bool = False,
+        email: bool = False,
+        name_affiliation: bool = False,
+    ) -> None:
+        """Request user info during negotiation (email may be an empty string).
+
+        Approved fields are delivered under `_user_info` in negotiation requests
+        and exposed as `job.user_info` during contract execution.
+        """
+        fields: list[str] = []
+        if user_id:
+            fields.append("user_id")
+        if email:
+            fields.append("email")
+        if name_affiliation:
+            fields.append("name_affiliation")
+        self.user_info_request = fields
+
 
 class AgentConstructor:
     """Builds agent config interactively and wires it to an Agent instance."""
@@ -1429,9 +1481,17 @@ class Broker:
         else:
             raise TypeError
 
-    def ask(self, agent_id: str, request: JsonDict) -> JsonDict:
+    def ask(
+        self,
+        agent_id: str,
+        request: JsonDict,
+        *,
+        user_info_consent: Iterable[str] | None = None,
+    ) -> JsonDict:
         """Full flow helper: negotiate -> contract -> wait for result."""
-        response = self.negotiate(agent_id, request)
+        response = self.negotiate(
+            agent_id, request, user_info_consent=user_info_consent
+        )
         if "negotiation_id" not in response:
             raise Exception(f"Cannot communicate with Agent {agent_id}")
 
@@ -1447,13 +1507,30 @@ class Broker:
 
         return result
 
-    def negotiate(self, agent_id: str, request: JsonDict) -> JsonDict:
-        """Start negotiation and send the first request."""
-        response = self.post("negotiate", {"agent_id": agent_id, "request": request})
+    def negotiate(
+        self,
+        agent_id: str,
+        request: JsonDict,
+        *,
+        user_info_consent: Iterable[str] | None = None,
+    ) -> JsonDict:
+        """Start negotiation and send the first request.
+
+        Use `user_info_consent` to approve sharing `user_id`, `email`,
+        and/or `name_affiliation` when the agent requests it.
+        """
+        request_payload = self._with_user_info_consent(request, user_info_consent)
+        response = self.post(
+            "negotiate", {"agent_id": agent_id, "request": request_payload}
+        )
         return response
 
     def begin_negotiation(self, agent_id: str) -> JsonDict:
-        """Begin negotiation to fetch input schema before sending a request."""
+        """Begin negotiation to fetch input schema before sending a request.
+
+        If the response content includes `user_info_request`, pass that list
+        as `user_info_consent` when calling negotiate/ask.
+        """
         response = self.post("negotiation/begin", {"agent_id": agent_id})
         return response
 
@@ -1490,6 +1567,16 @@ class Broker:
             **self.header_auth,
         }
         return headers
+
+    def _with_user_info_consent(
+        self, request: JsonDict, consent: Iterable[str] | None
+    ) -> JsonDict:
+        """Attach user info consent to the request payload."""
+        if not consent:
+            return request
+        payload = dict(request)
+        payload["_user_info_consent"] = _normalize_user_info_fields(consent)
+        return payload
 
     def post(self, uri: str, payload: JsonDict) -> JsonDict:
         """POST to the client API and return JSON."""

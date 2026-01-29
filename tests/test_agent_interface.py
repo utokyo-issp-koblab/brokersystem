@@ -40,3 +40,12 @@ def test_format_for_output_includes_tables_and_files() -> None:
     assert "table" in result["@keys"]
     assert "image" in result["@keys"]
     assert upload_calls == [("png", b"data")]
+
+
+def test_make_config_includes_user_info_request() -> None:
+    interface = AgentInterface()
+    interface.user_info_request = ["email", "user_id"]
+
+    config = interface.make_config()
+
+    assert config["user_info_request"] == ["email", "user_id"]

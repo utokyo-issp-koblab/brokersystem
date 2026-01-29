@@ -22,6 +22,24 @@ def test_broker_begin_negotiation() -> None:
 
 
 @responses.activate
+def test_broker_negotiate_sends_user_info_consent() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/negotiate",
+        json={"negotiation_id": "n1", "state": "ok", "content": {}},
+        status=200,
+    )
+
+    broker.negotiate("agent-1", {"x": 1}, user_info_consent=["email"])
+
+    body = responses.calls[0].request.body
+    assert body is not None
+    payload = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
+    assert payload["request"]["_user_info_consent"] == ["email"]
+
+
+@responses.activate
 def test_broker_contract_flow_get_result() -> None:
     broker = Broker(broker_url=BROKER_URL, auth="token")
     responses.add(

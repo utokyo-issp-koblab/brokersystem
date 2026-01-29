@@ -46,6 +46,7 @@ def build_agent(enable_upload: bool) -> Agent:
         agent.secret_token = f"{agent_id}:{agent_secret}"
         agent.description = "Example agent showing input/output templates"
         agent.charge = 100
+        agent.request_user_info(user_id=True, email=True, name_affiliation=True)
 
         agent.input.x = Number(1, min=0, max=10, unit="unit")
         agent.input.mode = Choice(["fast", "safe"])
@@ -71,6 +72,8 @@ def build_agent(enable_upload: bool) -> Agent:
     @agent.job_func
     def job_func(job) -> dict[str, Any]:
         x_value = job["x"]
+        if job.user_info:
+            print("User info:", job.user_info)
         job.msg("Starting job")
         job.progress(0.5)
         result = {
@@ -104,8 +107,13 @@ def run_client(agent_id: str, step_by_step: bool) -> None:
     broker = Broker(broker_url=broker_url, auth=token)
 
     request = {"x": 2, "mode": "safe"}
+    begin = broker.begin_negotiation(agent_id)
+    requested_user_info = begin.get("content", {}).get("user_info_request", [])
+    if requested_user_info:
+        print("Agent requests user info:", requested_user_info)
+        # email may be an empty string depending on auth provider settings.
+        request["_user_info_consent"] = requested_user_info
     if step_by_step:
-        begin = broker.begin_negotiation(agent_id)
         print("Begin negotiation:", begin)
 
         negotiation = broker.negotiate(agent_id, request)
