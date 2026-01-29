@@ -40,6 +40,19 @@ def test_broker_negotiate_sends_user_info_consent() -> None:
 
 
 @responses.activate
+def test_broker_board() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.GET,
+        f"{BROKER_URL}/api/v1/client/board",
+        json={"agents": []},
+        status=200,
+    )
+
+    assert broker.board() == {"agents": []}
+
+
+@responses.activate
 def test_broker_contract_flow_get_result() -> None:
     broker = Broker(broker_url=BROKER_URL, auth="token")
     responses.add(

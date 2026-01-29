@@ -1463,7 +1463,11 @@ class AgentConstructor:
 
 
 class Broker:
-    """Client for the broker-side API used by end users."""
+    """Client for the broker-side API used by end users.
+
+    `/api/v1/client/board` mirrors `/api/v1/broker/board` payloads but accepts
+    either agent secret (Basic <agent_id>:<secret>) or user tokens.
+    """
 
     def __init__(
         self,
@@ -1555,6 +1559,10 @@ class Broker:
             raise Exception(f"Error response from agent: {response['msg']}")
         return response
 
+    def board(self) -> JsonDict:
+        """Return the board listing (same payload as broker board)."""
+        return self.get("board")
+
     @property
     def header_auth(self) -> dict[str, str]:
         return {"authorization": f"Basic {self.auth}"}
@@ -1640,7 +1648,10 @@ class Broker:
 
 
 class BrokerAdmin:
-    """Client for broker automation endpoints (/api/v1/broker)."""
+    """Client for broker automation endpoints (/api/v1/broker).
+
+    These endpoints accept user tokens only (agent secrets are rejected).
+    """
 
     def __init__(self, broker_url: str, token: str) -> None:
         self.broker_url = broker_url
@@ -1704,7 +1715,10 @@ class BrokerAdmin:
 
     # Board + results
     def board(self) -> JsonDict:
-        """Return the board listing (agents + active flag)."""
+        """Return the board listing (agents + active flag).
+
+        Requires a user token and returns the same payload as /api/v1/client/board.
+        """
         return self._request_json("GET", "board")
 
     def list_results(self) -> JsonDict:

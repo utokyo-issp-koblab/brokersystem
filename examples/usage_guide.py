@@ -5,6 +5,11 @@ Configure via env vars:
 - BROKER_TOKEN: broker access token (client API + broker admin API)
 - AGENT_ID / AGENT_SECRET: agent credentials (agent API)
 
+Notes:
+- `/api/v1/client/board` and `/api/v1/broker/board` return the same payload.
+- Broker (client API) accepts agent secret *or* user token.
+- BrokerAdmin (broker API) accepts user token only.
+
 Run examples:
   BROKER_URL=https://... AGENT_ID=... AGENT_SECRET=... \
     python examples/usage_guide.py agent [--enable-upload]
@@ -105,6 +110,9 @@ def run_client(agent_id: str, step_by_step: bool) -> None:
     token = require_env("BROKER_TOKEN")
 
     broker = Broker(broker_url=broker_url, auth=token)
+
+    board = broker.board()
+    print("Client board:", board)
 
     request = {"x": 2, "mode": "safe"}
     begin = broker.begin_negotiation(agent_id)
