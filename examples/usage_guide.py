@@ -190,17 +190,8 @@ def run_client(agent_id: str, step_by_step: bool) -> None:
     print(f"{source} result payload keys:", result_payload_keys)
     print("Result keys match expected:", expected_keys.issubset(result_keys))
 
-    file_id = next(
-        (
-            value
-            for value in result_payload.values()
-            if isinstance(value, str)
-            and "." in value
-            and value.rsplit(".", 1)[-1] in {"png", "jpg", "gif", "csv", "pptx"}
-        ),
-        None,
-    )
-    if file_id:
+    if "image" in result_payload:
+        file_id = result_payload["image"]
         response = broker.get_file(f"files/{file_id}")
         print(
             "Downloaded file:",

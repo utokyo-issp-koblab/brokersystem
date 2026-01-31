@@ -3,6 +3,7 @@ import importlib
 import inspect
 import io
 import json
+import mimetypes
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -590,7 +591,7 @@ class File(ValueTemplate):
 
     def __init__(self, file_type: str) -> None:
         super().__init__()
-        if file_type in ["png", "jpeg", "gif"]:
+        if file_type in ["png", "jpg", "jpeg", "gif"]:
             self.type = "image"
         self.file_type = file_type
         self.set_constraint("file_type", file_type)
@@ -613,10 +614,15 @@ class File(ValueTemplate):
             match self.type:
                 case "image":
                     match self.file_type:
-                        case "png" | "jpeg":
+                        case "png" | "jpeg" | "jpg":
                             img = PIL.Image.open(path)
                             output = io.BytesIO()
-                            img.save(output, format=self.file_type)
+                            format_name = (
+                                "jpeg"
+                                if self.file_type in ["jpeg", "jpg"]
+                                else self.file_type
+                            )
+                            img.save(output, format=format_name)
                             binary_data = output.getvalue()
                         case "gif":
                             with path.open("rb") as f:
@@ -1516,17 +1522,12 @@ class Agent:
 
         Retries transient connection errors with backoff and logs failures.
         """
-        file_name = "__file_name__"
-        mime_dict = {
-            "png": "image/png",
-            "gif": "image/gif",
-            "jpeg": "image/jpeg",
-            "csv": "text/csv",
-            "pdf": "application/pdf",
-            "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        }
-        assert file_type in mime_dict
-        files = {file_type: (file_name, binary_data, mime_dict[file_type])}
+        extension = file_type.strip().lower().lstrip(".")
+        file_name = f"__file_name__.{extension}" if extension else "__file_name__"
+        content_type, _encoding = mimetypes.guess_type(file_name)
+        if content_type is None:
+            content_type = "application/octet-stream"
+        files = {"file": (file_name, binary_data, content_type)}
         for attempt in range(self.REQUEST_RETRY_LIMIT + 1):
             try:
                 response = requests.post(
