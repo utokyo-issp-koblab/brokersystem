@@ -7,7 +7,7 @@ Configure via env vars:
 
 Notes:
 - `/api/v1/client/board` and `/api/v1/broker/board` return the same payload.
-- Broker (client API) accepts agent secret *or* user token.
+- Broker (client API) accepts agent secret or user token.
 - BrokerAdmin (broker API) accepts user token only.
 
 Run examples:
@@ -25,9 +25,23 @@ import argparse
 import os
 import sys
 import uuid
-from typing import Any
+import time
+from typing import Literal
 
-from brokersystem import Agent, Broker, BrokerAdmin, Choice, File, Number, Table
+from brokersystem import (
+    Agent,
+    AgentError,
+    Broker,
+    BrokerAdmin,
+    BrokerError,
+    Choice,
+    File,
+    Job,
+    JsonDict,
+    Number,
+    Table,
+    UserInfoField,
+)
 
 
 def require_env(key: str) -> str:
@@ -51,38 +65,64 @@ def build_agent(enable_upload: bool) -> Agent:
         agent.secret_token = f"{agent_id}:{agent_secret}"
         agent.description = "Example agent showing input/output templates"
         agent.charge = 100
-        agent.request_user_info(user_id=True, email=True, name_affiliation=True)
+        # Only request user info when necessary (e.g., for validation/decision logic).
+        # A 10% tax is applied per requested field (-> 30% tax here).
+        agent.user_info_request = [
+            UserInfoField.USER_ID,
+            UserInfoField.EMAIL,
+            UserInfoField.NAME_AFFILIATION,
+        ]
 
-        agent.input.x = Number(1, min=0, max=10, unit="unit")
-        agent.input.mode = Choice(["fast", "safe"])
+        agent.input.x = Number(1, min=0, max=10, unit="µm")
+        agent.input.mode = Choice(["fast", "safe", "special"])
         agent.output.score = Number(unit="pt")
-        agent.output.table = Table(unit_dict={"x": "unit", "y": "unit"})
+        agent.output.table = Table(unit_dict={"x": "µm", "y": "W"})
         if enable_upload:
             agent.output.image = File("png")
 
     @agent.charge_func
-    def charge_func(input_values: dict[str, Any]) -> int:
-        if input_values.get("mode") == "fast":
+    def charge_func(input_values: JsonDict) -> int:
+        """Optional: if omitted, `agent.charge` is used."""
+        if input_values["mode"] == "fast":
             return 200
         return 100
 
     @agent.negotiation
     def negotiation(
-        request: dict[str, Any], response: dict[str, Any]
-    ) -> tuple[str, dict[str, Any]]:
-        if request.get("x") is None:
+        request: JsonDict, response: JsonDict
+    ) -> tuple[Literal["ok", "need_revision", "ng"], JsonDict]:
+        """Optional: if omitted, only schema validation runs."""
+        mode = request["mode"]
+        x_value = request["x"]
+
+        if mode == "fast" and x_value > 5:
+            response["error_msg"] = "Fast mode requires x <= 5."
             return "need_revision", response
+
+        if mode == "special":
+            user_info = request["_user_info"]
+            email = user_info["email"]
+            if email != "admin@example.com":
+                response["error_msg"] = "Special mode requires admin@example.com email."
+                return "ng", response
         return "ok", response
 
     @agent.job_func
-    def job_func(job) -> dict[str, Any]:
+    def job_func(job: Job) -> JsonDict:
         x_value = job["x"]
-        if job.user_info:
-            print("User info:", job.user_info)
-        job.msg("Starting job")
-        job.progress(0.5)
-        result = {
-            "score": x_value * 2,
+        mode = job["mode"]
+        user_info = job.user_info
+        name_affiliation = user_info["name_affiliation"]
+        user_id = user_info["user_id"]
+        greeting = (
+            f"Hello, {name_affiliation['name']} from {name_affiliation['affiliation']}!"
+        )
+        job.msg(f"{greeting} Your user_id is: {user_id}")
+        score = x_value * 2
+        job.report(progress=0.5, result={"score": score})
+        if mode != "fast":
+            time.sleep(5)
+        result: JsonDict = {
             "table": [{"x": x_value, "y": x_value * 3}],
         }
         if enable_upload:
@@ -112,30 +152,27 @@ def run_client(agent_id: str, step_by_step: bool) -> None:
     broker = Broker(broker_url=broker_url, auth=token)
 
     board = broker.board()
+    agents = board["agents"]
     print("Client board:", board)
+    print("Client board agent count:", len(agents))
 
     request = {"x": 2, "mode": "safe"}
     begin = broker.begin_negotiation(agent_id)
-    requested_user_info = begin.get("content", {}).get("user_info_request", [])
-    if requested_user_info:
-        print("Agent requests user info:", requested_user_info)
-        # email may be an empty string depending on auth provider settings.
-        request["_user_info_consent"] = requested_user_info
+    begin_content = begin["content"]
+    user_info_request = begin_content["user_info_request"]
+    if user_info_request:
+        print("Agent requests user info:", user_info_request)
+        request["_user_info_consent"] = user_info_request
     if step_by_step:
         print("Begin negotiation:", begin)
 
         negotiation = broker.negotiate(agent_id, request)
         print("Negotiation:", negotiation)
 
-        negotiation_id = negotiation.get("negotiation_id")
-        if not negotiation_id:
-            raise RuntimeError("Negotiation failed")
+        negotiation_id = negotiation["negotiation_id"]
 
         contract = broker.contract(negotiation_id)
         print("Contract:", contract)
-        if contract.get("status") == "error":
-            print("Contract failed (insufficient points or unavailable agent).")
-            return
 
         result = broker.get_result(negotiation_id)
         source = "step-by-step"
@@ -145,35 +182,32 @@ def run_client(agent_id: str, step_by_step: bool) -> None:
 
     expected_keys = {"status", "progress", "msg", "result"}
     result_keys = set(result.keys())
-    result_payload = result.get("result")
-    result_payload_keys = (
-        sorted(result_payload.keys()) if isinstance(result_payload, dict) else None
-    )
+    result_payload = result["result"]
+    result_payload_keys = sorted(result_payload.keys())
 
     print(f"{source} result:", result)
     print(f"{source} result keys:", sorted(result_keys))
     print(f"{source} result payload keys:", result_payload_keys)
     print("Result keys match expected:", expected_keys.issubset(result_keys))
 
-    if isinstance(result_payload, dict):
-        file_id = next(
-            (
-                value
-                for value in result_payload.values()
-                if isinstance(value, str)
-                and "." in value
-                and value.rsplit(".", 1)[-1] in {"png", "jpg", "gif", "csv", "pptx"}
-            ),
-            None,
+    file_id = next(
+        (
+            value
+            for value in result_payload.values()
+            if isinstance(value, str)
+            and "." in value
+            and value.rsplit(".", 1)[-1] in {"png", "jpg", "gif", "csv", "pptx"}
+        ),
+        None,
+    )
+    if file_id:
+        response = broker.get_file(f"files/{file_id}")
+        print(
+            "Downloaded file:",
+            file_id,
+            "content-type:",
+            response.headers["content-type"],
         )
-        if file_id:
-            response = broker.get_file(f"files/{file_id}")
-            print(
-                "Downloaded file:",
-                file_id,
-                "content-type:",
-                response.headers.get("content-type"),
-            )
 
 
 def run_admin(allow_deposit: bool, allow_delete: bool) -> None:
@@ -185,72 +219,77 @@ def run_admin(allow_deposit: bool, allow_delete: bool) -> None:
 
     board = admin.board()
     print("Board:", board)
-    agents = board.get("agents", [])
+    agents = board["agents"]
     print("Board agent count:", len(agents))
     if agents:
         sample = agents[0]
         print("Board agent keys:", sorted(sample.keys()))
-        owner = sample.get("owner", {})
+        owner = sample["owner"]
         print("Board agent owner keys:", sorted(owner.keys()))
-        info = sample.get("info", {})
-        if isinstance(info, dict):
-            print("Board agent info keys:", sorted(info.keys()))
-    print("Results:", admin.list_results())
-    print("Agents (admin sees all; non-admin sees own):", admin.list_agents())
-    print("Tokens:", admin.list_access_tokens())
+        info = sample["info"]
+        print("Board agent info keys:", sorted(info.keys()))
+
+    results = admin.list_results()
+    print("Results:", results)
+
+    agents_response = admin.list_agents()
+    print("Agents (admin sees all; non-admin sees own):", agents_response)
+
+    tokens = admin.list_access_tokens()
+    print("Tokens:", tokens)
+
     user_response = admin.get_user()
     print("User:", user_response)
 
-    current_user = user_response.get("user", {})
-    current_user_id = current_user.get("id")
+    current_user = user_response["user"]
+    current_user_id = current_user["id"]
 
-    if allow_delete and current_user_id:
+    if allow_delete:
+        delete_response = admin.delete_user(current_user_id)
         print(
             "Delete user (self-only; fails if user owns agents):",
-            admin.delete_user(current_user_id),
+            delete_response,
         )
 
-    created_user = admin.create_user(
-        current_user.get("name", "Example User"),
-        current_user.get("affiliation", "example"),
-    )
+    created_user = admin.create_user(current_user["name"], current_user["affiliation"])
     print("Create user:", created_user)
-    current_user = created_user.get("user", current_user)
-    current_user_id = current_user.get("id")
+    current_user = created_user["user"]
+    current_user_id = current_user["id"]
 
     updated_user = admin.update_user(
-        name=current_user.get("name"), affiliation=current_user.get("affiliation")
+        name=current_user["name"],
+        affiliation=current_user["affiliation"],
     )
     print("Update user:", updated_user)
 
     users = admin.list_users()
     print("Users (admin sees all; non-admin sees self):", users)
 
-    if current_user_id:
-        print(
-            "User by id (self; admin can access others):",
-            admin.get_user_by_id(current_user_id),
-        )
-        print(
-            "Update user by id (self-only):",
-            admin.update_user_by_id(current_user_id, name=current_user.get("name")),
-        )
-        if allow_deposit:
-            print(
-                "Deposit user (self-only):",
-                admin.deposit_user(current_user_id),
-            )
+    user_by_id = admin.get_user_by_id(current_user_id)
+    print("User by id (self; admin can access others):", user_by_id)
+
+    updated_by_id = admin.update_user_by_id(
+        current_user_id,
+        name=current_user["name"],
+    )
+    print("Update user by id (self-only):", updated_by_id)
+    if allow_deposit:
+        deposit_response = admin.deposit_user(current_user_id)
+        print("Deposit user (self-only):", deposit_response)
 
     temp_name = f"example-agent-{uuid.uuid4().hex[:8]}"
     created = admin.create_agent(temp_name, "predict", "demo", is_public=True)
-    agent = created.get("agent", {})
-    agent_id = agent.get("id")
+    agent = created["agent"]
+    agent_id = agent["id"]
     print("Created agent:", agent)
 
     if agent_id:
-        print("Agent detail (owner or admin only):", admin.get_agent(agent_id))
+        detail = admin.get_agent(agent_id)
+        print("Agent detail (owner or admin only):", detail)
+
         updated = admin.update_agent(agent_id, is_public=False)
-        print("Updated agent:", updated.get("agent", {}))
+        updated_agent = updated["agent"]
+        print("Updated agent:", updated_agent)
 
         full_template = admin.download_agent_template(agent_id, simple=False)
         simple_template = admin.download_agent_template(agent_id, simple=True)
@@ -264,10 +303,9 @@ def run_admin(allow_deposit: bool, allow_delete: bool) -> None:
     issued = admin.issue_access_token(temp_label)
     print("Issued token:", issued)
 
-    issued_token = issued.get("token")
-    if issued_token:
-        revoked = admin.revoke_access_token(issued_token)
-        print("Revoked token:", revoked)
+    issued_token = issued["token"]
+    revoked = admin.revoke_access_token(issued_token)
+    print("Revoked token:", revoked)
 
 
 def main() -> int:
@@ -310,7 +348,7 @@ def main() -> int:
             run_client(args.agent_id, args.step_by_step)
         elif args.command == "admin":
             run_admin(args.deposit_user, args.delete_user)
-    except RuntimeError as exc:
+    except (RuntimeError, BrokerError, AgentError) as exc:
         print(exc)
         print("Set BROKER_URL, BROKER_TOKEN, AGENT_ID, AGENT_SECRET as needed.")
         return 1

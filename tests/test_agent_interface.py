@@ -1,4 +1,8 @@
-from brokersystem.agent import AgentInterface, File, Number, Table
+from typing import cast
+
+import pytest
+
+from brokersystem.agent import Agent, AgentInterface, File, Number, Table, UserInfoField
 
 
 def test_validate_returns_ok_for_valid_input() -> None:
@@ -15,6 +19,23 @@ def test_validate_returns_need_revision_for_invalid_input() -> None:
     msg, template = interface.validate({"value": 999})
     assert msg == "need_revision"
     assert "value" not in template or template["value"] != 999
+
+
+def test_validate_returns_need_revision_for_missing_input() -> None:
+    interface = AgentInterface()
+    interface.input.value = Number(value=2, min=1, max=3)
+    msg, template = interface.validate({})
+    assert msg == "need_revision"
+    assert "value" not in template
+
+
+def test_user_info_request_rejects_invalid_fields() -> None:
+    agent = Agent("https://example.test")
+    with pytest.raises(ValueError):
+        agent.user_info_request = [
+            UserInfoField.USER_ID,
+            cast(UserInfoField, "unknown"),
+        ]
 
 
 def test_format_for_output_includes_tables_and_files() -> None:
@@ -44,7 +65,7 @@ def test_format_for_output_includes_tables_and_files() -> None:
 
 def test_make_config_includes_user_info_request() -> None:
     interface = AgentInterface()
-    interface.user_info_request = ["email", "user_id"]
+    interface.user_info_request = [UserInfoField.EMAIL, UserInfoField.USER_ID]
 
     config = interface.make_config()
 

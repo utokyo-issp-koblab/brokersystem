@@ -1,8 +1,15 @@
 import json
 
+import pytest
 import responses
 
-from brokersystem.agent import Broker, BrokerAdmin
+from brokersystem.agent import (
+    Broker,
+    BrokerAdmin,
+    BrokerHTTPError,
+    BrokerResponseError,
+    UserInfoField,
+)
 
 BROKER_URL = "https://example.test"
 
@@ -13,7 +20,11 @@ def test_broker_begin_negotiation() -> None:
     responses.add(
         responses.POST,
         f"{BROKER_URL}/api/v1/client/negotiation/begin",
-        json={"negotiation_id": "n1", "state": "ok", "content": {}},
+        json={
+            "negotiation_id": "n1",
+            "state": "ok",
+            "content": {"user_info_request": []},
+        },
         status=200,
     )
 
@@ -27,11 +38,15 @@ def test_broker_negotiate_sends_user_info_consent() -> None:
     responses.add(
         responses.POST,
         f"{BROKER_URL}/api/v1/client/negotiate",
-        json={"negotiation_id": "n1", "state": "ok", "content": {}},
+        json={
+            "negotiation_id": "n1",
+            "state": "ok",
+            "content": {"user_info_request": []},
+        },
         status=200,
     )
 
-    broker.negotiate("agent-1", {"x": 1}, user_info_consent=["email"])
+    broker.negotiate("agent-1", {"x": 1}, user_info_consent=[UserInfoField.EMAIL])
 
     body = responses.calls[0].request.body
     assert body is not None
@@ -53,12 +68,44 @@ def test_broker_board() -> None:
 
 
 @responses.activate
+def test_broker_board_raises_on_http_error() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.GET,
+        f"{BROKER_URL}/api/v1/client/board",
+        status=500,
+        body="oops",
+    )
+
+    with pytest.raises(BrokerHTTPError):
+        broker.board()
+
+
+@responses.activate
+def test_broker_begin_negotiation_raises_on_missing_user_info_request() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/negotiation/begin",
+        json={"negotiation_id": "n1", "state": "ok", "content": {}},
+        status=200,
+    )
+
+    with pytest.raises(BrokerResponseError):
+        broker.begin_negotiation("agent-1")
+
+
+@responses.activate
 def test_broker_contract_flow_get_result() -> None:
     broker = Broker(broker_url=BROKER_URL, auth="token")
     responses.add(
         responses.POST,
         f"{BROKER_URL}/api/v1/client/negotiate",
-        json={"negotiation_id": "n1", "state": "ok", "content": {}},
+        json={
+            "negotiation_id": "n1",
+            "state": "ok",
+            "content": {"user_info_request": []},
+        },
         status=200,
     )
     responses.add(
@@ -89,6 +136,24 @@ def test_broker_contract_flow_get_result() -> None:
     result = broker.get_result("n1")
     assert result["status"] == "done"
     assert result["result"]["x"] == 1
+
+
+@responses.activate
+def test_broker_ask_raises_on_non_ok_state() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/negotiate",
+        json={
+            "negotiation_id": "n1",
+            "state": "need_revision",
+            "content": {"user_info_request": [], "error_msg": "x too large"},
+        },
+        status=200,
+    )
+
+    with pytest.raises(BrokerResponseError):
+        broker.ask("agent-1", {"x": 1})
 
 
 @responses.activate

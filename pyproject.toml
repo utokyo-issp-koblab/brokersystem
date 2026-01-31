@@ -7,7 +7,7 @@ authors = ["chocolate <you@example.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = "^3.11"
 requests = "^2.31"
 logzero = "^1.7"
 pandas = "^2.0"
@@ -23,7 +23,7 @@ pyright = "^1.1.408"
 testpaths = ["tests"]
 
 [tool.pyright]
-pythonVersion = "3.10"
+pythonVersion = "3.11"
 typeCheckingMode = "basic"
 include = ["brokersystem", "tests"]
 

@@ -1,3 +1,4 @@
+import functools
 import importlib
 import inspect
 import io
@@ -6,10 +7,11 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from datetime import timedelta
+from enum import StrEnum
 from os import PathLike
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal, cast
+from typing import Any, Literal, ParamSpec, TypedDict, TypeVar, cast
 
 import pandas as pd
 import PIL.Image
@@ -22,18 +24,395 @@ JsonDict = dict[str, Any]
 JsonPayload = dict[str, Any]
 BinaryData = bytes | bytearray | memoryview
 AgentFactory = Callable[[Callable[..., JsonDict | None]], Callable[..., "Agent"]]
+P = ParamSpec("P")
+R = TypeVar("R")
 
-USER_INFO_FIELDS = ("user_id", "email", "name_affiliation")
+ResultValue = str | int | float | bool | None | list[Any] | dict[str, Any]
+NegotiationState = Literal[
+    "begin",
+    "request",
+    "ok",
+    "need_revision",
+    "ng",
+    "error",
+    "contract_requested",
+    "contract_accepted",
+    "contract_denied",
+]
+ResultStatus = Literal["requested", "accepted", "running", "done", "error", "denied"]
+
+TemplateSchema = TypedDict(
+    "TemplateSchema",
+    {
+        "@type": dict[str, str],
+        "@unit": dict[str, str | None],
+        "@keys": list[str],
+        "@value": list[str],
+        "@table": dict[str, list[str]],
+        "@repr": dict[str, Any],
+        "@necessity": dict[str, str],
+        "@constraints": dict[str, dict[str, Any]],
+        "@option": dict[str, Any],
+        "@file": dict[str, Any],
+        "@ui": dict[str, Any],
+    },
+    total=False,
+)
+
+ResultPayload = dict[str, ResultValue]
 
 
-def _normalize_user_info_fields(fields: Iterable[str]) -> list[str]:
-    """Normalize user info request fields to supported values."""
-    normalized: list[str] = []
+class UserInfoField(StrEnum):
+    USER_ID = "user_id"
+    EMAIL = "email"
+    NAME_AFFILIATION = "name_affiliation"
+
+
+UserInfoFieldValue = Literal["user_id", "email", "name_affiliation"]
+USER_INFO_FIELDS: tuple[UserInfoField, ...] = tuple(UserInfoField)
+
+
+class UserInfoNameAffiliation(TypedDict):
+    name: str | None
+    affiliation: str | None
+
+
+class UserInfo(TypedDict):
+    user_id: str | None
+    email: str | None
+    name_affiliation: UserInfoNameAffiliation
+
+
+class NegotiationContentBase(TypedDict):
+    user_info_request: list[UserInfoField]
+
+
+class NegotiationContent(NegotiationContentBase, total=False):
+    input: TemplateSchema
+    condition: TemplateSchema
+    output: TemplateSchema
+    charge: int
+
+
+class NegotiationResponse(TypedDict):
+    negotiation_id: str
+    state: NegotiationState
+    content: NegotiationContent
+
+
+class ContractResponse(TypedDict):
+    status: Literal["ok"]
+
+
+class ResultResponse(TypedDict):
+    status: Literal["done"]
+    msg: str
+    progress: float
+    result: ResultPayload
+
+
+class BoardResponse(TypedDict):
+    agents: list["BoardAgent"]
+
+
+class BoardAgentOwner(TypedDict):
+    id: str
+    name: str
+    affiliation: str
+
+
+class AgentInfo(TypedDict, total=False):
+    input: TemplateSchema
+    condition: TemplateSchema
+    output: TemplateSchema
+    description: str
+    module_version: str
+    user_info_request: list[UserInfoFieldValue]
+
+
+class BoardAgent(TypedDict):
+    id: str
+    name: str
+    type: str
+    category: str
+    info: AgentInfo
+    is_public: bool
+    active: bool
+    owner: BoardAgentOwner
+
+
+class AgentSummary(TypedDict):
+    id: str
+    name: str
+    type: str
+    category: str
+    is_public: bool
+    point: int
+    info: AgentInfo
+
+
+class UserSummary(TypedDict):
+    id: str
+    auth: str
+    name: str
+    affiliation: str
+    point: int
+    info: dict[str, str]
+
+
+class AgentDetailBase(AgentSummary):
+    owner: UserSummary
+
+
+class AgentDetail(AgentDetailBase, total=False):
+    secret_key: str
+
+
+class ResultSummary(TypedDict):
+    negotiation_id: str
+    status: ResultStatus
+    progress: float
+    charge: float
+    msg: str
+    agent_id: str
+    agent_name: str
+    requested_date: str
+
+
+class TokenSummary(TypedDict):
+    token: str
+    label: str
+    created_at: str
+    last_seen: str
+
+
+class ResultsResponse(TypedDict):
+    contracts: list[ResultSummary]
+
+
+class AgentsResponse(TypedDict):
+    agents: list[AgentSummary]
+
+
+class TokensResponse(TypedDict):
+    tokens: list[TokenSummary]
+
+
+class AccessTokenResponse(TypedDict):
+    token: str
+    label: str
+
+
+class AgentResponse(TypedDict):
+    agent: AgentDetail
+
+
+class UserResponse(TypedDict):
+    user: UserSummary
+
+
+class UserResponseWithStatus(UserResponse):
+    status: Literal["exists", "created"]
+
+
+class UsersResponse(TypedDict):
+    users: list[UserSummary]
+
+
+class StatusResponse(TypedDict):
+    status: Literal["ok"]
+
+
+class BrokerError(RuntimeError):
+    """Base class for broker client errors."""
+
+
+class BrokerConnectionError(BrokerError):
+    """Raised when the broker server cannot be reached."""
+
+
+class BrokerHTTPError(BrokerError):
+    """Raised for non-200 HTTP responses."""
+
+    def __init__(self, status_code: int, uri: str, content: bytes | str | None) -> None:
+        self.status_code = status_code
+        self.uri = uri
+        self.content = content
+        message = f"HTTP {status_code} for {uri}"
+        if content:
+            message = f"{message}: {content!r}"
+        super().__init__(message)
+
+
+class BrokerResponseError(BrokerError):
+    """Raised for malformed or error response payloads."""
+
+    def __init__(self, message: str, payload: Any | None = None) -> None:
+        super().__init__(message)
+        self.payload = payload
+
+
+class AgentError(RuntimeError):
+    """Base class for agent runtime errors."""
+
+
+class AgentConnectionError(AgentError):
+    """Raised when the broker server cannot be reached by an agent."""
+
+
+class AgentHTTPError(AgentError):
+    """Raised for non-200 HTTP responses to agent requests."""
+
+    def __init__(self, status_code: int, uri: str, content: bytes | str | None) -> None:
+        self.status_code = status_code
+        self.uri = uri
+        self.content = content
+        message = f"HTTP {status_code} for {uri}"
+        if content:
+            message = f"{message}: {content!r}"
+        super().__init__(message)
+
+
+class AgentResponseError(AgentError):
+    """Raised for malformed agent response payloads."""
+
+    def __init__(self, message: str, payload: Any | None = None) -> None:
+        super().__init__(message)
+        self.payload = payload
+
+
+def _coerce_error_content(content: bytes | str | None) -> str | None:
+    if content is None:
+        return None
+    if isinstance(content, bytes):
+        try:
+            return content.decode("utf-8", errors="replace")
+        except Exception:
+            return repr(content)
+    return str(content)
+
+
+def _ensure_response_dict(payload: Any, context: str) -> JsonDict:
+    if not isinstance(payload, dict):
+        raise BrokerResponseError(
+            f"{context} returned non-dict payload: {payload!r}", payload=payload
+        )
+    if not payload:
+        raise BrokerResponseError(f"{context} returned empty payload", payload=payload)
+    if payload.get("status") == "error":
+        detail = payload.get("error_msg") or payload.get("error") or "unknown error"
+        raise BrokerResponseError(
+            f"{context} failed: {detail}",
+            payload=payload,
+        )
+    if "error_msg" in payload:
+        raise BrokerResponseError(f"{context} failed: {payload['error_msg']}", payload)
+    if "error" in payload:
+        raise BrokerResponseError(f"{context} failed: {payload['error']}", payload)
+    return payload
+
+
+def _require_key(payload: Mapping[str, Any], key: str, context: str) -> Any:
+    if key not in payload:
+        raise BrokerResponseError(f"{context} missing '{key}'", payload=payload)
+    return payload[key]
+
+
+def _require_mapping(payload: Mapping[str, Any], key: str, context: str) -> JsonDict:
+    value = _require_key(payload, key, context)
+    if not isinstance(value, dict):
+        raise BrokerResponseError(
+            f"{context} field '{key}' is not a dict: {value!r}", payload=payload
+        )
+    return value
+
+
+def _require_list(payload: Mapping[str, Any], key: str, context: str) -> list[Any]:
+    value = _require_key(payload, key, context)
+    if not isinstance(value, list):
+        raise BrokerResponseError(
+            f"{context} field '{key}' is not a list: {value!r}", payload=payload
+        )
+    return value
+
+
+def _require_str_list(payload: Mapping[str, Any], key: str, context: str) -> list[str]:
+    value = _require_list(payload, key, context)
+    if not all(isinstance(item, str) for item in value):
+        raise BrokerResponseError(
+            f"{context} field '{key}' is not a list of strings", payload=payload
+        )
+    return list(value)
+
+
+def _backoff_seconds(attempt: int, base: float, cap: float) -> float:
+    return min(cap, base * (2**attempt))
+
+
+def _normalize_user_info_fields(
+    fields: Iterable[str | UserInfoField],
+) -> list[UserInfoField]:
+    """Normalize user info request fields to supported values.
+
+    Raises:
+        TypeError: If a field is not a string or UserInfoField.
+        ValueError: If a field is not a supported user info field.
+    """
+    normalized: list[UserInfoField] = []
+    allowed_values = ", ".join(field.value for field in USER_INFO_FIELDS)
     for field in fields:
-        value = str(field)
-        if value in USER_INFO_FIELDS and value not in normalized:
+        if isinstance(field, UserInfoField):
+            value = field
+        elif isinstance(field, str):
+            try:
+                value = UserInfoField(field)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unsupported user_info_request field: {field!r}. "
+                    f"Allowed: {allowed_values}"
+                ) from exc
+        else:
+            raise TypeError(
+                "user_info_request fields must be strings or UserInfoField: "
+                f"{field!r}"
+            )
+
+        if value not in USER_INFO_FIELDS:
+            raise ValueError(
+                f"Unsupported user_info_request field: {value!r}. "
+                f"Allowed: {allowed_values}"
+            )
+        if value not in normalized:
             normalized.append(value)
     return normalized
+
+
+def _normalize_user_info_payload(payload: Any) -> UserInfo:
+    """Normalize user info payload to ensure all keys exist."""
+    if not isinstance(payload, Mapping):
+        payload = {}
+    name_affiliation = payload.get("name_affiliation")
+    if isinstance(name_affiliation, Mapping):
+        name = name_affiliation.get("name")
+        affiliation = name_affiliation.get("affiliation")
+    else:
+        name = None
+        affiliation = None
+    return {
+        "user_id": payload.get("user_id"),
+        "email": payload.get("email"),
+        "name_affiliation": {"name": name, "affiliation": affiliation},
+    }
+
+
+def _safe_debug_value(value: Any) -> Any:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<{len(value)} bytes>"
+    if isinstance(value, dict):
+        return {key: _safe_debug_value(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_safe_debug_value(item) for item in value]
+    return value
 
 
 class ValueTemplate:
@@ -256,7 +635,8 @@ class File(ValueTemplate):
             binary_data = bytes(binary_data)
         response = uploader(self.file_type, binary_data)
         logger.debug("upload result: %s", response)
-        assert "file_id" in response
+        if "file_id" not in response:
+            raise RuntimeError(f"Upload failed; response={response!r}")
         value = response["file_id"]
 
         return value, self.format_dict
@@ -447,7 +827,7 @@ class AgentInterface:
         self.charge: int = 10000
         self.convention: str = ""
         self.description: str = ""
-        self.user_info_request: list[str] = []
+        self.user_info_request: list[UserInfoField] = []
         self.input: TemplateContainer = TemplateContainer("input")
         self.condition: TemplateContainer = TemplateContainer("condition")
         self.output: TemplateContainer = TemplateContainer("output")
@@ -459,13 +839,13 @@ class AgentInterface:
         if "make_config" not in self.func_dict and (
             self.secret_token == "" or self.name is None
         ):
-            logger.exception("Secret_token and name should be specified.")
-            return
+            message = "Secret_token and name should be specified."
+            logger.exception(message)
+            raise RuntimeError(message)
         if "job_func" not in self.func_dict:
-            logger.exception(
-                "job execution function is required: Prepare a decorated function with @job_func."
-            )
-            return
+            message = "job execution function is required: Prepare a decorated function with @job_func."
+            logger.exception(message)
+            raise RuntimeError(message)
         self.make_config()
 
     def make_config(self, for_registration: bool = False) -> JsonDict:
@@ -473,7 +853,13 @@ class AgentInterface:
         if "make_config" in self.func_dict:
             self.func_dict["make_config"]()
             if self.name is None:
-                logger.exception("Agent's name should be set in config function")
+                message = "Agent's name should be set in config function"
+                logger.exception(message)
+                raise RuntimeError(message)
+            if self.secret_token == "":
+                message = "Agent's secret_token should be set in config function"
+                logger.exception(message)
+                raise RuntimeError(message)
         config_dict = dict[str, Any]()
         for item_type in ["input", "condition", "output"]:
             config_dict[item_type] = getattr(
@@ -481,8 +867,9 @@ class AgentInterface:
             )()
 
         config_dict["charge"] = self.charge
-        if self.user_info_request:
-            config_dict["user_info_request"] = list(self.user_info_request)
+        config_dict["user_info_request"] = [
+            field.value for field in self.user_info_request
+        ]
         if for_registration:
             config_dict["module_version"] = (
                 __version__  # pyright: ignore[reportUndefinedVariable]
@@ -508,6 +895,8 @@ class AgentInterface:
                     template_dict[key] = value
                 except (AssertionError, TypeError):
                     msg = "need_revision"
+            else:
+                msg = "need_revision"
         return msg, template_dict
 
     def cast(self, key: str, input_value: Any) -> Any:
@@ -565,12 +954,14 @@ class AgentInterface:
         return output_dict
 
 
-class DummyJob:
+class DummyJob(Mapping[str, Any]):
     """Fallback job used during local config generation."""
 
     _to_show_i_am_job_class = True
 
-    def __init__(self, request_params: Any, config: dict[str, str]) -> None:
+    def __init__(
+        self, request_params: Mapping[str, Any], config: dict[str, str]
+    ) -> None:
         class DummyAgentInterface:
             def __init__(self):
                 self.secret_token = config["secret_token"]
@@ -582,6 +973,7 @@ class DummyJob:
                     self.interface = DummyAgentInterface()
 
         self._agent = DummyAgent()
+        self._request = dict(request_params)
 
     def report(
         self,
@@ -591,23 +983,34 @@ class DummyJob:
     ) -> None:
         logger.info(f"[DUMMY JOB] REPORT: {msg}, {progress}, {result}")
 
-    def __getitem__(self, key: str) -> int:
-        return 0
+    def __getitem__(self, key: str) -> Any:
+        return self._request[key]
 
     def __contains__(self, key: str) -> bool:
-        return True
+        return key in self._request
+
+    def __iter__(self):
+        return iter(self._request)
+
+    def __len__(self) -> int:
+        return len(self._request)
 
 
-class Job:
-    """Runtime job wrapper used by agent job functions."""
+class Job(Mapping[str, Any]):
+    """Runtime job wrapper used by agent job functions.
+
+    Behaves like a read-only mapping of request fields.
+    """
 
     _to_show_i_am_job_class = True
 
     def __init__(self, agent: "Agent", negotiation_id: str, request: JsonDict) -> None:
         self._agent = agent
         self._negotiation_id = negotiation_id
-        self._request = request
-        self._result_dict: JsonDict = {}
+        self._request: JsonDict = request
+        self._request["_user_info"] = _normalize_user_info_payload(
+            self._request.get("_user_info")
+        )
         self._status: str = "init"
         self.id: str = negotiation_id
 
@@ -617,9 +1020,21 @@ class Job:
         progress: float | None = None,
         result: JsonDict | None = None,
     ) -> None:
-        """Post a progress or result update to the broker."""
+        """Post a progress or result update to the broker.
+
+        The broker stores the latest `msg`, `progress`, and `result` values,
+        and the UI/client APIs read the latest stored snapshot. Fields omitted
+        from a report keep their previous values. The broker merges partial
+        result payloads into the stored snapshot.
+        """
         payload: JsonDict = dict(
             negotiation_id=self._negotiation_id, status=self._status
+        )
+        logger.debug(
+            "REPORT payload: msg=%r progress=%r result=%r",
+            msg,
+            progress,
+            _safe_debug_value(result),
         )
         if msg is not None:
             payload["msg"] = msg
@@ -629,9 +1044,8 @@ class Job:
             assert isinstance(
                 result, dict
             ), "Result should be given as a dict: {result_key: result_value}"
-            self._result_dict.update(result)
             payload["result"] = self._agent.interface.format_for_output(
-                self._result_dict, self._agent.upload
+                result, self._agent.upload
             )
 
         self._agent.post("report", payload)
@@ -683,12 +1097,18 @@ class Job:
         return key in self._request
 
     @property
-    def user_info(self) -> JsonDict:
-        """User info injected by the broker (email may be an empty string)."""
-        value = self._request.get("_user_info")
-        if isinstance(value, dict):
-            return value
-        return {}
+    def user_info(self) -> UserInfo:
+        """User info injected by the broker.
+
+        Fields are populated based on the agent's `user_info_request`.
+        """
+        return cast(UserInfo, self._request["_user_info"])
+
+    def __iter__(self):
+        return iter(self._request)
+
+    def __len__(self) -> int:
+        return len(self._request)
 
     def _set_status(self, status: str) -> None:
         self._status = status
@@ -699,6 +1119,10 @@ class Agent:
 
     RESTART_INTERVAL_CRITERIA = 30
     HEARTBEAT_INTERVAL = 2
+    REQUEST_RETRY_LIMIT = 3
+    REQUEST_RETRY_BASE = 0.5
+    REQUEST_RETRY_MAX = 5.0
+    POLLING_BACKOFF_MAX = 10
     _automatic_built_agents: dict[str, "Agent"] = {}
 
     def __init__(self, broker_url: str) -> None:
@@ -711,6 +1135,17 @@ class Agent:
         self.auth: str = ""
         self.polling_interval: int = 0
         self.last_heartbeat: float = 0.0
+
+    def _increase_polling_interval(self) -> None:
+        if self.polling_interval <= 0:
+            self.polling_interval = 1
+        else:
+            self.polling_interval = min(
+                self.polling_interval * 2, self.POLLING_BACKOFF_MAX
+            )
+
+    def _reset_polling_interval(self) -> None:
+        self.polling_interval = 0
 
     def run(self, _automatic: bool = False) -> None:
         """Start the agent loop and block until shutdown if not automatic."""
@@ -751,28 +1186,59 @@ class Agent:
         """Stop agent loops and allow threads to exit."""
         self.running = False
 
-    def register_config(self) -> bool:
+    def register_config(self, *, raise_on_fail: bool = True) -> bool:
         """Register agent config and obtain an access token."""
-        for _ in range(5):
-            response = self.post(
-                "config",
-                self.interface.make_config(for_registration=True),
-                basic_auth=True,
-            )
-            if "status" in response and response["status"] == "ok":
+        attempts = 5
+        for attempt in range(attempts):
+            try:
+                response = self.post(
+                    "config",
+                    self.interface.make_config(for_registration=True),
+                    basic_auth=True,
+                )
+            except AgentConnectionError as exc:
+                logger.warning(
+                    "Cannot connect to broker (attempt %s/%s): %s",
+                    attempt + 1,
+                    attempts,
+                    exc,
+                )
+                time.sleep(_backoff_seconds(attempt, 1.0, 5.0))
+                continue
+            except AgentHTTPError as exc:
+                logger.exception("Broker returned HTTP error during config: %s", exc)
+                if raise_on_fail:
+                    raise RuntimeError(str(exc)) from exc
+                return False
+            except AgentResponseError as exc:
+                logger.exception("Broker returned invalid config response: %s", exc)
+                if raise_on_fail:
+                    raise RuntimeError(str(exc)) from exc
+                return False
+            if response.get("status") == "ok":
                 logger.info(
-                    f"Agent {self.interface.name} has successfully connected to the broker system!"
+                    "Agent %s has successfully connected to the broker system!",
+                    self.interface.name,
                 )
                 self.access_token = response["token"]
-                logger.debug(f"TOKEN {self.access_token}")
+                logger.debug("TOKEN %s", self.access_token)
                 return True
-            elif "status" in response and response["status"] == "error":
-                logger.exception(response["error_msg"])
-                break
-            else:
-                logger.warning("Cannot connect to the broker system.")
-            time.sleep(3)
-        logger.exception("Stop try connecting to the broker system.")
+            if response.get("status") == "error":
+                message = response.get("error_msg") or "unknown error"
+                logger.exception("Broker rejected config: %s", message)
+                if raise_on_fail:
+                    raise RuntimeError(message)
+                return False
+            logger.warning(
+                "Cannot connect to the broker system (attempt %s/%s).",
+                attempt + 1,
+                attempts,
+            )
+            time.sleep(_backoff_seconds(attempt, 1.0, 5.0))
+        message = "Stop try connecting to the broker system."
+        logger.exception(message)
+        if raise_on_fail:
+            raise RuntimeError(message)
         return False
 
     def heartbeat(self) -> None:
@@ -799,27 +1265,32 @@ class Agent:
     def connect(self) -> None:
         """Poll the agent message box and dispatch handlers."""
         while self.running:
-            self.last_heartbeat = time.perf_counter()
             try:
                 messages = self.check_msgbox()
+                self.last_heartbeat = time.perf_counter()
+                self._reset_polling_interval()
                 for message in messages:
                     threading.Thread(
                         target=self.process_message, args=[message], daemon=True
                     ).start()
-            except:
+            except AgentError as exc:
+                logger.warning("Message polling failed: %s", exc)
+                self._increase_polling_interval()
+            except Exception:
                 logger.exception("Error occured during the message processing")
+                self._increase_polling_interval()
             time.sleep(self.polling_interval)
 
     def check_msgbox(self) -> list[Any]:
         """Fetch queued messages from the broker."""
         response = self.get("msgbox")
-        if len(response) > 0:
-            messages = response["messages"]
-            assert isinstance(
-                messages, list
-            ), f"Response messages was not a list: {response=}"
-            return messages
-        return []
+        messages = response.get("messages")
+        if not isinstance(messages, list):
+            logger.error("Response messages was not a list: %s", response)
+            raise AgentResponseError(
+                "Response messages was not a list", payload=response
+            )
+        return messages
 
     def process_message(self, message: Mapping[str, Any]) -> None:
         """Dispatch a broker message to the appropriate handler."""
@@ -848,6 +1319,7 @@ class Agent:
                 "negotiation_id": negotiation_id,
                 "response": response,
             },
+            allow_empty=True,
         )
 
     def process_negotiation(self, body: Mapping[str, Any]) -> None:
@@ -855,6 +1327,7 @@ class Agent:
         negotiation_id = body["negotiation_id"]
         response = self.interface.make_config()
         request = body["request"]
+        request["_user_info"] = _normalize_user_info_payload(request.get("_user_info"))
         msg, input_response = self.interface.validate(request)
         response["input"] = input_response
         if msg == "ok" and self.interface.has_func("negotiation"):
@@ -872,6 +1345,7 @@ class Agent:
         self.post(
             "negotiation/response",
             {"msg": msg, "negotiation_id": negotiation_id, "response": response},
+            allow_empty=True,
         )
 
     def process_contract(self, msg: Mapping[str, Any]) -> None:
@@ -881,7 +1355,11 @@ class Agent:
         request = msg["request"]
         job = Job(self, negotiation_id, request)
         try:
-            self.post("contract/accept", {"negotiation_id": negotiation_id})
+            self.post(
+                "contract/accept",
+                {"negotiation_id": negotiation_id},
+                allow_empty=True,
+            )
             job._set_status("running")
             job.msg(f"{self.interface.name} starts running...")
 
@@ -890,11 +1368,17 @@ class Agent:
             if result is None:
                 result = {}
             job._set_status("done")
-            job.report(msg="Job done.", progress=1, result=result)
+            try:
+                job.report(msg="Job done.", progress=1, result=result)
+            except Exception:
+                logger.exception("Failed to report job completion")
         except:
             logger.exception(f"Error occured during the job execution; {msg=}")
             job._set_status("error")
-            job.report(msg="Error occured during the job.", progress=-1)
+            try:
+                job.report(msg="Error occured during the job.", progress=-1)
+            except Exception:
+                logger.exception("Failed to report job error status")
         logger.debug(f"{negotiation_id} took {time.perf_counter()-st:.3f} s.")
 
     def header(self, basic_auth: bool = False, upload: bool = False) -> JsonDict:
@@ -910,59 +1394,128 @@ class Agent:
 
         return headers
 
-    def post(self, uri: str, payload: JsonDict, basic_auth: bool = False) -> JsonDict:
-        """POST to the agent API and return JSON response."""
-        try:
-            response = requests.post(
-                f"{self.broker_url}/api/v1/agent/{uri}",
-                json=payload,
-                headers=self.header(basic_auth),
-            )
-        except requests.exceptions.ConnectionError:
-            return {}
+    def _request_json_with_retry(
+        self,
+        method: str,
+        uri: str,
+        payload: JsonDict | None = None,
+        *,
+        basic_auth: bool = False,
+        retries: int | None = None,
+        allow_empty: bool = False,
+    ) -> JsonDict:
+        url = f"{self.broker_url}/api/v1/agent/{uri}"
+        attempt_limit = self.REQUEST_RETRY_LIMIT if retries is None else retries
+        for attempt in range(attempt_limit + 1):
+            try:
+                response = requests.request(
+                    method,
+                    url,
+                    json=payload,
+                    headers=self.header(basic_auth),
+                )
+            except requests.exceptions.RequestException as exc:
+                logger.warning(
+                    "Connection error on %s request; %s (attempt %s/%s)",
+                    method,
+                    uri,
+                    attempt + 1,
+                    attempt_limit + 1,
+                )
+                logger.debug("Connection error details: %s", exc)
+                if attempt < attempt_limit:
+                    time.sleep(
+                        _backoff_seconds(
+                            attempt, self.REQUEST_RETRY_BASE, self.REQUEST_RETRY_MAX
+                        )
+                    )
+                    continue
+                logger.error(
+                    "Giving up %s request after %s attempts; %s",
+                    method,
+                    attempt_limit + 1,
+                    uri,
+                )
+                raise AgentConnectionError(
+                    f"Connection error on {method} request; {uri}"
+                ) from exc
 
-        if response.status_code == 401 and not basic_auth:
-            assert self.register_config()
-            return self.post(uri, payload)
-        elif response.status_code != 200:
-            logger.exception(f"{response.status_code}: {uri} {payload}")
-            return {}
-        obj = response.json()
-        assert isinstance(obj, dict), f"Response was not a dict: {obj}"
-        assert all(
-            isinstance(k, str) for k in obj.keys()
-        ), f"Some of response keys were not str: {obj.keys()}"
-        return obj
+            if response.status_code == 401 and not basic_auth:
+                if self.register_config(raise_on_fail=False):
+                    continue
+                logger.error("Re-auth failed; aborting %s request; %s", method, uri)
+                raise AgentHTTPError(
+                    response.status_code, uri, _coerce_error_content(response.content)
+                )
+            if response.status_code != 200:
+                logger.error(
+                    "Not 200: status=%s; uri=%s; response=%s",
+                    response.status_code,
+                    uri,
+                    response.content,
+                )
+                raise AgentHTTPError(
+                    response.status_code, uri, _coerce_error_content(response.content)
+                )
+            try:
+                obj = response.json()
+            except ValueError as exc:
+                logger.error("Non-JSON response for %s request; %s", method, uri)
+                raise AgentResponseError(
+                    f"{method} {uri} returned non-JSON response"
+                ) from exc
+            if not isinstance(obj, dict):
+                logger.error("Response was not a dict: %r", obj)
+                raise AgentResponseError(
+                    f"{method} {uri} returned non-dict response", payload=obj
+                )
+            if not obj:
+                if allow_empty:
+                    return {}
+                logger.error("Empty response for %s request; %s", method, uri)
+                raise AgentResponseError(
+                    f"{method} {uri} returned empty response", payload=obj
+                )
+            if not all(isinstance(k, str) for k in obj.keys()):
+                logger.error("Some response keys were not str: %s", obj.keys())
+                raise AgentResponseError(
+                    f"{method} {uri} returned non-str keys", payload=obj
+                )
+            return obj
+        raise AgentConnectionError(f"Connection error on {method} request; {uri}")
+
+    def post(
+        self,
+        uri: str,
+        payload: JsonDict,
+        basic_auth: bool = False,
+        *,
+        allow_empty: bool = False,
+    ) -> JsonDict:
+        """POST to the agent API and return JSON response.
+
+        Retries transient connection errors with backoff and logs failures.
+        """
+        return self._request_json_with_retry(
+            "POST",
+            uri,
+            payload,
+            basic_auth=basic_auth,
+            allow_empty=allow_empty,
+        )
 
     def get(self, uri: str, basic_auth: bool = False) -> JsonDict:
-        """GET from the agent API and return JSON response."""
-        try:
-            response = requests.get(
-                f"{self.broker_url}/api/v1/agent/{uri}", headers=self.header(basic_auth)
-            )
-        except requests.exceptions.ConnectionError:
-            if self.polling_interval < 10:
-                self.polling_interval += 1
-            return {}
+        """GET from the agent API and return JSON response.
 
-        if response.status_code == 401 and not basic_auth:
-            assert self.register_config()
-            return self.get(uri)
-        elif response.status_code != 200:
-            logger.exception(response.status_code)
-            if self.polling_interval < 10:
-                self.polling_interval += 1
-            return {}
-        self.polling_interval = 0
-        obj = response.json()
-        assert isinstance(obj, dict), f"Response was not a dict: {obj}"
-        assert all(
-            isinstance(k, str) for k in obj.keys()
-        ), f"Some of response keys were not str: {obj.keys()}"
-        return obj
+        Retries transient connection errors with backoff and logs failures.
+        """
+        return self._request_json_with_retry("GET", uri, basic_auth=basic_auth)
 
     def upload(self, file_type: str, binary_data: bytes) -> JsonDict:
-        """Upload a binary payload and return the broker file id."""
+        """Upload a binary payload and return the broker file id.
+
+        Retries transient connection errors with backoff and logs failures.
+        """
         file_name = "__file_name__"
         mime_dict = {
             "png": "image/png",
@@ -974,26 +1527,68 @@ class Agent:
         }
         assert file_type in mime_dict
         files = {file_type: (file_name, binary_data, mime_dict[file_type])}
-        try:
-            response = requests.post(
-                f"{self.broker_url}/api/v1/agent/upload",
-                headers=self.header(upload=True),
-                files=files,
-            )
-        except requests.exceptions.ConnectionError:
-            logger.exception("Cannot connect to the broker system for upload")
-            return {}
-        return response.json()
+        for attempt in range(self.REQUEST_RETRY_LIMIT + 1):
+            try:
+                response = requests.post(
+                    f"{self.broker_url}/api/v1/agent/upload",
+                    headers=self.header(upload=True),
+                    files=files,
+                )
+            except requests.exceptions.RequestException as exc:
+                logger.warning(
+                    "Connection error during upload (attempt %s/%s)",
+                    attempt + 1,
+                    self.REQUEST_RETRY_LIMIT + 1,
+                )
+                logger.debug("Upload connection error details: %s", exc)
+                if attempt < self.REQUEST_RETRY_LIMIT:
+                    time.sleep(
+                        _backoff_seconds(
+                            attempt, self.REQUEST_RETRY_BASE, self.REQUEST_RETRY_MAX
+                        )
+                    )
+                    continue
+                logger.error("Giving up upload after retries")
+                raise AgentConnectionError("Connection error during upload") from exc
+            if response.status_code != 200:
+                logger.error(
+                    "Upload failed: status=%s; response=%s",
+                    response.status_code,
+                    response.content,
+                )
+                raise AgentHTTPError(
+                    response.status_code,
+                    "upload",
+                    _coerce_error_content(response.content),
+                )
+            try:
+                obj = response.json()
+            except ValueError as exc:
+                logger.error("Upload returned non-JSON response")
+                raise AgentResponseError("Upload returned non-JSON response") from exc
+            if not isinstance(obj, dict):
+                logger.error("Upload response was not a dict: %r", obj)
+                raise AgentResponseError("Upload response was not a dict", payload=obj)
+            if not obj:
+                logger.error("Upload returned empty response")
+                raise AgentResponseError("Upload returned empty response", payload=obj)
+            return obj
+        raise AgentConnectionError("Connection error during upload")
 
     def register_func(self, func_name: str, func: Callable[..., Any]) -> None:
         """Register a handler function on the agent."""
         self.agent_funcs[func_name] = func
 
     ##### wrapper functions #####
-    def config(self, func: Callable[[], None]) -> Callable[[], None]:
-        """Decorator for the configuration builder."""
+    def config(self, func: Callable[P, None]) -> Callable[P, None]:
+        """Decorator for the configuration builder.
 
-        def wrapper(*args, **kwargs):
+        Optional: You may omit this if you set `agent.name` and
+        `agent.secret_token` programmatically before running the agent.
+        """
+
+        @functools.wraps(func)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:
             return func(*args, **kwargs)
 
         self.register_func("make_config", wrapper)
@@ -1005,28 +1600,48 @@ class Agent:
             [JsonDict, JsonDict],
             tuple[Literal["ok", "need_revision", "ng"], JsonDict],
         ],
-    ) -> Callable[..., Any]:
-        """Decorator for custom negotiation logic."""
+    ) -> Callable[
+        [JsonDict, JsonDict],
+        tuple[Literal["ok", "need_revision", "ng"], JsonDict],
+    ]:
+        """Decorator for custom negotiation logic.
 
-        def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
+        Optional: If omitted, only schema validation runs and the
+        default response is returned.
+        """
+
+        @functools.wraps(func)
+        def wrapper(
+            request: JsonDict, response: JsonDict
+        ) -> tuple[Literal["ok", "need_revision", "ng"], JsonDict]:
+            return func(request, response)
 
         self.register_func("negotiation", wrapper)
         return wrapper
 
-    def charge_func(self, func: Callable[[JsonDict], int]) -> Callable[..., Any]:
-        """Decorator for custom charge calculation."""
+    def charge_func(self, func: Callable[[JsonDict], int]) -> Callable[[JsonDict], int]:
+        """Decorator for custom charge calculation.
 
-        def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
+        Optional: If omitted, the configured `agent.charge` is used.
+        """
+
+        @functools.wraps(func)
+        def wrapper(input_values: JsonDict) -> int:
+            return func(input_values)
 
         self.register_func("charge_func", wrapper)
         return wrapper
 
-    def job_func(self, func: Callable[..., JsonDict | None]) -> Callable[..., Any]:
-        """Decorator for the main job function."""
+    def job_func(
+        self, func: Callable[P, JsonDict | None]
+    ) -> Callable[P, JsonDict | None]:
+        """Decorator for the main job function.
 
-        def wrapper(*args, **kwargs):
+        The job argument (if provided) implements Mapping[str, Any] semantics.
+        """
+
+        @functools.wraps(func)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> JsonDict | None:
             return func(*args, **kwargs)
 
         self.register_func("job_func", wrapper)
@@ -1071,7 +1686,7 @@ class Agent:
     @classmethod
     def add_config(
         cls, broker_url: str | None = None, secret_token: str | None = None
-    ) -> Callable[..., Callable[..., Any]]:
+    ) -> Callable[[Callable[P, R]], Callable[P, R]]:
         """Decorator to inject broker_url/secret_token into a job func."""
         config_dict = dict[str, str]()
         if broker_url is not None:
@@ -1079,14 +1694,15 @@ class Agent:
         if secret_token is not None:
             config_dict["secret_token"] = secret_token
 
-        def add_config_func(func: Callable[..., Any]):
-            def wrapper(*args, **kwargs):
+        def add_config_func(func: Callable[P, R]) -> Callable[P, R]:
+            @functools.wraps(func)
+            def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
                 return func(*args, **kwargs)
 
-            wrapper._additional_config = (  # pyright: ignore[reportFunctionMemberAccess]
+            wrapper._additional_config = (  # pyright: ignore[reportAttributeAccessIssue]
                 config_dict
             )
-            wrapper._original_keys = (  # pyright: ignore[reportFunctionMemberAccess]
+            wrapper._original_keys = (  # pyright: ignore[reportAttributeAccessIssue]
                 list(inspect.signature(func).parameters)
             )
             return wrapper
@@ -1096,18 +1712,22 @@ class Agent:
     ##### interface for agent interface #####
     @property
     def input(self):
+        """Input schema container used during negotiation."""
         return self.interface.input
 
     @property
     def output(self):
+        """Output schema container used to format results."""
         return self.interface.output
 
     @property
     def condition(self):
+        """Condition schema container for optional negotiation inputs."""
         return self.interface.condition
 
     @property
     def secret_token(self):
+        """Agent secret token used for broker authentication."""
         return self.interface.secret_token
 
     @secret_token.setter
@@ -1116,6 +1736,7 @@ class Agent:
 
     @property
     def name(self):
+        """Agent name shown in broker listings."""
         return self.interface.name
 
     @name.setter
@@ -1124,6 +1745,7 @@ class Agent:
 
     @property
     def convention(self):
+        """Optional convention label included in the agent config."""
         return self.interface.convention
 
     @convention.setter
@@ -1132,6 +1754,7 @@ class Agent:
 
     @property
     def description(self):
+        """Human-readable description shown to users."""
         return self.interface.description
 
     @description.setter
@@ -1140,6 +1763,11 @@ class Agent:
 
     @property
     def charge(self):
+        """Default charge used when no `charge_func` is provided.
+
+        Note: The broker platform fee is 20% plus 10% per requested user info
+        field (deducted from the agent payout).
+        """
         return self.interface.charge
 
     @charge.setter
@@ -1147,11 +1775,12 @@ class Agent:
         self.interface.charge = charge
 
     @property
-    def user_info_request(self) -> list[str]:
+    def user_info_request(self) -> list[UserInfoField]:
+        """List of requested user info fields for negotiation consent."""
         return list(self.interface.user_info_request)
 
     @user_info_request.setter
-    def user_info_request(self, fields: Iterable[str]) -> None:
+    def user_info_request(self, fields: Iterable[UserInfoField]) -> None:
         self.interface.user_info_request = _normalize_user_info_fields(fields)
 
     def request_user_info(
@@ -1161,18 +1790,18 @@ class Agent:
         email: bool = False,
         name_affiliation: bool = False,
     ) -> None:
-        """Request user info during negotiation (email may be an empty string).
+        """Request user info during negotiation.
 
         Approved fields are delivered under `_user_info` in negotiation requests
         and exposed as `job.user_info` during contract execution.
         """
-        fields: list[str] = []
+        fields: list[UserInfoField] = []
         if user_id:
-            fields.append("user_id")
+            fields.append(UserInfoField.USER_ID)
         if email:
-            fields.append("email")
+            fields.append(UserInfoField.EMAIL)
         if name_affiliation:
-            fields.append("name_affiliation")
+            fields.append(UserInfoField.NAME_AFFILIATION)
         self.user_info_request = fields
 
 
@@ -1384,17 +2013,26 @@ class AgentConstructor:
         try:
             with self.config_path.open() as f:
                 self.config = json.load(f)
-        except:
+        except FileNotFoundError:
             self.config = {}
+        except json.JSONDecodeError as exc:
+            logger.exception("Invalid config JSON: %s", self.config_path)
+            raise exc
+        except Exception as exc:
+            logger.exception("Failed to load config: %s", self.config_path)
+            raise exc
 
     def fill_config(self) -> None:
         """Fill required top-level config values (broker_url, secret_token, etc.)."""
         broker_url = self.fill_config_item("broker_url")
-        assert broker_url.startswith("http"), "broker_url should be properly specified."
+        if not broker_url.startswith("http"):
+            raise ValueError("broker_url should be properly specified.")
         secret_token = self.fill_config_item("secret_token")
-        assert len(secret_token) > 0, "secret_token should be set"
+        if len(secret_token) == 0:
+            raise ValueError("secret_token should be set")
         charge = self.fill_config_item("charge", int)
-        assert charge > 0, "charge should be larger than 0"
+        if charge <= 0:
+            raise ValueError("charge should be larger than 0")
         _ = self.fill_config_item("description")
 
     def fill_config_item(self, key: str, astype: type = str) -> Any:
@@ -1490,78 +2128,166 @@ class Broker:
         agent_id: str,
         request: JsonDict,
         *,
-        user_info_consent: Iterable[str] | None = None,
-    ) -> JsonDict:
-        """Full flow helper: negotiate -> contract -> wait for result."""
-        response = self.negotiate(
+        user_info_consent: Iterable[UserInfoField] | None = None,
+    ) -> ResultResponse:
+        """Execute negotiate -> contract -> wait for result.
+
+        Args:
+            agent_id: Target agent id.
+            request: Input payload for negotiation.
+            user_info_consent: Optional consent fields (`user_id`, `email`,
+                `name_affiliation`) to include in the request.
+
+        Returns:
+            Result payload once the job finishes.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error
+                (including negotiation states other than "ok").
+        """
+        negotiation = self.negotiate(
             agent_id, request, user_info_consent=user_info_consent
         )
-        if "negotiation_id" not in response:
-            raise Exception(f"Cannot communicate with Agent {agent_id}")
-
-        negotiation_id = response["negotiation_id"]
-        response = self.contract(negotiation_id)
-        if "status" not in response:
-            raise Exception(f"Server error")
-        if response["status"] == "error":
-            raise Exception(
-                f"Cannot make a contract with Agent {agent_id}: {response['error_msg']}"
-            )
-        result = self.get_result(negotiation_id)
-
-        return result
+        state = _require_key(negotiation, "state", "negotiate")
+        if state != "ok":
+            content = negotiation.get("content", {})
+            error_msg = None
+            if isinstance(content, dict):
+                error_msg = content.get("error_msg")
+            message = f"Negotiation returned {state}"
+            if error_msg:
+                message = f"{message}: {error_msg}"
+            raise BrokerResponseError(message, payload=negotiation)
+        negotiation_id = _require_key(negotiation, "negotiation_id", "negotiate")
+        self.contract(cast(str, negotiation_id))
+        return self.get_result(cast(str, negotiation_id))
 
     def negotiate(
         self,
         agent_id: str,
         request: JsonDict,
         *,
-        user_info_consent: Iterable[str] | None = None,
-    ) -> JsonDict:
+        user_info_consent: Iterable[UserInfoField] | None = None,
+    ) -> NegotiationResponse:
         """Start negotiation and send the first request.
 
         Use `user_info_consent` to approve sharing `user_id`, `email`,
         and/or `name_affiliation` when the agent requests it.
+
+        Args:
+            agent_id: Target agent id.
+            request: Input payload for negotiation.
+            user_info_consent: Optional consent fields to include in the request.
+
+        Returns:
+            Negotiation response payload including `negotiation_id`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
         """
         request_payload = self._with_user_info_consent(request, user_info_consent)
         response = self.post(
             "negotiate", {"agent_id": agent_id, "request": request_payload}
         )
-        return response
+        _require_key(response, "negotiation_id", "negotiate")
+        content = _require_mapping(response, "content", "negotiate")
+        requested = _require_str_list(content, "user_info_request", "negotiate")
+        content["user_info_request"] = _normalize_user_info_fields(requested)
+        return cast(NegotiationResponse, response)
 
-    def begin_negotiation(self, agent_id: str) -> JsonDict:
+    def begin_negotiation(self, agent_id: str) -> NegotiationResponse:
         """Begin negotiation to fetch input schema before sending a request.
 
         If the response content includes `user_info_request`, pass that list
         as `user_info_consent` when calling negotiate/ask.
+
+        Args:
+            agent_id: Target agent id.
+
+        Returns:
+            Response payload including `negotiation_id` and `content`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
         """
         response = self.post("negotiation/begin", {"agent_id": agent_id})
-        return response
+        _require_key(response, "negotiation_id", "begin_negotiation")
+        content = _require_mapping(response, "content", "begin_negotiation")
+        requested = _require_str_list(content, "user_info_request", "begin_negotiation")
+        content["user_info_request"] = _normalize_user_info_fields(requested)
+        return cast(NegotiationResponse, response)
 
-    def contract(self, negotiation_id: str) -> JsonDict:
-        """Request a contract for a negotiated job."""
+    def contract(self, negotiation_id: str) -> ContractResponse:
+        """Request a contract for a negotiated job.
+
+        Args:
+            negotiation_id: Negotiation id returned by begin/negotiation.
+
+        Returns:
+            Contract response payload.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
         response = self.post("contract", {"negotiation_id": negotiation_id})
-        return response
+        _require_key(response, "status", "contract")
+        return cast(ContractResponse, response)
 
-    def get_result(self, negotiation_id: str) -> JsonDict:
-        """Poll the broker for results until done/error."""
+    def get_result(self, negotiation_id: str) -> ResultResponse:
+        """Poll the broker for results until done/error.
+
+        Args:
+            negotiation_id: Negotiation id to poll.
+
+        Returns:
+            Final result payload when status reaches done.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
         msg = ""
         while True:
             response = self.get(f"result/{negotiation_id}")
-            assert len(response) > 0, "Bad response error"
+            status = _require_key(response, "status", "get_result")
+            _require_key(response, "msg", "get_result")
+            _require_key(response, "progress", "get_result")
+            _require_key(response, "result", "get_result")
             if response["msg"] != msg:
                 msg = response["msg"]
                 logger.debug(msg)
-            if response["status"] in ["done", "error"]:
+            if status in ["done", "error"]:
                 break
             time.sleep(1)
         if response["status"] == "error":
-            raise Exception(f"Error response from agent: {response['msg']}")
-        return response
+            raise BrokerResponseError(
+                f"Error response from agent: {response['msg']}", payload=response
+            )
+        return cast(ResultResponse, response)
 
-    def board(self) -> JsonDict:
-        """Return the board listing (same payload as broker board)."""
-        return self.get("board")
+    def board(self) -> BoardResponse:
+        """Return the board listing (same payload as broker board).
+
+        Returns:
+            Board payload with `agents`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self.get("board")
+        _require_list(response, "agents", "board")
+        return cast(BoardResponse, response)
 
     @property
     def header_auth(self) -> dict[str, str]:
@@ -1577,74 +2303,94 @@ class Broker:
         return headers
 
     def _with_user_info_consent(
-        self, request: JsonDict, consent: Iterable[str] | None
+        self, request: JsonDict, consent: Iterable[UserInfoField] | None
     ) -> JsonDict:
         """Attach user info consent to the request payload."""
         if not consent:
             return request
         payload = dict(request)
-        payload["_user_info_consent"] = _normalize_user_info_fields(consent)
+        payload["_user_info_consent"] = [
+            field.value for field in _normalize_user_info_fields(consent)
+        ]
         return payload
 
     def post(self, uri: str, payload: JsonDict) -> JsonDict:
-        """POST to the client API and return JSON."""
-        try:
-            response = requests.post(
-                f"{self.broker_url}/api/v1/client/{uri}",
-                json=payload,
-                headers=self.header,
-            )
-        except requests.exceptions.ConnectionError:
-            logger.exception("Connection error on post request")
-            raise
-        if response.status_code != 200:
-            logger.exception(response.status_code)
-            return {}
-        obj = response.json()
-        assert isinstance(obj, dict), f"Response was not a dict: {obj}"
-        assert all(
-            isinstance(k, str) for k in obj.keys()
-        ), f"Some of response keys were not str: {obj.keys()}"
-        return obj
+        """POST to the client API and return JSON.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        return self._request_json("POST", uri, payload)
 
     def get(self, uri: str) -> JsonDict:
-        """GET from the client API and return JSON."""
-        try:
-            response = requests.get(
-                f"{self.broker_url}/api/v1/client/{uri}", headers=self.header
-            )
-        except requests.exceptions.ConnectionError:
-            logger.exception(f"Connection error on get request; {uri=}")
-            return {}
+        """GET from the client API and return JSON.
 
-        if response.status_code != 200:
-            logger.exception(
-                f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
-            )
-            return {}
-        obj = response.json()
-        assert isinstance(obj, dict), f"Response was not a dict: {obj}"
-        assert all(
-            isinstance(k, str) for k in obj.keys()
-        ), f"Some of response keys were not str: {obj.keys()}"
-        return obj
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        return self._request_json("GET", uri)
 
     def get_file(self, uri: str) -> requests.Response:
-        """Download a file from the client API and return a raw Response."""
+        """Download a file from the client API and return a raw Response.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+        """
         try:
             response = requests.get(
                 f"{self.broker_url}/api/v1/client/{uri}", headers=self.header_auth
             )
-        except requests.exceptions.ConnectionError:
+        except requests.exceptions.RequestException as exc:
             logger.exception(f"Connection error on get request; {uri=}")
-            raise Exception("Connection error")
+            raise BrokerConnectionError(
+                f"Connection error on get request; {uri=}"
+            ) from exc
 
         if response.status_code != 200:
             logger.exception(
                 f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
             )
-            raise Exception("Not 200")
+            raise BrokerHTTPError(
+                response.status_code, uri, _coerce_error_content(response.content)
+            )
         return response
+
+    def _request_json(
+        self, method: str, uri: str, payload: JsonDict | None = None
+    ) -> JsonDict:
+        url = f"{self.broker_url}/api/v1/client/{uri}"
+        try:
+            response = requests.request(method, url, json=payload, headers=self.header)
+        except requests.exceptions.RequestException as exc:
+            logger.exception(f"Connection error on {method} request; {uri=}")
+            raise BrokerConnectionError(
+                f"Connection error on {method} request; {uri=}"
+            ) from exc
+
+        if response.status_code != 200:
+            logger.exception(
+                f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
+            )
+            raise BrokerHTTPError(
+                response.status_code, uri, _coerce_error_content(response.content)
+            )
+
+        try:
+            obj = response.json()
+        except ValueError as exc:
+            raise BrokerResponseError(
+                f"{method} {uri} returned non-JSON response"
+            ) from exc
+        obj = _ensure_response_dict(obj, f"{method} {uri}")
+        assert all(
+            isinstance(k, str) for k in obj.keys()
+        ), f"Some of response keys were not str: {obj.keys()}"
+        return obj
 
 
 class BrokerAdmin:
@@ -1679,18 +2425,27 @@ class BrokerAdmin:
                 json=payload,
                 headers=self.header,
             )
-        except requests.exceptions.ConnectionError:
+        except requests.exceptions.RequestException as exc:
             logger.exception(f"Connection error on {method} request; {uri=}")
-            return {}
+            raise BrokerConnectionError(
+                f"Connection error on {method} request; {uri=}"
+            ) from exc
 
         if response.status_code != 200:
             logger.exception(
                 f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
             )
-            return {}
+            raise BrokerHTTPError(
+                response.status_code, uri, _coerce_error_content(response.content)
+            )
 
-        obj = response.json()
-        assert isinstance(obj, dict), f"Response was not a dict: {obj}"
+        try:
+            obj = response.json()
+        except ValueError as exc:
+            raise BrokerResponseError(
+                f"{method} {uri} returned non-JSON response"
+            ) from exc
+        obj = _ensure_response_dict(obj, f"{method} {uri}")
         assert all(
             isinstance(k, str) for k in obj.keys()
         ), f"Some of response keys were not str: {obj.keys()}"
@@ -1701,38 +2456,88 @@ class BrokerAdmin:
             response = requests.get(
                 f"{self.broker_url}/api/v1/broker/{uri}", headers=self.header_auth
             )
-        except requests.exceptions.ConnectionError:
+        except requests.exceptions.RequestException as exc:
             logger.exception(f"Connection error on get request; {uri=}")
-            raise Exception("Connection error")
+            raise BrokerConnectionError(
+                f"Connection error on get request; {uri=}"
+            ) from exc
 
         if response.status_code != 200:
             logger.exception(
                 f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
             )
-            raise Exception("Not 200")
+            raise BrokerHTTPError(
+                response.status_code, uri, _coerce_error_content(response.content)
+            )
 
         return response
 
     # Board + results
-    def board(self) -> JsonDict:
+    def board(self) -> BoardResponse:
         """Return the board listing (agents + active flag).
 
         Requires a user token and returns the same payload as /api/v1/client/board.
-        """
-        return self._request_json("GET", "board")
 
-    def list_results(self) -> JsonDict:
-        """Return the result list for the current user."""
-        return self._request_json("GET", "results")
+        Returns:
+            Board payload with `agents`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json("GET", "board")
+        _require_list(response, "agents", "board")
+        return cast(BoardResponse, response)
+
+    def list_results(self) -> ResultsResponse:
+        """Return the result list for the current user.
+
+        Returns:
+            Results payload with `contracts`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json("GET", "results")
+        _require_list(response, "contracts", "list_results")
+        return cast(ResultsResponse, response)
 
     # Agents
-    def list_agents(self) -> JsonDict:
-        """Return agents visible to the current user."""
-        return self._request_json("GET", "agents")
+    def list_agents(self) -> AgentsResponse:
+        """Return agents visible to the current user.
 
-    def get_agent(self, agent_id: str) -> JsonDict:
-        """Return details for a specific agent."""
-        return self._request_json("GET", f"agents/{agent_id}")
+        Returns:
+            Payload with `agents`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json("GET", "agents")
+        _require_list(response, "agents", "list_agents")
+        return cast(AgentsResponse, response)
+
+    def get_agent(self, agent_id: str) -> AgentResponse:
+        """Return details for a specific agent.
+
+        Args:
+            agent_id: Target agent id.
+
+        Returns:
+            Payload with `agent`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json("GET", f"agents/{agent_id}")
+        _require_mapping(response, "agent", "get_agent")
+        return cast(AgentResponse, response)
 
     def create_agent(
         self,
@@ -1740,8 +2545,23 @@ class BrokerAdmin:
         agent_type: str,
         category: str,
         is_public: bool = True,
-    ) -> JsonDict:
-        """Create a new agent owned by the current user (defaults to public)."""
+    ) -> AgentResponse:
+        """Create a new agent owned by the current user (defaults to public).
+
+        Args:
+            name: Agent display name.
+            agent_type: Agent type string.
+            category: Agent category.
+            is_public: Whether to publish the agent.
+
+        Returns:
+            Payload with `agent`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
         payload: JsonDict = {
             "servicer_agent": {
                 "name": name,
@@ -1750,20 +2570,63 @@ class BrokerAdmin:
                 "is_public": is_public,
             }
         }
-        return self._request_json("POST", "agents", payload)
+        response = self._request_json("POST", "agents", payload)
+        _require_mapping(response, "agent", "create_agent")
+        return cast(AgentResponse, response)
 
-    def update_agent(self, agent_id: str, **fields: Any) -> JsonDict:
-        """Update an existing agent (name/type/category/is_public)."""
-        return self._request_json(
+    def update_agent(self, agent_id: str, **fields: Any) -> AgentResponse:
+        """Update an existing agent (name/type/category/is_public).
+
+        Args:
+            agent_id: Target agent id.
+            **fields: Fields to update.
+
+        Returns:
+            Payload with `agent`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json(
             "PATCH", f"agents/{agent_id}", {"servicer_agent": fields}
         )
+        _require_mapping(response, "agent", "update_agent")
+        return cast(AgentResponse, response)
 
-    def delete_agent(self, agent_id: str) -> JsonDict:
-        """Delete an agent owned by the current user."""
-        return self._request_json("DELETE", f"agents/{agent_id}")
+    def delete_agent(self, agent_id: str) -> StatusResponse:
+        """Delete an agent owned by the current user.
+
+        Args:
+            agent_id: Target agent id.
+
+        Returns:
+            Payload with `status`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json("DELETE", f"agents/{agent_id}")
+        _require_key(response, "status", "delete_agent")
+        return cast(StatusResponse, response)
 
     def download_agent_template(self, agent_id: str, simple: bool = False) -> str:
-        """Download the agent Python template as text."""
+        """Download the agent Python template as text.
+
+        Args:
+            agent_id: Target agent id.
+            simple: Whether to fetch the simplified template.
+
+        Returns:
+            Python source code template.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+        """
         path = (
             f"agents/{agent_id}/template_simple"
             if simple
@@ -1773,59 +2636,209 @@ class BrokerAdmin:
         return response.text
 
     # Access tokens
-    def list_access_tokens(self) -> JsonDict:
-        """List broker access tokens for the current user."""
-        return self._request_json("GET", "access_tokens")
+    def list_access_tokens(self) -> TokensResponse:
+        """List broker access tokens for the current user.
 
-    def issue_access_token(self, label: str) -> JsonDict:
-        """Issue a new access token with a label."""
-        return self._request_json("POST", "access_tokens", {"label": label})
+        Returns:
+            Payload with `tokens`.
 
-    def revoke_access_token(self, token: str) -> JsonDict:
-        """Revoke an existing access token."""
-        return self._request_json("DELETE", f"access_tokens/{token}")
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json("GET", "access_tokens")
+        _require_list(response, "tokens", "list_access_tokens")
+        return cast(TokensResponse, response)
+
+    def issue_access_token(self, label: str) -> AccessTokenResponse:
+        """Issue a new access token with a label.
+
+        Args:
+            label: Token label.
+
+        Returns:
+            Payload with `token`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json("POST", "access_tokens", {"label": label})
+        _require_key(response, "token", "issue_access_token")
+        return cast(AccessTokenResponse, response)
+
+    def revoke_access_token(self, token: str) -> StatusResponse:
+        """Revoke an existing access token.
+
+        Args:
+            token: Token string.
+
+        Returns:
+            Payload with `status`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json("DELETE", f"access_tokens/{token}")
+        _require_key(response, "status", "revoke_access_token")
+        return cast(StatusResponse, response)
 
     # User profile
-    def get_user(self) -> JsonDict:
-        """Return the current user's profile."""
-        return self._request_json("GET", "user")
+    def get_user(self) -> UserResponse:
+        """Return the current user's profile.
 
-    def create_user(self, name: str, affiliation: str | None = None) -> JsonDict:
-        """Create a user record for the current auth id if missing."""
+        Returns:
+            Payload with `user`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json("GET", "user")
+        _require_mapping(response, "user", "get_user")
+        return cast(UserResponseWithStatus, response)
+
+    def create_user(
+        self, name: str, affiliation: str | None = None
+    ) -> UserResponseWithStatus:
+        """Create a user record for the current auth id if missing.
+
+        Args:
+            name: User display name.
+            affiliation: Optional affiliation.
+
+        Returns:
+            Payload with `user`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
         payload = {"user": {"name": name, "affiliation": affiliation}}
-        return self._request_json("POST", "user", payload)
+        response = self._request_json("POST", "user", payload)
+        _require_mapping(response, "user", "create_user")
+        return cast(UserResponseWithStatus, response)
 
     def update_user(
         self, name: str | None = None, affiliation: str | None = None
-    ) -> JsonDict:
-        """Update the current user's profile fields."""
+    ) -> UserResponse:
+        """Update the current user's profile fields.
+
+        Args:
+            name: Updated name (optional).
+            affiliation: Updated affiliation (optional).
+
+        Returns:
+            Payload with `user`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
         payload: JsonDict = {"user": {}}
         if name is not None:
             payload["user"]["name"] = name
         if affiliation is not None:
             payload["user"]["affiliation"] = affiliation
-        return self._request_json("PATCH", "user", payload)
+        response = self._request_json("PATCH", "user", payload)
+        _require_mapping(response, "user", "update_user")
+        return cast(UserResponse, response)
 
     # Admin/self endpoints
-    def list_users(self) -> JsonDict:
-        """List users (admin sees all; non-admin sees self)."""
-        return self._request_json("GET", "users")
+    def list_users(self) -> UsersResponse:
+        """List users (admin sees all; non-admin sees self).
 
-    def get_user_by_id(self, user_id: str) -> JsonDict:
-        """Fetch a specific user by id."""
-        return self._request_json("GET", f"users/{user_id}")
+        Returns:
+            Payload with `users`.
 
-    def update_user_by_id(self, user_id: str, **fields: Any) -> JsonDict:
-        """Update a user by id (self-only unless admin rules change)."""
-        return self._request_json("PATCH", f"users/{user_id}", {"user": fields})
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json("GET", "users")
+        _require_list(response, "users", "list_users")
+        return cast(UsersResponse, response)
 
-    def delete_user(self, user_id: str) -> JsonDict:
-        """Delete a user by id (self-only)."""
-        return self._request_json("DELETE", f"users/{user_id}")
+    def get_user_by_id(self, user_id: str) -> UserResponse:
+        """Fetch a specific user by id.
 
-    def deposit_user(self, user_id: str) -> JsonDict:
-        """Deposit points to a user (self-only in current policy)."""
-        return self._request_json("POST", f"users/{user_id}/deposit")
+        Args:
+            user_id: Target user id.
+
+        Returns:
+            Payload with `user`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json("GET", f"users/{user_id}")
+        _require_mapping(response, "user", "get_user_by_id")
+        return cast(UserResponse, response)
+
+    def update_user_by_id(self, user_id: str, **fields: Any) -> UserResponse:
+        """Update a user by id (self-only unless admin rules change).
+
+        Args:
+            user_id: Target user id.
+            **fields: Fields to update.
+
+        Returns:
+            Payload with `user`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json("PATCH", f"users/{user_id}", {"user": fields})
+        _require_mapping(response, "user", "update_user_by_id")
+        return cast(UserResponse, response)
+
+    def delete_user(self, user_id: str) -> StatusResponse:
+        """Delete a user by id (self-only).
+
+        Args:
+            user_id: Target user id.
+
+        Returns:
+            Payload with `status`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json("DELETE", f"users/{user_id}")
+        _require_key(response, "status", "delete_user")
+        return cast(StatusResponse, response)
+
+    def deposit_user(self, user_id: str) -> UserResponse:
+        """Deposit points to a user (self-only in current policy).
+
+        Args:
+            user_id: Target user id.
+
+        Returns:
+            Payload with `user`.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerResponseError: If the response payload is malformed or indicates error.
+        """
+        response = self._request_json("POST", f"users/{user_id}/deposit")
+        _require_mapping(response, "user", "deposit_user")
+        return cast(UserResponse, response)
 
 
 class AgentManager:
