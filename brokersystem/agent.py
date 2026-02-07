@@ -61,6 +61,23 @@ TemplateSchema = TypedDict(
     total=False,
 )
 
+
+class UiPreviewVega(TypedDict):
+    """UI preview declaration for Vega specs.
+
+    Notes:
+    - The broker UI should treat this as untrusted input and render it in a sandbox.
+    - Agents should not embed secrets in the spec.
+    """
+
+    type: Literal["vega"]
+    spec: JsonDict
+
+
+# Future: `UiPreview` will become a union of multiple preview types.
+UiPreview = UiPreviewVega
+
+
 ResultPayload = dict[str, ResultValue]
 
 
@@ -94,6 +111,7 @@ class NegotiationContent(NegotiationContentBase, total=False):
     condition: TemplateSchema
     output: TemplateSchema
     charge: int
+    ui_preview: UiPreview
 
 
 class NegotiationResponse(TypedDict):
@@ -405,6 +423,26 @@ def _normalize_user_info_payload(payload: Any) -> UserInfo:
         "email": payload.get("email"),
         "name_affiliation": {"name": name, "affiliation": affiliation},
     }
+
+
+def _normalize_ui_preview(value: Mapping[str, Any]) -> UiPreview:
+    """Validate and normalize agent-provided UI preview declarations.
+
+    Raises:
+        TypeError: If ui_preview is not a mapping, or if its fields are malformed.
+        ValueError: If ui_preview has an unsupported `type`.
+    """
+    preview = dict(value)
+    preview_type = preview.get("type")
+    if preview_type != "vega":
+        raise ValueError(
+            "ui_preview.type must be 'vega' when set " f"(got {preview_type!r})"
+        )
+    spec = preview.get("spec")
+    if not isinstance(spec, Mapping):
+        raise TypeError("ui_preview.spec must be a mapping when set")
+    preview["spec"] = dict(spec)
+    return cast(UiPreviewVega, preview)
 
 
 def _safe_debug_value(value: Any) -> Any:
@@ -860,6 +898,7 @@ class AgentInterface:
         self.convention: str = ""
         self.description: str = ""
         self.user_info_request: list[UserInfoField] = []
+        self.ui_preview: UiPreview | None = None
         self.input: TemplateContainer = TemplateContainer("input")
         self.condition: TemplateContainer = TemplateContainer("condition")
         self.output: TemplateContainer = TemplateContainer("output")
@@ -902,6 +941,10 @@ class AgentInterface:
         config_dict["user_info_request"] = [
             field.value for field in self.user_info_request
         ]
+        if self.ui_preview is not None:
+            if not isinstance(self.ui_preview, dict):
+                raise TypeError("Agent ui_preview must be a dict when set")
+            config_dict["ui_preview"] = _normalize_ui_preview(self.ui_preview)
         if for_registration:
             config_dict["module_version"] = (
                 __version__  # pyright: ignore[reportUndefinedVariable]
@@ -1809,6 +1852,25 @@ class Agent:
     @user_info_request.setter
     def user_info_request(self, fields: Iterable[UserInfoField]) -> None:
         self.interface.user_info_request = _normalize_user_info_fields(fields)
+
+    @property
+    def ui_preview(self) -> UiPreview | None:
+        """Optional UI preview declaration included in agent config.
+
+        The broker UI may render this declaration (e.g., a Vega spec) during
+        negotiation. Treat it as public: do not embed secrets.
+        """
+
+        return self.interface.ui_preview
+
+    @ui_preview.setter
+    def ui_preview(self, value: Mapping[str, Any] | None) -> None:
+        if value is None:
+            self.interface.ui_preview = None
+            return
+        if not isinstance(value, Mapping):
+            raise TypeError("agent.ui_preview must be a dict-like mapping")
+        self.interface.ui_preview = _normalize_ui_preview(value)
 
     def request_user_info(
         self,

@@ -1,4 +1,4 @@
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -79,3 +79,27 @@ def test_make_config_includes_number_step_constraint() -> None:
     config = interface.make_config()
 
     assert config["input"]["@constraints"]["value"]["step"] == 0.1
+
+
+def test_make_config_includes_ui_preview_when_set() -> None:
+    interface = AgentInterface()
+    interface.ui_preview = {
+        "type": "vega",
+        "spec": {"$schema": "https://vega.github.io/schema/vega/v6.json", "marks": []},
+    }
+
+    config = interface.make_config()
+    assert config["ui_preview"]["type"] == "vega"
+
+
+def test_make_config_rejects_non_dict_ui_preview() -> None:
+    interface = AgentInterface()
+    interface.ui_preview = cast(Any, 123)
+    with pytest.raises(TypeError):
+        interface.make_config()
+
+
+def test_agent_ui_preview_rejects_non_mapping() -> None:
+    agent = Agent("https://example.test")
+    with pytest.raises(TypeError):
+        agent.ui_preview = cast(Any, 123)
