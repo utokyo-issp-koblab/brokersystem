@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from brokersystem.agent import Choice, File, Number, String, Table, ValueTemplate
 
@@ -46,3 +47,30 @@ def test_file_format_for_output_uploads_bytes() -> None:
     assert uploader_calls == [("png", b"data")]
     assert value == "file-123.png"
     assert fmt["@type"] == "image"
+
+
+def test_number_cast_preserves_float() -> None:
+    template = Number(min=0, max=1)
+    assert template.cast(0.5) == 0.5
+
+
+def test_number_cast_parses_numeric_strings() -> None:
+    template = Number(min=0, max=10)
+    assert template.cast("2") == 2
+    assert template.cast("0.5") == 0.5
+
+
+def test_number_cast_rejects_bool() -> None:
+    template = Number(min=0, max=10)
+    with pytest.raises(TypeError):
+        template.cast(True)
+
+
+def test_choice_cast_preserves_float() -> None:
+    template = Choice([0.5, 1.5])
+    assert template.cast(0.5) == 0.5
+
+
+def test_choice_cast_keeps_string_when_choices_are_strings() -> None:
+    template = Choice(["1", "2"])
+    assert template.cast("1") == "1"

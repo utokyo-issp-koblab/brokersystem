@@ -4,6 +4,7 @@ import inspect
 import io
 import json
 import mimetypes
+import re
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -552,9 +553,20 @@ class Number(ValueTemplate):
 
     def cast(self, value: Any) -> int | float:
         """Cast to int/float and validate min/max constraints."""
-        try:
-            value = int(value)
-        except Exception:
+        # Preserve fractional parts. (int(0.5) == 0 would silently corrupt user input.)
+        if isinstance(value, bool):
+            raise TypeError("number value must not be bool")
+
+        if isinstance(value, (int, float)):
+            pass
+        elif isinstance(value, str):
+            s = value.strip()
+            if re.fullmatch(r"[+-]?\d+", s):
+                value = int(s)
+            else:
+                value = float(s)
+        else:
+            # Accept other numeric-like values (e.g., Decimal, numpy scalars) as float.
             value = float(value)
         assert not (
             "min" in self.constraint_dict and value < self.constraint_dict["min"]
@@ -658,15 +670,20 @@ class Choice(ValueTemplate):
         self.set_constraint("choices", list(choices))
 
     def cast(self, value: Any) -> int | float | str:
-        """Cast input to numeric if possible and validate membership."""
-        try:
-            value = int(value)
-        except Exception:
-            pass
-        try:
-            value = float(value)
-        except Exception:
-            pass
+        """Cast input to the appropriate type (based on choices) and validate membership."""
+        if isinstance(value, bool):
+            raise TypeError("choice value must not be bool")
+
+        choices = self.constraint_dict["choices"]
+        has_string_choice = any(isinstance(choice, str) for choice in choices)
+
+        # Only coerce string inputs when the choice-set is purely numeric.
+        if isinstance(value, str) and not has_string_choice:
+            s = value.strip()
+            if re.fullmatch(r"[+-]?\d+", s):
+                value = int(s)
+            else:
+                value = float(s)
         assert value in self.constraint_dict["choices"]
         return value
 
