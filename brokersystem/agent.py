@@ -5,6 +5,7 @@ import io
 import json
 import mimetypes
 import re
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -1235,11 +1236,24 @@ class Agent:
             threading.Thread(target=self.connect, daemon=True).start()
             # threading.Thread(target=self.heartbeat).start()
             if not _automatic:
-                logger.info(
-                    f"Agent {self.interface.name} has started. Press return to quit."
-                )
                 try:
-                    input("")
+                    if sys.stdin.isatty():
+                        logger.info(
+                            "Agent %s has started. Press return to quit.",
+                            self.interface.name,
+                        )
+                        input("")
+                    else:
+                        # In non-interactive environments (stdin closed / redirected),
+                        # `input()` would raise EOFError and immediately stop the agent.
+                        logger.info(
+                            "Agent %s has started (non-interactive). Press Ctrl+C to quit.",
+                            self.interface.name,
+                        )
+                        while True:
+                            time.sleep(1)
+                except KeyboardInterrupt:
+                    pass
                 finally:
                     self.goodbye()
 
@@ -1251,8 +1265,17 @@ class Agent:
             for agent in cls._automatic_built_agents.values():
                 agent.run(_automatic=True)
                 agent_list.append(agent)
-            logger.info("Press return to quit.")
-            input("")
+            if sys.stdin.isatty():
+                logger.info("Press return to quit.")
+                input("")
+            else:
+                logger.info(
+                    "Agents have started (non-interactive). Press Ctrl+C to quit."
+                )
+                while True:
+                    time.sleep(1)
+        except KeyboardInterrupt:
+            pass
         finally:
             for agent in agent_list:
                 agent.goodbye()
@@ -1296,7 +1319,8 @@ class Agent:
                     self.interface.name,
                 )
                 self.access_token = response["token"]
-                logger.debug("TOKEN %s", self.access_token)
+                # Never log credentials/tokens (even at DEBUG).
+                logger.debug("Token issued")
                 return True
             if response.get("status") == "error":
                 message = response.get("error_msg") or "unknown error"
