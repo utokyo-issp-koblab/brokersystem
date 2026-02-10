@@ -74,3 +74,14 @@ def test_choice_cast_preserves_float() -> None:
 def test_choice_cast_keeps_string_when_choices_are_strings() -> None:
     template = Choice(["1", "2"])
     assert template.cast("1") == "1"
+
+
+def test_number_init_rejects_invalid_step() -> None:
+    with pytest.raises(TypeError):
+        Number(step=True)
+    with pytest.raises(TypeError):
+        Number(step="0.1")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        Number(step=0)
+    with pytest.raises(ValueError):
+        Number(step=-1)

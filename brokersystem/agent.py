@@ -537,7 +537,7 @@ class ValueTemplate:
 
 
 class Number(ValueTemplate):
-    """Numeric template with optional min/max bounds."""
+    """Numeric template with optional min/max/step constraints."""
 
     def __init__(
         self,
@@ -545,11 +545,20 @@ class Number(ValueTemplate):
         unit: str | None = None,
         min: int | float | None = None,
         max: int | float | None = None,
+        step: int | float | None = None,
     ) -> None:
         super().__init__(unit)
+        if step is not None:
+            if isinstance(step, bool):
+                raise TypeError("step must not be bool")
+            if not isinstance(step, (int, float)):
+                raise TypeError("step must be int or float")
+            if step <= 0:
+                raise ValueError("step must be > 0")
         self.set_constraint("default", value)
         self.set_constraint("min", min)
         self.set_constraint("max", max)
+        self.set_constraint("step", step)
 
     def cast(self, value: Any) -> int | float:
         """Cast to int/float and validate min/max constraints."""

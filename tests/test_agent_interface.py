@@ -70,3 +70,12 @@ def test_make_config_includes_user_info_request() -> None:
     config = interface.make_config()
 
     assert config["user_info_request"] == ["email", "user_id"]
+
+
+def test_make_config_includes_number_step_constraint() -> None:
+    interface = AgentInterface()
+    interface.input.value = Number(value=2, min=1, max=3, step=0.1)
+
+    config = interface.make_config()
+
+    assert config["input"]["@constraints"]["value"]["step"] == 0.1
