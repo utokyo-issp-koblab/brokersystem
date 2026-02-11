@@ -586,6 +586,16 @@ class Number(ValueTemplate):
         max: int | float | None = None,
         step: int | float | None = None,
     ) -> None:
+        """Initialize numeric constraints.
+
+        Args:
+            value: Default value.
+            unit: Unit label for UI display.
+            min: Inclusive minimum bound.
+            max: Inclusive maximum bound.
+            step: Optional UI hint for increment/decrement controls.
+                Direct user input may still use non-multiple values.
+        """
         super().__init__(unit)
         if step is not None:
             if isinstance(step, bool):
