@@ -76,6 +76,11 @@ def test_choice_cast_keeps_string_when_choices_are_strings() -> None:
     assert template.cast("1") == "1"
 
 
+def test_choice_init_rejects_empty_choices() -> None:
+    with pytest.raises(ValueError):
+        Choice([])
+
+
 def test_number_init_rejects_invalid_step() -> None:
     with pytest.raises(TypeError):
         Number(step=True)

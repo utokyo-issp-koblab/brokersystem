@@ -715,7 +715,10 @@ class Choice(ValueTemplate):
         self, choices: Iterable[int | float | str], unit: str | None = None
     ) -> None:
         super().__init__(unit)
-        self.set_constraint("choices", list(choices))
+        choice_list = list(choices)
+        if len(choice_list) == 0:
+            raise ValueError("choices must not be empty")
+        self.set_constraint("choices", choice_list)
 
     def cast(self, value: Any) -> int | float | str:
         """Cast input to the appropriate type (based on choices) and validate membership."""
