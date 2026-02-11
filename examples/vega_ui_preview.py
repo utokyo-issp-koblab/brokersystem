@@ -61,6 +61,9 @@ VEGA_SPEC: JsonDict = {
         {"name": "x_right2", "update": "width / 2 + abf_d1_px / 2"},
         {"name": "y0", "update": "abf_y0"},
         {"name": "y1", "update": "abf_y0 + abf_thickness_px"},
+        {"name": "y_boundary_dim", "update": "min(height - 26, y1 + 18)"},
+        {"name": "y_boundary_tick", "update": "min(height - 10, y1 + 24)"},
+        {"name": "y_boundary_label", "update": "min(height - 4, y1 + 30)"},
         {
             "name": "abf_left_path",
             "update": "'M ' + x_left0 + ' ' + y0 + ' L ' + x_left1 + ' ' + y0 + ' L ' + x_left2 + ' ' + y1 + ' L ' + x_left0 + ' ' + y1 + ' Z'",
@@ -233,6 +236,65 @@ VEGA_SPEC: JsonDict = {
                     "y": {"signal": "y1"},
                     "x2": {"signal": "x_thickness - arrow_size"},
                     "y2": {"signal": "y1 - arrow_size"},
+                },
+            },
+        },
+        {
+            "type": "rule",
+            "encode": {
+                "enter": {
+                    "stroke": {"value": "black"},
+                    "strokeDash": {"value": [3, 3]},
+                },
+                "update": {
+                    "x": {"signal": "x_left2"},
+                    "y": {"signal": "y1"},
+                    "y2": {"signal": "y_boundary_tick"},
+                },
+            },
+        },
+        {
+            "type": "rule",
+            "encode": {
+                "enter": {
+                    "stroke": {"value": "black"},
+                    "strokeDash": {"value": [3, 3]},
+                },
+                "update": {
+                    "x": {"signal": "x_right2"},
+                    "y": {"signal": "y1"},
+                    "y2": {"signal": "y_boundary_tick"},
+                },
+            },
+        },
+        {
+            "type": "rule",
+            "encode": {
+                "enter": {
+                    "stroke": {"value": "black"},
+                    "strokeDash": {"value": [1, 1]},
+                },
+                "update": {
+                    "x": {"signal": "x_left2"},
+                    "x2": {"signal": "x_right2"},
+                    "y": {"signal": "y_boundary_dim"},
+                },
+            },
+        },
+        {
+            "type": "text",
+            "encode": {
+                "enter": {
+                    "font": {"value": "Helvetica"},
+                    "fontSize": {"value": 16},
+                    "align": {"value": "center"},
+                    "baseline": {"value": "middle"},
+                },
+                "update": {
+                    "x": {"signal": "width / 2"},
+                    "y": {"signal": "y_boundary_label"},
+                    "fill": {"value": "black"},
+                    "text": {"signal": "format(d1_um, '.3~f') + ' µm'"},
                 },
             },
         },
