@@ -48,6 +48,7 @@ TemplateSchema = TypedDict(
     "TemplateSchema",
     {
         "@type": dict[str, str],
+        "@help": dict[str, str | None],
         "@unit": dict[str, str | None],
         "@keys": list[str],
         "@value": list[str],
@@ -463,9 +464,10 @@ class ValueTemplate:
     Subclasses implement type-specific casting and output formatting.
     """
 
-    def __init__(self, unit: str | None = None) -> None:
+    def __init__(self, unit: str | None = None, help: str | None = None) -> None:
         self.type: str = self.__class__.__name__.lower()
         self.unit: str | None = unit
+        self.help: str | None = help
         self.constraint_dict: dict[str, Any] = {}
         self.item_type: str | None = None
 
@@ -478,6 +480,8 @@ class ValueTemplate:
     def format_dict(self) -> JsonDict:
         """Return the schema fragment used by the broker protocol."""
         format_dict = {"@type": self.type, "@unit": self.unit}
+        if self.help is not None:
+            format_dict["@help"] = self.help
         if self.item_type == "input":
             format_dict.update(
                 {"@necessity": "required", "@constraints": self.constraint_dict}
@@ -495,6 +499,8 @@ class ValueTemplate:
     ) -> tuple[Any, JsonDict]:
         """Format an output value and return (value, format_dict)."""
         format_dict = {"@type": self.type, "@unit": self.unit}
+        if self.help is not None:
+            format_dict["@help"] = self.help
         return value, format_dict
 
     def set_item_type(self, item_type: str) -> None:
@@ -575,6 +581,8 @@ class ValueTemplate:
                 template.set_constraint(key, value)
         if "@unit" in format_dict:
             template.unit = format_dict["@unit"]
+        if "@help" in format_dict:
+            template.help = format_dict["@help"]
 
         return template
 
@@ -589,6 +597,7 @@ class Number(ValueTemplate):
         min: int | float | None = None,
         max: int | float | None = None,
         step: int | float | None = None,
+        help: str | None = None,
     ) -> None:
         """Initialize numeric constraints.
 
@@ -599,8 +608,9 @@ class Number(ValueTemplate):
             max: Inclusive maximum bound.
             step: Optional UI hint for increment/decrement controls.
                 Direct user input may still use non-multiple values.
+            help: Optional helper text for UI display.
         """
-        super().__init__(unit)
+        super().__init__(unit, help=help)
         if step is not None:
             if isinstance(step, bool):
                 raise TypeError("step must not be bool")
@@ -647,24 +657,45 @@ class Range(ValueTemplate):
         range_min: int | float | None = None,
         range_max: int | float | None = None,
         unit: str | None = None,
+        help: str | None = None,
     ) -> None:
-        super().__init__(unit)
+        """Initialize a range-like template with optional UI help text.
+
+        Args:
+            range_min: Lower bound shown in the default range payload.
+            range_max: Upper bound shown in the default range payload.
+            unit: Unit label for UI display.
+            help: Optional helper text for UI display.
+        """
+        super().__init__(unit, help=help)
         self.set_constraint("default", {"min": range_min, "max": range_max})
 
 
 class String(ValueTemplate):
     """String template with an optional default value."""
 
-    def __init__(self, string: str | None = None) -> None:
-        super().__init__()
+    def __init__(self, string: str | None = None, help: str | None = None) -> None:
+        """Initialize a string template.
+
+        Args:
+            string: Default string value.
+            help: Optional helper text for UI display.
+        """
+        super().__init__(help=help)
         self.set_constraint("default", string)
 
 
 class Bool(ValueTemplate):
     """Boolean template with an optional default value."""
 
-    def __init__(self, value: bool | None = None) -> None:
-        super().__init__()
+    def __init__(self, value: bool | None = None, help: str | None = None) -> None:
+        """Initialize a boolean template.
+
+        Args:
+            value: Default boolean value.
+            help: Optional helper text for UI display.
+        """
+        super().__init__(help=help)
         if value is not None and not isinstance(value, bool):
             raise TypeError("bool default must be a bool")
         self.set_constraint("default", value)
@@ -685,8 +716,14 @@ class Bool(ValueTemplate):
 class File(ValueTemplate):
     """File template supporting binary uploads and file ids."""
 
-    def __init__(self, file_type: str) -> None:
-        super().__init__()
+    def __init__(self, file_type: str, help: str | None = None) -> None:
+        """Initialize a file or image template.
+
+        Args:
+            file_type: File extension/type handled by the broker.
+            help: Optional helper text for UI display.
+        """
+        super().__init__(help=help)
         if file_type in ["png", "jpg", "jpeg", "gif"]:
             self.type = "image"
         self.file_type = file_type
@@ -748,9 +785,19 @@ class Choice(ValueTemplate):
     """Choice template with a fixed list of valid values."""
 
     def __init__(
-        self, choices: Iterable[int | float | str], unit: str | None = None
+        self,
+        choices: Iterable[int | float | str],
+        unit: str | None = None,
+        help: str | None = None,
     ) -> None:
-        super().__init__(unit)
+        """Initialize a choice template.
+
+        Args:
+            choices: Allowed values for the parameter.
+            unit: Unit label for UI display.
+            help: Optional helper text for UI display.
+        """
+        super().__init__(unit, help=help)
         choice_list = list(choices)
         if len(choice_list) == 0:
             raise ValueError("choices must not be empty")
@@ -782,8 +829,16 @@ class Table(ValueTemplate):
         self,
         unit_dict: Mapping[str, str | None],
         graph: Mapping[str, Any] | None = None,
+        help: str | None = None,
     ) -> None:
-        super().__init__(unit=None)
+        """Initialize a table template.
+
+        Args:
+            unit_dict: Units for each numeric column.
+            graph: Optional graph metadata for broker-side previews.
+            help: Optional helper text for UI display.
+        """
+        super().__init__(unit=None, help=help)
         self.unit_dict: dict[str, str | None] = dict(unit_dict)
         self.graph: Mapping[str, Any] | None = graph
 
@@ -859,11 +914,11 @@ class TemplateContainer:
         """Serialize the container into the broker schema format."""
         match self._item_type:
             case "input":
-                format_keys = ["@type", "@unit", "@necessity", "@constraints"]
+                format_keys = ["@type", "@help", "@unit", "@necessity", "@constraints"]
             case "output":
-                format_keys = ["@type", "@unit", "@repr"]
+                format_keys = ["@type", "@help", "@unit", "@repr"]
             case "condition":
-                format_keys = ["@type", "@unit", "@value"]
+                format_keys = ["@type", "@help", "@unit", "@value"]
             case _ as unknown_type:
                 raise NotImplementedError(f"Unknown item type: {unknown_type}")
         template_dict = dict[str, Any](**{fkey: {} for fkey in format_keys})
@@ -1028,6 +1083,7 @@ class AgentInterface:
     ) -> JsonDict:
         """Convert raw job results to the broker output schema."""
         output_dict = {
+            "@help": {},
             "@unit": {},
             "@type": {},
             "@option": {},
@@ -2107,12 +2163,14 @@ class AgentConstructor:
                     print("")
                     print("--- Output ---")
                 updated = True
+                template = ValueTemplate.guess_from_value(
+                    value, unit_callback_func=self.ask_output_format, key=key
+                )
+                template.help = self.ask_template_help(key)
                 setattr(
                     container,
                     key,
-                    ValueTemplate.guess_from_value(
-                        value, unit_callback_func=self.ask_output_format, key=key
-                    ),
+                    template,
                 )
         if updated:
             self.merge_config_and_container("output", container)
@@ -2132,26 +2190,27 @@ class AgentConstructor:
             unit = input(f'--> Unit of "{key}" (empty if none):')
             if len(unit) == 0:
                 unit = None
+        help_text = self.ask_template_help(key)
         if value_type == "n":
             default_value = float(input(f'--> Default value of "{key}":'))
             print(
                 f"== {key}: {default_value} {'('+unit+')' if unit is not None else ''} =="
             )
             print("")
-            return Number(value=default_value, unit=unit)
+            return Number(value=default_value, unit=unit, help=help_text)
         elif value_type == "c":
             choices = input(f'--> Choices separated by a comma of "{key}":')
             choices = [c.strip() for c in choices.split(",")]
             print(f"== {key}: {choices} {'('+unit+')' if unit is not None else ''}")
             print("")
-            return Choice(choices=choices, unit=unit)
+            return Choice(choices=choices, unit=unit, help=help_text)
         elif value_type == "s":
             default_value = input(f'--> Default value of "{key}":')
             print(
                 f"== {key}: {default_value} {'('+unit+')' if unit is not None else ''} =="
             )
             print("")
-            return String(string=default_value)
+            return String(string=default_value, help=help_text)
         elif value_type == "b":
             while True:
                 default_value_raw = input(
@@ -2163,7 +2222,7 @@ class AgentConstructor:
                     break
             print(f"== {key}: {default_value} ==")
             print("")
-            return Bool(value=default_value)
+            return Bool(value=default_value, help=help_text)
         raise AssertionError("Unreachable input format branch")
 
     def ask_output_format(self, key: str) -> str | None:
@@ -2171,6 +2230,12 @@ class AgentConstructor:
         unit = input(f'Unit of "{key}" (empty if none) > ')
         print("")
         return unit
+
+    def ask_template_help(self, key: str) -> str | None:
+        """Prompt for optional help text metadata."""
+        help_text = input(f'Help text of "{key}" (empty if none) > ').strip()
+        print("")
+        return help_text or None
 
     def load_config(self) -> None:
         """Load config JSON if it exists; otherwise start fresh."""

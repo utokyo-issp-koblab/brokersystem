@@ -107,6 +107,17 @@ def test_make_config_includes_bool_default() -> None:
     assert config["input"]["@constraints"]["enabled"]["default"] is True
 
 
+def test_make_config_includes_help_text() -> None:
+    interface = AgentInterface()
+    interface.input.value = Number(value=2, help="Requested pulse count.")
+    interface.output.image = File("png", help="Preview image.")
+
+    config = interface.make_config()
+
+    assert config["input"]["@help"]["value"] == "Requested pulse count."
+    assert config["output"]["@help"]["image"] == "Preview image."
+
+
 def test_make_config_includes_ui_preview_when_set() -> None:
     interface = AgentInterface()
     interface.ui_preview = {

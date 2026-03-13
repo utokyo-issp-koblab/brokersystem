@@ -34,11 +34,17 @@ def test_guess_from_value_table_from_dataframe() -> None:
 
 def test_from_dict_builds_bool_template() -> None:
     template = ValueTemplate.from_dict(
-        {"@type": "bool", "@unit": None, "@constraints": {"default": True}},
+        {
+            "@type": "bool",
+            "@unit": None,
+            "@help": "Enable the optional path.",
+            "@constraints": {"default": True},
+        },
         {},
     )
     assert isinstance(template, Bool)
     assert template.constraint_dict["default"] is True
+    assert template.help == "Enable the optional path."
 
 
 def test_table_format_for_output_from_list_of_dict() -> None:
@@ -55,12 +61,13 @@ def test_file_format_for_output_uploads_bytes() -> None:
         uploader_calls.append((file_type, data))
         return {"file_id": "file-123.png"}
 
-    file_template = File("png")
+    file_template = File("png", help="Rendered preview image.")
     value, fmt = file_template.format_for_output(b"data", fake_uploader)
 
     assert uploader_calls == [("png", b"data")]
     assert value == "file-123.png"
     assert fmt["@type"] == "image"
+    assert fmt["@help"] == "Rendered preview image."
 
 
 def test_number_cast_preserves_float() -> None:
@@ -101,6 +108,12 @@ def test_bool_cast_rejects_non_bool_values() -> None:
     template = Bool(value=False)
     with pytest.raises(TypeError):
         template.cast(1)
+
+
+def test_number_format_dict_includes_help() -> None:
+    template = Number(value=1, help="Beam diameter in micrometers.")
+    template.set_item_type("input")
+    assert template.format_dict["@help"] == "Beam diameter in micrometers."
 
 
 def test_choice_init_rejects_empty_choices() -> None:

@@ -74,11 +74,25 @@ def build_agent(enable_upload: bool) -> Agent:
             UserInfoField.NAME_AFFILIATION,
         ]
 
-        agent.input.x = Number(1, min=0, max=10, unit="µm")
-        agent.input.mode = Choice(["fast", "safe", "special"])
-        agent.input.include_offset = Bool(False)
-        agent.output.score = Number(unit="pt")
-        agent.output.table = Table(unit_dict={"x": "µm", "y": "W"})
+        agent.input.x = Number(
+            1,
+            min=0,
+            max=10,
+            unit="µm",
+        )
+        agent.input.mode = Choice(
+            ["fast", "safe", "special"],
+        )
+        agent.input.include_offset = Bool(
+            False,
+            help="When true, adds a small offset to the computed result.",
+        )
+        agent.output.score = Number(
+            unit="pt", help="Computed score returned by the job."
+        )
+        agent.output.table = Table(
+            unit_dict={"x": "µm", "y": "W"},
+        )
         if enable_upload:
             agent.output.image = File("png")
 
