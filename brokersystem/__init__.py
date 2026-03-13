@@ -11,6 +11,7 @@ from brokersystem.agent import (
     BoardAgent,
     BoardAgentOwner,
     BoardResponse,
+    Bool,
     Broker,
     BrokerAdmin,
     BrokerConnectionError,

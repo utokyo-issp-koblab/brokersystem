@@ -31,6 +31,7 @@ from typing import Literal
 from brokersystem import (
     Agent,
     AgentError,
+    Bool,
     Broker,
     BrokerAdmin,
     BrokerError,
@@ -75,6 +76,7 @@ def build_agent(enable_upload: bool) -> Agent:
 
         agent.input.x = Number(1, min=0, max=10, unit="µm")
         agent.input.mode = Choice(["fast", "safe", "special"])
+        agent.input.include_offset = Bool(False)
         agent.output.score = Number(unit="pt")
         agent.output.table = Table(unit_dict={"x": "µm", "y": "W"})
         if enable_upload:
@@ -111,6 +113,7 @@ def build_agent(enable_upload: bool) -> Agent:
     def job_func(job: Job) -> JsonDict:
         x_value = job["x"]
         mode = job["mode"]
+        include_offset = job["include_offset"]
         user_info = job.user_info
         name_affiliation = user_info["name_affiliation"]
         user_id = user_info["user_id"]
@@ -118,12 +121,13 @@ def build_agent(enable_upload: bool) -> Agent:
             f"Hello, {name_affiliation['name']} from {name_affiliation['affiliation']}!"
         )
         job.msg(f"{greeting} Your user_id is: {user_id}")
-        score = x_value * 2
+        offset = 1 if include_offset else 0
+        score = x_value * 2 + offset
         job.report(progress=0.5, result={"score": score})
         if mode != "fast":
             time.sleep(5)
         result: JsonDict = {
-            "table": [{"x": x_value, "y": x_value * 3}],
+            "table": [{"x": x_value, "y": x_value * 3 + offset}],
         }
         if enable_upload:
             result["image"] = b"fake-bytes"
@@ -156,7 +160,7 @@ def run_client(agent_id: str, step_by_step: bool) -> None:
     print("Client board:", board)
     print("Client board agent count:", len(agents))
 
-    request = {"x": 2, "mode": "safe"}
+    request = {"x": 2, "mode": "safe", "include_offset": True}
     begin = broker.begin_negotiation(agent_id)
     begin_content = begin["content"]
     user_info_request = begin_content["user_info_request"]

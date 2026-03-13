@@ -1,12 +1,17 @@
 import pandas as pd
 import pytest
 
-from brokersystem.agent import Choice, File, Number, String, Table, ValueTemplate
+from brokersystem.agent import Bool, Choice, File, Number, String, Table, ValueTemplate
 
 
 def test_guess_from_value_number() -> None:
     template = ValueTemplate.guess_from_value(3)
     assert isinstance(template, Number)
+
+
+def test_guess_from_value_bool() -> None:
+    template = ValueTemplate.guess_from_value(True)
+    assert isinstance(template, Bool)
 
 
 def test_guess_from_value_string() -> None:
@@ -25,6 +30,15 @@ def test_guess_from_value_table_from_dataframe() -> None:
     template = ValueTemplate.guess_from_value(df)
     assert isinstance(template, Table)
     assert template.format_dict["@repr"]["type"] == "graph"
+
+
+def test_from_dict_builds_bool_template() -> None:
+    template = ValueTemplate.from_dict(
+        {"@type": "bool", "@unit": None, "@constraints": {"default": True}},
+        {},
+    )
+    assert isinstance(template, Bool)
+    assert template.constraint_dict["default"] is True
 
 
 def test_table_format_for_output_from_list_of_dict() -> None:
@@ -74,6 +88,19 @@ def test_choice_cast_preserves_float() -> None:
 def test_choice_cast_keeps_string_when_choices_are_strings() -> None:
     template = Choice(["1", "2"])
     assert template.cast("1") == "1"
+
+
+def test_bool_cast_parses_string_literals() -> None:
+    template = Bool(value=False)
+    assert template.cast(True) is True
+    assert template.cast("true") is True
+    assert template.cast("false") is False
+
+
+def test_bool_cast_rejects_non_bool_values() -> None:
+    template = Bool(value=False)
+    with pytest.raises(TypeError):
+        template.cast(1)
 
 
 def test_choice_init_rejects_empty_choices() -> None:

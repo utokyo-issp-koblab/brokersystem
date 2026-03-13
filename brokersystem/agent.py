@@ -510,6 +510,8 @@ class ValueTemplate:
     ) -> "ValueTemplate":
         """Infer a template class from a Python value."""
         unit = None
+        if isinstance(value, bool):
+            return Bool(value)
         if isinstance(value, (int, float)):
             if unit_callback_func is not None and key is not None:
                 unit = unit_callback_func(key)
@@ -551,6 +553,8 @@ class ValueTemplate:
         match format_dict["@type"]:
             case "number":
                 template = Number()
+            case "bool":
+                template = Bool()
             case "string":
                 template = String()
             case "choice":
@@ -654,6 +658,28 @@ class String(ValueTemplate):
     def __init__(self, string: str | None = None) -> None:
         super().__init__()
         self.set_constraint("default", string)
+
+
+class Bool(ValueTemplate):
+    """Boolean template with an optional default value."""
+
+    def __init__(self, value: bool | None = None) -> None:
+        super().__init__()
+        if value is not None and not isinstance(value, bool):
+            raise TypeError("bool default must be a bool")
+        self.set_constraint("default", value)
+
+    def cast(self, value: Any) -> bool:
+        """Cast to bool and accept common string literals."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ["true", "1", "yes", "on"]:
+                return True
+            if normalized in ["false", "0", "no", "off"]:
+                return False
+        raise TypeError("bool value must be a bool")
 
 
 class File(ValueTemplate):
@@ -2096,9 +2122,10 @@ class AgentConstructor:
         """Prompt for input template details when missing in config."""
         while True:
             value_type = input(
-                f"Select the value type of \"{key}\" ('n':Number, 's': String, 'c': Choice):"
+                f'Select the value type of "{key}" '
+                "('n':Number, 's': String, 'c': Choice, 'b': Bool):"
             )
-            if value_type in ["n", "s", "c"]:
+            if value_type in ["n", "s", "c", "b"]:
                 break
         unit = None
         if value_type in ["n", "c"]:
@@ -2125,6 +2152,18 @@ class AgentConstructor:
             )
             print("")
             return String(string=default_value)
+        elif value_type == "b":
+            while True:
+                default_value_raw = input(
+                    f'--> Default value of "{key}" (true/false):'
+                ).strip()
+                normalized = default_value_raw.lower()
+                if normalized in ["true", "false"]:
+                    default_value = normalized == "true"
+                    break
+            print(f"== {key}: {default_value} ==")
+            print("")
+            return Bool(value=default_value)
         raise AssertionError("Unreachable input format branch")
 
     def ask_output_format(self, key: str) -> str | None:

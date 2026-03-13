@@ -2,7 +2,15 @@ from typing import Any, cast
 
 import pytest
 
-from brokersystem.agent import Agent, AgentInterface, File, Number, Table, UserInfoField
+from brokersystem.agent import (
+    Agent,
+    AgentInterface,
+    Bool,
+    File,
+    Number,
+    Table,
+    UserInfoField,
+)
 
 
 def test_validate_returns_ok_for_valid_input() -> None:
@@ -27,6 +35,14 @@ def test_validate_returns_need_revision_for_missing_input() -> None:
     msg, template = interface.validate({})
     assert msg == "need_revision"
     assert "value" not in template
+
+
+def test_validate_returns_ok_for_valid_bool_input() -> None:
+    interface = AgentInterface()
+    interface.input.enabled = Bool(value=False)
+    msg, template = interface.validate({"enabled": True})
+    assert msg == "ok"
+    assert template["enabled"] is True
 
 
 def test_user_info_request_rejects_invalid_fields() -> None:
@@ -79,6 +95,16 @@ def test_make_config_includes_number_step_constraint() -> None:
     config = interface.make_config()
 
     assert config["input"]["@constraints"]["value"]["step"] == 0.1
+
+
+def test_make_config_includes_bool_default() -> None:
+    interface = AgentInterface()
+    interface.input.enabled = Bool(value=True)
+
+    config = interface.make_config()
+
+    assert config["input"]["@type"]["enabled"] == "bool"
+    assert config["input"]["@constraints"]["enabled"]["default"] is True
 
 
 def test_make_config_includes_ui_preview_when_set() -> None:
