@@ -118,6 +118,31 @@ def test_make_config_includes_help_text() -> None:
     assert config["output"]["@help"]["image"] == "Preview image."
 
 
+def test_make_config_preserves_input_declaration_order() -> None:
+    interface = AgentInterface()
+    interface.input.alpha = Number(value=1)
+    interface.input.beta = Bool(value=False)
+    interface.input.gamma = File("txt")
+
+    config = interface.make_config()
+
+    assert config["input"]["@value"] == ["alpha", "beta", "gamma"]
+    assert config["input"]["@keys"] == ["alpha", "beta", "gamma"]
+
+
+def test_make_config_preserves_output_declaration_order_with_tables_last() -> None:
+    interface = AgentInterface()
+    interface.output.score = Number()
+    interface.output.image = File("png")
+    interface.output.series = Table(unit_dict={"x": "m", "y": "s"})
+
+    config = interface.make_config()
+
+    assert config["output"]["@value"] == ["score", "image"]
+    assert config["output"]["@keys"] == ["score", "image", "series"]
+    assert config["output"]["@table"]["series"] == ["x", "y"]
+
+
 def test_make_config_includes_ui_preview_when_set() -> None:
     interface = AgentInterface()
     interface.ui_preview = {

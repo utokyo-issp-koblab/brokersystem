@@ -890,8 +890,6 @@ class TemplateContainer:
 
     def __init__(self, item_type: str) -> None:
         self._container_dict: dict[str, ValueTemplate] = {}
-        self._value_keys: set[str] = set()
-        self._table_keys: set[str] = set()
         self._item_type: str = item_type
 
     def __setattr__(self, key: str, value: Any) -> None:
@@ -904,10 +902,6 @@ class TemplateContainer:
             )
             return
         self._container_dict[key] = value
-        if isinstance(value, Table):
-            self._table_keys.add(key)
-        else:
-            self._value_keys.add(key)
         value.set_item_type(self._item_type)
 
     def _get_template(self) -> JsonDict:
@@ -923,11 +917,22 @@ class TemplateContainer:
                 raise NotImplementedError(f"Unknown item type: {unknown_type}")
         template_dict = dict[str, Any](**{fkey: {} for fkey in format_keys})
 
-        template_dict["@keys"] = list(self._value_keys | self._table_keys)
-        if len(self._value_keys) > 0:
-            template_dict["@value"] = list(self._value_keys)
+        value_keys = [
+            key
+            for key, template in self._container_dict.items()
+            if not isinstance(template, Table)
+        ]
+        table_keys = [
+            key
+            for key, template in self._container_dict.items()
+            if isinstance(template, Table)
+        ]
 
-        if len(self._table_keys) > 0:
+        template_dict["@keys"] = value_keys + table_keys
+        if len(value_keys) > 0:
+            template_dict["@value"] = value_keys
+
+        if len(table_keys) > 0:
             template_dict["@table"] = {}  # will be given by Table instance
 
         for key, template in self._container_dict.items():
