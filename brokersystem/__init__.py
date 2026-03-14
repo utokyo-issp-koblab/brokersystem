@@ -30,6 +30,7 @@ from brokersystem.agent import (
     need_revision_response,
     ng_response,
     NegotiationState,
+    ResultClientSummary,
     ResultSummary,
     ResultPayload,
     ResultStatus,

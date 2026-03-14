@@ -333,7 +333,26 @@ def test_broker_admin_user_and_results() -> None:
     responses.add(
         responses.GET,
         f"{BROKER_URL}/api/v1/broker/results",
-        json={"contracts": []},
+        json={
+            "contracts": [
+                {
+                    "negotiation_id": "n1",
+                    "status": "done",
+                    "progress": 1.0,
+                    "charge": 42,
+                    "msg": "done",
+                    "agent_id": "a1",
+                    "agent_name": "Result Agent",
+                    "requested_date": "2026-03-14 00:00:00",
+                    "client": {
+                        "auth": "auth0|owner",
+                        "name": "Owner User",
+                        "affiliation": "Owner Lab",
+                    },
+                    "mine": False,
+                }
+            ]
+        },
         status=200,
     )
     responses.add(
@@ -346,7 +365,10 @@ def test_broker_admin_user_and_results() -> None:
     assert admin.get_user()["user"]["id"] == "u1"
     assert admin.create_user("name", "lab")["status"] == "created"
     assert admin.update_user(name="updated")["user"]["name"] == "updated"
-    assert admin.list_results() == {"contracts": []}
+    results = admin.list_results()
+    assert results["contracts"][0]["agent_name"] == "Result Agent"
+    assert results["contracts"][0]["client"]["affiliation"] == "Owner Lab"
+    assert results["contracts"][0]["mine"] is False
     assert admin.board() == {"agents": []}
 
 

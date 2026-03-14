@@ -253,6 +253,12 @@ def run_admin(allow_deposit: bool, allow_delete: bool) -> None:
 
     results = admin.list_results()
     print("Results:", results)
+    contracts = results["contracts"]
+    print("Result count:", len(contracts))
+    if contracts:
+        sample_contract = contracts[0]
+        print("Result keys:", sorted(sample_contract.keys()))
+        print("Result client keys:", sorted(sample_contract["client"].keys()))
 
     agents_response = admin.list_agents()
     print("Agents (admin sees all; non-admin sees own):", agents_response)

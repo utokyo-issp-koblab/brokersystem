@@ -197,6 +197,12 @@ class UserSummary(TypedDict):
     info: dict[str, str]
 
 
+class ResultClientSummary(TypedDict):
+    auth: str
+    name: str
+    affiliation: str
+
+
 class AgentDetailBase(AgentSummary):
     owner: UserSummary
 
@@ -214,6 +220,8 @@ class ResultSummary(TypedDict):
     agent_id: str
     agent_name: str
     requested_date: str
+    client: ResultClientSummary
+    mine: bool
 
 
 class TokenSummary(TypedDict):
@@ -2910,7 +2918,11 @@ class BrokerAdmin:
         return cast(BoardResponse, response)
 
     def list_results(self) -> ResultsResponse:
-        """Return the result list for the current user.
+        """Return the result list visible to the current user.
+
+        Non-admin users receive only their own contracts. Admin users receive
+        all visible contracts; each summary includes `client` metadata and a
+        `mine` boolean so callers can filter client-side if needed.
 
         Returns:
             Results payload with `contracts`.
