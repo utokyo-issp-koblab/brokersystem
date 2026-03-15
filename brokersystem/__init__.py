@@ -5,6 +5,7 @@ from brokersystem.agent import (
     AgentError,
     AgentHTTPError,
     AgentResponseError,
+    AgentUploadError,
     AgentDetail,
     AgentInfo,
     AgentSummary,

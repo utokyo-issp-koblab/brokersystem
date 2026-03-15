@@ -24,8 +24,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import uuid
 import time
+import uuid
 
 from brokersystem import (
     Agent,
@@ -34,6 +34,7 @@ from brokersystem import (
     Broker,
     BrokerAdmin,
     BrokerError,
+    BrokerResponseError,
     Choice,
     File,
     Job,
@@ -77,25 +78,15 @@ def build_agent(enable_upload: bool) -> Agent:
             UserInfoField.NAME_AFFILIATION,
         ]
 
-        agent.input.x = Number(
-            1,
-            min=0,
-            max=10,
-            unit="µm",
-        )
-        agent.input.mode = Choice(
-            ["fast", "standard"],
-        )
+        agent.input.x = Number(1, min=0, max=10, unit="µm")
+        agent.input.mode = Choice(["fast", "standard"])
         agent.input.include_offset = Bool(
-            False,
-            help="When true, adds a small offset to the computed result.",
+            False, help="When true, adds a small offset to the computed result."
         )
         agent.output.score = Number(
             unit="pt", help="Computed score returned by the job."
         )
-        agent.output.table = Table(
-            unit_dict={"x": "µm", "y": "W"},
-        )
+        agent.output.table = Table(unit_dict={"x": "µm", "y": "W"})
         if enable_upload:
             agent.output.image = File("png")
 
@@ -191,6 +182,7 @@ def run_client(agent_id: str, step_by_step: bool) -> None:
     begin = broker.begin_negotiation(agent_id)
     begin_content = begin["content"]
     user_info_request = begin_content["user_info_request"]
+    initial_charge = begin_content["charge"]
     if user_info_request:
         print("Agent requests user info:", user_info_request)
         request["_user_info_consent"] = user_info_request
@@ -198,7 +190,16 @@ def run_client(agent_id: str, step_by_step: bool) -> None:
         print("Begin negotiation:", begin)
 
         negotiation = broker.negotiate(agent_id, request)
+        if negotiation["state"] != "ok":
+            raise BrokerResponseError(
+                f'Negotiation returned {negotiation["state"]}: '
+                f'{negotiation["content"]["feedback"]["message"]}',
+                payload=negotiation,
+            )
         print("Negotiation:", negotiation)
+        negotiated_charge = negotiation["content"]["charge"]
+        if negotiated_charge != initial_charge:
+            print("Charge:", initial_charge, "->", negotiated_charge)
 
         negotiation_id = negotiation["negotiation_id"]
 
@@ -208,6 +209,7 @@ def run_client(agent_id: str, step_by_step: bool) -> None:
         result = broker.get_result(negotiation_id)
         source = "step-by-step"
     else:
+        # ask() continues with the negotiated charge even when it changes from the initial listing.
         result = broker.ask(agent_id, request)
         source = "ask"
 

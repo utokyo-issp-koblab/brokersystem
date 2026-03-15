@@ -8,13 +8,23 @@ import re
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable, Iterable, Mapping
 from datetime import timedelta
 from enum import StrEnum
 from os import PathLike
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal, ParamSpec, TypedDict, TypeVar, cast
+from typing import (
+    Any,
+    Literal,
+    NoReturn,
+    NotRequired,
+    ParamSpec,
+    TypedDict,
+    TypeVar,
+    cast,
+)
 
 import pandas as pd
 import PIL.Image
@@ -32,6 +42,8 @@ R = TypeVar("R")
 
 ResultValue = str | int | float | bool | None | list[Any] | dict[str, Any]
 NegotiationStatus = Literal["ok", "need_revision", "ng"]
+NegotiationFeedbackKind = Literal["agent", "validation"]
+JobErrorDetailLevel = Literal["summary", "traceback"]
 NegotiationState = Literal[
     "begin",
     "request",
@@ -105,30 +117,23 @@ class UserInfo(TypedDict):
     name_affiliation: UserInfoNameAffiliation
 
 
-NegotiationFeedback = TypedDict(
-    "NegotiationFeedback",
-    {
-        "message": str,
-        "fields": dict[str, str],
-    },
-    total=False,
-)
+class NegotiationFeedback(TypedDict):
+    kind: NegotiationFeedbackKind
+    message: str
+    fields: dict[str, str]
+
+
 NegotiationDecision = tuple[NegotiationStatus, NegotiationFeedback]
 
 
-class NegotiationContentBase(TypedDict):
+class NegotiationContent(TypedDict):
     user_info_request: list[UserInfoField]
-
-
-class NegotiationContent(NegotiationContentBase, total=False):
     input: TemplateSchema
     condition: TemplateSchema
     output: TemplateSchema
     charge: int
-    ui_preview: UiPreview
-    error_msg: str
+    ui_preview: NotRequired[UiPreview]
     feedback: NegotiationFeedback
-    revision: NegotiationFeedback
 
 
 class NegotiationResponse(TypedDict):
@@ -158,7 +163,7 @@ class BoardAgentOwner(TypedDict):
     affiliation: str
 
 
-class AgentInfo(TypedDict, total=False):
+class AgentInfo(TypedDict):
     input: TemplateSchema
     condition: TemplateSchema
     output: TemplateSchema
@@ -207,7 +212,7 @@ class AgentDetailBase(AgentSummary):
     owner: UserSummary
 
 
-class AgentDetail(AgentDetailBase, total=False):
+class AgentDetail(AgentDetailBase):
     secret_key: str
 
 
@@ -326,6 +331,21 @@ class AgentResponseError(AgentError):
         self.payload = payload
 
 
+class AgentUploadError(AgentError):
+    """Raised when the broker rejects an upload request."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        payload: Any | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.payload = payload
+
+
 def _coerce_error_content(content: bytes | str | None) -> str | None:
     if content is None:
         return None
@@ -337,13 +357,21 @@ def _coerce_error_content(content: bytes | str | None) -> str | None:
     return str(content)
 
 
-def _ensure_response_dict(payload: Any, context: str) -> JsonDict:
+def _raise_malformed_response(
+    context: str, detail: str, payload: object | None = None
+) -> NoReturn:
+    raise BrokerResponseError(
+        f"Malformed broker response in {context}: {detail}", payload=payload
+    )
+
+
+def _ensure_response_dict(payload: object, context: str) -> JsonDict:
     if not isinstance(payload, dict):
-        raise BrokerResponseError(
-            f"{context} returned non-dict payload: {payload!r}", payload=payload
+        _raise_malformed_response(
+            context, f"expected a JSON object, got {payload!r}", payload
         )
     if not payload:
-        raise BrokerResponseError(f"{context} returned empty payload", payload=payload)
+        _raise_malformed_response(context, "returned an empty payload", payload)
     if payload.get("status") == "error":
         detail = payload.get("error_msg") or payload.get("error") or "unknown error"
         raise BrokerResponseError(
@@ -358,48 +386,214 @@ def _ensure_response_dict(payload: Any, context: str) -> JsonDict:
 
 
 def _normalize_negotiation_content_feedback(
-    content: Mapping[str, Any],
+    content: Mapping[str, object],
+    *,
+    context: str,
 ) -> NegotiationContent:
     normalized = dict(content)
-    feedback = _feedback_from_payload(normalized)
-    if feedback:
-        normalized["feedback"] = feedback
-    else:
-        normalized.pop("feedback", None)
+    normalized["user_info_request"] = _normalize_user_info_fields(
+        _require_str_list(normalized, "user_info_request", context)
+    )
+    normalized["input"] = cast(
+        TemplateSchema, _require_mapping(normalized, "input", context)
+    )
+    normalized["condition"] = cast(
+        TemplateSchema, _require_mapping(normalized, "condition", context)
+    )
+    normalized["output"] = cast(
+        TemplateSchema, _require_mapping(normalized, "output", context)
+    )
+    normalized["charge"] = _require_int(normalized, "charge", context)
+    if "ui_preview" in normalized:
+        normalized["ui_preview"] = _normalize_ui_preview(
+            _require_mapping(normalized, "ui_preview", context)
+        )
+    normalized["feedback"] = _require_feedback_payload(
+        _require_mapping(normalized, "feedback", context),
+        context=f"{context}.feedback",
+    )
     return cast(NegotiationContent, normalized)
 
 
-def _require_key(payload: Mapping[str, Any], key: str, context: str) -> Any:
+def _normalize_agent_info_payload(value: object, *, context: str) -> AgentInfo:
+    info = _require_object_mapping(value, context)
+    return {
+        "input": cast(TemplateSchema, _require_mapping(info, "input", context)),
+        "condition": cast(TemplateSchema, _require_mapping(info, "condition", context)),
+        "output": cast(TemplateSchema, _require_mapping(info, "output", context)),
+        "description": _require_str(info, "description", context),
+        "module_version": _require_str(info, "module_version", context),
+        "user_info_request": [
+            field.value
+            for field in _normalize_user_info_fields(
+                cast(
+                    Iterable[str | UserInfoField],
+                    _require_str_list(info, "user_info_request", context),
+                )
+            )
+        ],
+    }
+
+
+def _normalize_agent_summary_payload(payload: object, *, context: str) -> AgentSummary:
+    agent = _require_object_mapping(payload, context)
+    return {
+        "id": _require_str(agent, "id", context),
+        "name": _require_str(agent, "name", context),
+        "type": _require_str(agent, "type", context),
+        "category": _require_str(agent, "category", context),
+        "is_public": _require_bool(agent, "is_public", context),
+        "point": _require_int(agent, "point", context),
+        "info": _normalize_agent_info_payload(
+            _require_mapping(agent, "info", context),
+            context=f"{context}.info",
+        ),
+    }
+
+
+def _normalize_agent_detail_payload(payload: object, *, context: str) -> AgentDetail:
+    agent = _require_object_mapping(payload, context)
+    summary = _normalize_agent_summary_payload(agent, context=context)
+    return {
+        **summary,
+        "owner": _normalize_user_summary_payload(
+            _require_mapping(agent, "owner", context),
+            context=f"{context}.owner",
+        ),
+        "secret_key": _require_str(agent, "secret_key", context),
+    }
+
+
+def _normalize_board_agent_owner_payload(
+    value: object, *, context: str
+) -> BoardAgentOwner:
+    owner = _require_object_mapping(value, context)
+    return {
+        "id": _require_str(owner, "id", context),
+        "name": _require_str(owner, "name", context),
+        "affiliation": _require_str(owner, "affiliation", context),
+    }
+
+
+def _normalize_user_summary_payload(value: object, *, context: str) -> UserSummary:
+    user = _require_object_mapping(value, context)
+    info = _require_mapping(user, "info", context)
+    user_info: dict[str, str] = {}
+    for key, entry in info.items():
+        if not isinstance(key, str):
+            _raise_malformed_response(
+                context,
+                f"user info key is not a string: {key!r}",
+                info,
+            )
+        if not isinstance(entry, str):
+            _raise_malformed_response(
+                context,
+                f"user info field '{key}' is not a string: {entry!r}",
+                info,
+            )
+        user_info[key] = entry
+
+    return {
+        "id": _require_str(user, "id", context),
+        "auth": _require_str(user, "auth", context),
+        "name": _require_str(user, "name", context),
+        "affiliation": _require_str(user, "affiliation", context),
+        "point": _require_int(user, "point", context),
+        "info": user_info,
+    }
+
+
+def _normalize_board_agent_payload(payload: object, *, context: str) -> BoardAgent:
+    agent = _require_object_mapping(payload, context)
+    return {
+        "id": _require_str(agent, "id", context),
+        "name": _require_str(agent, "name", context),
+        "type": _require_str(agent, "type", context),
+        "category": _require_str(agent, "category", context),
+        "info": _normalize_agent_info_payload(
+            _require_mapping(agent, "info", context),
+            context=f"{context}.info",
+        ),
+        "is_public": _require_bool(agent, "is_public", context),
+        "active": _require_bool(agent, "active", context),
+        "owner": _normalize_board_agent_owner_payload(
+            _require_mapping(agent, "owner", context),
+            context=f"{context}.owner",
+        ),
+    }
+
+
+def _require_object_mapping(value: object, context: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        _raise_malformed_response(
+            context, f"expected a JSON object, got {value!r}", value
+        )
+    return cast(Mapping[str, object], value)
+
+
+def _require_key(payload: Mapping[str, object], key: str, context: str) -> object:
     if key not in payload:
-        raise BrokerResponseError(f"{context} missing '{key}'", payload=payload)
+        _raise_malformed_response(context, f"missing '{key}'", payload)
     return payload[key]
 
 
-def _require_mapping(payload: Mapping[str, Any], key: str, context: str) -> JsonDict:
+def _require_mapping(payload: Mapping[str, object], key: str, context: str) -> JsonDict:
     value = _require_key(payload, key, context)
     if not isinstance(value, dict):
-        raise BrokerResponseError(
-            f"{context} field '{key}' is not a dict: {value!r}", payload=payload
+        _raise_malformed_response(
+            context, f"field '{key}' is not a dict: {value!r}", payload
         )
     return value
 
 
-def _require_list(payload: Mapping[str, Any], key: str, context: str) -> list[Any]:
+def _require_list(
+    payload: Mapping[str, object], key: str, context: str
+) -> list[object]:
     value = _require_key(payload, key, context)
     if not isinstance(value, list):
-        raise BrokerResponseError(
-            f"{context} field '{key}' is not a list: {value!r}", payload=payload
+        _raise_malformed_response(
+            context, f"field '{key}' is not a list: {value!r}", payload
         )
     return value
 
 
-def _require_str_list(payload: Mapping[str, Any], key: str, context: str) -> list[str]:
+def _require_str_list(
+    payload: Mapping[str, object], key: str, context: str
+) -> list[str]:
     value = _require_list(payload, key, context)
     if not all(isinstance(item, str) for item in value):
-        raise BrokerResponseError(
-            f"{context} field '{key}' is not a list of strings", payload=payload
+        _raise_malformed_response(
+            context, f"field '{key}' is not a list of strings", payload
         )
-    return list(value)
+    return [item for item in value if isinstance(item, str)]
+
+
+def _require_int(payload: Mapping[str, object], key: str, context: str) -> int:
+    value = _require_key(payload, key, context)
+    if not isinstance(value, int) or isinstance(value, bool):
+        _raise_malformed_response(
+            context, f"field '{key}' is not an int: {value!r}", payload
+        )
+    return value
+
+
+def _require_str(payload: Mapping[str, object], key: str, context: str) -> str:
+    value = _require_key(payload, key, context)
+    if not isinstance(value, str):
+        _raise_malformed_response(
+            context, f"field '{key}' is not a string: {value!r}", payload
+        )
+    return value
+
+
+def _require_bool(payload: Mapping[str, object], key: str, context: str) -> bool:
+    value = _require_key(payload, key, context)
+    if not isinstance(value, bool):
+        _raise_malformed_response(
+            context, f"field '{key}' is not a bool: {value!r}", payload
+        )
+    return value
 
 
 def _backoff_seconds(attempt: int, base: float, cap: float) -> float:
@@ -482,47 +676,124 @@ def _normalize_ui_preview(value: Mapping[str, Any]) -> UiPreview:
     return cast(UiPreviewVega, preview)
 
 
-def _normalize_feedback_text(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    trimmed = value.strip()
-    if trimmed == "":
-        return None
-    return trimmed
+def _normalize_feedback_kind(value: object) -> NegotiationFeedbackKind | None:
+    if value in ("agent", "validation"):
+        return cast(NegotiationFeedbackKind, value)
+    return None
 
 
-def _normalize_feedback(
-    message: Any = None,
+def _build_feedback(
+    message: str | None = None,
     fields: Mapping[str, str] = {},
+    *,
+    kind: NegotiationFeedbackKind = "agent",
 ) -> NegotiationFeedback:
-    """Normalize negotiation feedback into the broker-facing JSON shape."""
-    normalized: dict[str, Any] = {}
-    normalized_message = _normalize_feedback_text(message)
-    if normalized_message is not None:
-        normalized["message"] = normalized_message
-
+    """Build a local feedback payload in the public negotiation shape."""
     normalized_fields: dict[str, str] = {}
     for key, value in fields.items():
-        key_text = str(key).strip()
-        value_text = _normalize_feedback_text(value)
-        if key_text and value_text is not None:
+        if not isinstance(key, str):
+            raise TypeError(f"feedback field names must be strings: {key!r}")
+        if not isinstance(value, str):
+            raise TypeError(f"feedback field messages must be strings: {value!r}")
+        key_text = key.strip()
+        value_text = value.strip()
+        if key_text and value_text:
             normalized_fields[key_text] = value_text
-    if normalized_fields:
-        normalized["fields"] = normalized_fields
+    return {
+        "kind": kind,
+        "message": message.strip() if message is not None else "",
+        "fields": normalized_fields,
+    }
 
-    return cast(NegotiationFeedback, normalized)
+
+def _normalize_job_error_detail_level(value: object) -> JobErrorDetailLevel:
+    if value in ("summary", "traceback"):
+        return cast(JobErrorDetailLevel, value)
+    raise ValueError(
+        "job_error_detail_level must be 'summary' or 'traceback' " f"(got {value!r})"
+    )
 
 
-def _feedback_from_payload(payload: Mapping[str, Any]) -> NegotiationFeedback:
-    feedback = payload.get("feedback")
-    if isinstance(feedback, Mapping):
-        return _normalize_feedback(feedback.get("message"), feedback.get("fields", {}))
+def _job_error_summary(exc: BaseException) -> str:
+    error_type = type(exc).__name__
+    error_message = str(exc).strip()
+    if error_message:
+        return f"{error_type}: {error_message}"
+    return error_type
 
-    revision = payload.get("revision")
-    if isinstance(revision, Mapping):
-        return _normalize_feedback(revision.get("message"), revision.get("fields", {}))
 
-    return _normalize_feedback(payload.get("error_msg"))
+def _job_error_result(
+    exc: BaseException, detail_level: JobErrorDetailLevel
+) -> JsonDict:
+    error_type = type(exc).__name__
+    error_message = str(exc).strip() or repr(exc)
+    value_keys = ["error_type", "error_message"]
+
+    result: JsonDict = {
+        "@keys": list(value_keys),
+        "@value": list(value_keys),
+        "@type": {
+            "error_type": "string",
+            "error_message": "string",
+        },
+        "@help": {
+            "error_type": "Exception class raised by the agent job.",
+            "error_message": "Exception message raised by the agent job.",
+        },
+        "@unit": {},
+        "error_type": error_type,
+        "error_message": error_message,
+    }
+
+    if detail_level == "traceback":
+        traceback_text = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        ).rstrip()
+        result["@keys"].append("traceback")
+        result["@value"].append("traceback")
+        cast(dict[str, str], result["@type"])["traceback"] = "string"
+        cast(dict[str, str], result["@help"])[
+            "traceback"
+        ] = "Python traceback captured from the agent process."
+        result["traceback"] = traceback_text
+
+    return result
+
+
+def _require_feedback_payload(
+    payload: Mapping[str, object], *, context: str
+) -> NegotiationFeedback:
+    kind_value = _normalize_feedback_kind(_require_key(payload, "kind", context))
+    if kind_value is None:
+        _raise_malformed_response(
+            context,
+            f"field 'kind' is not one of ['agent', 'validation']: "
+            f"{payload.get('kind')!r}",
+            payload,
+        )
+
+    fields_mapping = _require_mapping(payload, "fields", context)
+    fields: dict[str, str] = {}
+    for key, value in fields_mapping.items():
+        if not isinstance(key, str):
+            _raise_malformed_response(
+                context,
+                f"feedback field name is not a string: {key!r}",
+                fields_mapping,
+            )
+        if not isinstance(value, str):
+            _raise_malformed_response(
+                context,
+                f"feedback field '{key}' is not a string: {value!r}",
+                fields_mapping,
+            )
+        fields[key] = value
+
+    return {
+        "kind": kind_value,
+        "message": _require_str(payload, "message", context),
+        "fields": fields,
+    }
 
 
 def _feedback_response(
@@ -531,7 +802,7 @@ def _feedback_response(
     message: str | None = None,
     fields: Mapping[str, str] = {},
 ) -> NegotiationDecision:
-    return status, _normalize_feedback(message, fields)
+    return status, _build_feedback(message, fields, kind="agent")
 
 
 def ok_response(
@@ -582,38 +853,33 @@ def revision_response(
 def _attach_feedback(
     response: JsonDict,
     status: NegotiationStatus,
-    feedback: Mapping[str, Any] | None,
+    feedback: NegotiationFeedback | None,
 ) -> JsonDict:
     payload = dict(response)
-    normalized = _normalize_feedback(
-        (feedback or {}).get("message") if isinstance(feedback, Mapping) else None,
-        (feedback or {}).get("fields", {}) if isinstance(feedback, Mapping) else {},
+    normalized = (
+        {
+            "kind": feedback["kind"],
+            "message": feedback["message"],
+            "fields": dict(feedback["fields"]),
+        }
+        if feedback is not None
+        else _build_feedback(kind="agent")
     )
 
     default_message = None
-    if "message" not in normalized and status == "need_revision":
+    if normalized["message"] == "" and status == "need_revision":
         default_message = "The agent asked for revisions before it can continue."
-    if "message" not in normalized and status == "ng":
+    if normalized["message"] == "" and status == "ng":
         default_message = "The agent rejected this request."
     if default_message is not None:
         normalized["message"] = default_message
 
-    if normalized:
-        payload["feedback"] = normalized
-        if status == "need_revision":
-            payload["revision"] = normalized
-        else:
-            payload.pop("revision", None)
-
-        if status in ["need_revision", "ng"] and "message" in normalized:
-            payload["error_msg"] = normalized["message"]
-        elif status == "ok":
-            payload.pop("error_msg", None)
-    else:
-        payload.pop("feedback", None)
-        payload.pop("revision", None)
-        if status == "ok":
-            payload.pop("error_msg", None)
+    payload["feedback"] = normalized
+    payload.pop("revision", None)
+    if status in ["need_revision", "ng"] and normalized["message"] != "":
+        payload["error_msg"] = normalized["message"]
+    elif status == "ok":
+        payload.pop("error_msg", None)
 
     return payload
 
@@ -1166,6 +1432,7 @@ class AgentInterface:
         self.secret_token: str = ""
         self.name: str | None = None
         self.charge: int = 10000
+        self.job_error_detail_level: JobErrorDetailLevel = "traceback"
         self.convention: str = ""
         self.description: str = ""
         self.user_info_request: list[UserInfoField] = []
@@ -1231,7 +1498,9 @@ class AgentInterface:
     def has_func(self, func_name: str) -> bool:
         return func_name in self.func_dict
 
-    def validate(self, input_dict: JsonDict) -> tuple[str, JsonDict]:
+    def validate(
+        self, input_dict: JsonDict
+    ) -> tuple[Literal["ok", "need_revision"], JsonDict]:
         """Validate a request payload and return (msg, input_template)."""
         template_dict = self.input._get_template()
         msg = "ok"
@@ -1244,15 +1513,18 @@ class AgentInterface:
                     template_dict[key] = value
                 except (AssertionError, TypeError, ValueError):
                     msg = "need_revision"
-                    field_feedback[key] = "The provided value could not be accepted."
+                    field_feedback[key] = (
+                        "This value does not satisfy the declared input constraints."
+                    )
             else:
                 msg = "need_revision"
-                field_feedback[key] = "This parameter is required."
+                field_feedback[key] = "This required parameter is missing."
 
         if msg == "need_revision":
-            self.last_feedback = _normalize_feedback(
-                "Some parameters need revision before the agent can continue.",
+            self.last_feedback = _build_feedback(
+                "Some submitted values did not satisfy the declared input constraints.",
                 field_feedback,
+                kind="validation",
             )
         return msg, template_dict
 
@@ -1406,6 +1678,25 @@ class Job(Mapping[str, Any]):
                 result, self._agent.upload
             )
 
+        self._agent.post("report", payload)
+
+    def _report_internal(
+        self,
+        *,
+        msg: str | None = None,
+        progress: float | None = None,
+        result: JsonDict | None = None,
+    ) -> None:
+        """Send a broker-internal report payload without output-schema formatting."""
+        payload: JsonDict = dict(
+            negotiation_id=self._negotiation_id, status=self._status
+        )
+        if msg is not None:
+            payload["msg"] = msg
+        if progress is not None:
+            payload["progress"] = progress
+        if result is not None:
+            payload["result"] = result
         self._agent.post("report", payload)
 
     def msg(self, msg: str) -> None:
@@ -1709,7 +2000,8 @@ class Agent:
         response = self.interface.make_config()
         request = body["request"]
         request["_user_info"] = _normalize_user_info_payload(request.get("_user_info"))
-        msg, input_response = self.interface.validate(request)
+        validation_msg, input_response = self.interface.validate(request)
+        msg: NegotiationStatus = validation_msg
         response["input"] = input_response
         if msg == "ok" and self.interface.has_func("negotiation"):
             msg, feedback = self.interface.func_dict["negotiation"](request)
@@ -1758,11 +2050,19 @@ class Agent:
                 job.report(msg="Job done.", progress=1, result=result)
             except Exception:
                 logger.exception("Failed to report job completion")
-        except:
+        except Exception as exc:
             logger.exception(f"Error occured during the job execution; {msg=}")
             job._set_status("error")
             try:
-                job.report(msg="Error occured during the job.", progress=-1)
+                error_summary = _job_error_summary(exc)
+                error_result = _job_error_result(
+                    exc, self.interface.job_error_detail_level
+                )
+                job._report_internal(
+                    msg=f"Job failed with {error_summary}.",
+                    progress=-1,
+                    result=error_result,
+                )
             except Exception:
                 logger.exception("Failed to report job error status")
         logger.debug(f"{negotiation_id} took {time.perf_counter()-st:.3f} s.")
@@ -1901,6 +2201,13 @@ class Agent:
         """Upload a binary payload and return the broker file id.
 
         Retries transient connection errors with backoff and logs failures.
+
+        Raises:
+            AgentConnectionError: If the broker cannot be reached after retries.
+            AgentHTTPError: If the broker responds with a non-200 HTTP status.
+            AgentResponseError: If the broker responds with malformed JSON.
+            AgentUploadError: If the broker rejects the upload payload, including
+                storage-capacity failures.
         """
         extension = file_type.strip().lower().lstrip(".")
         file_name = f"__file_name__.{extension}" if extension else "__file_name__"
@@ -1953,6 +2260,11 @@ class Agent:
             if not obj:
                 logger.error("Upload returned empty response")
                 raise AgentResponseError("Upload returned empty response", payload=obj)
+            if obj.get("status") == "error":
+                code = obj.get("error")
+                error_msg = obj.get("error_msg") or "Upload rejected by broker"
+                logger.error("Upload rejected by broker: code=%s payload=%r", code, obj)
+                raise AgentUploadError(error_msg, code=code, payload=obj)
             return obj
         raise AgentConnectionError("Connection error during upload")
 
@@ -2153,6 +2465,15 @@ class Agent:
     @charge.setter
     def charge(self, charge: int):
         self.interface.charge = charge
+
+    @property
+    def job_error_detail_level(self) -> JobErrorDetailLevel:
+        """How much job exception detail the broker/UI should receive."""
+        return self.interface.job_error_detail_level
+
+    @job_error_detail_level.setter
+    def job_error_detail_level(self, value: JobErrorDetailLevel) -> None:
+        self.interface.job_error_detail_level = _normalize_job_error_detail_level(value)
 
     @property
     def user_info_request(self) -> list[UserInfoField]:
@@ -2573,14 +2894,8 @@ class Broker:
         )
         state = _require_key(negotiation, "state", "negotiate")
         if state != "ok":
-            content = negotiation.get("content", {})
-            error_msg = None
-            if isinstance(content, dict):
-                error_msg = content.get("error_msg")
-                if error_msg is None and isinstance(content.get("feedback"), Mapping):
-                    error_msg = content["feedback"].get("message")
-                if error_msg is None and isinstance(content.get("revision"), Mapping):
-                    error_msg = content["revision"].get("message")
+            content = negotiation["content"]
+            error_msg = content["feedback"]["message"]
             message = f"Negotiation returned {state}"
             if error_msg:
                 message = f"{message}: {error_msg}"
@@ -2620,9 +2935,9 @@ class Broker:
         )
         _require_key(response, "negotiation_id", "negotiate")
         content = _require_mapping(response, "content", "negotiate")
-        requested = _require_str_list(content, "user_info_request", "negotiate")
-        content["user_info_request"] = _normalize_user_info_fields(requested)
-        response["content"] = _normalize_negotiation_content_feedback(content)
+        response["content"] = _normalize_negotiation_content_feedback(
+            content, context="negotiate"
+        )
         return cast(NegotiationResponse, response)
 
     def begin_negotiation(self, agent_id: str) -> NegotiationResponse:
@@ -2645,9 +2960,9 @@ class Broker:
         response = self.post("negotiation/begin", {"agent_id": agent_id})
         _require_key(response, "negotiation_id", "begin_negotiation")
         content = _require_mapping(response, "content", "begin_negotiation")
-        requested = _require_str_list(content, "user_info_request", "begin_negotiation")
-        content["user_info_request"] = _normalize_user_info_fields(requested)
-        response["content"] = _normalize_negotiation_content_feedback(content)
+        response["content"] = _normalize_negotiation_content_feedback(
+            content, context="begin_negotiation"
+        )
         return cast(NegotiationResponse, response)
 
     def contract(self, negotiation_id: str) -> ContractResponse:
@@ -2713,7 +3028,11 @@ class Broker:
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
         response = self.get("board")
-        _require_list(response, "agents", "board")
+        agents = _require_list(response, "agents", "board")
+        response["agents"] = [
+            _normalize_board_agent_payload(agent, context=f"board.agents[{index}]")
+            for index, agent in enumerate(agents)
+        ]
         return cast(BoardResponse, response)
 
     @property
@@ -2914,7 +3233,11 @@ class BrokerAdmin:
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
         response = self._request_json("GET", "board")
-        _require_list(response, "agents", "board")
+        agents = _require_list(response, "agents", "board")
+        response["agents"] = [
+            _normalize_board_agent_payload(agent, context=f"board.agents[{index}]")
+            for index, agent in enumerate(agents)
+        ]
         return cast(BoardResponse, response)
 
     def list_results(self) -> ResultsResponse:
@@ -2949,7 +3272,13 @@ class BrokerAdmin:
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
         response = self._request_json("GET", "agents")
-        _require_list(response, "agents", "list_agents")
+        agents = _require_list(response, "agents", "list_agents")
+        response["agents"] = [
+            _normalize_agent_summary_payload(
+                agent, context=f"list_agents.agents[{index}]"
+            )
+            for index, agent in enumerate(agents)
+        ]
         return cast(AgentsResponse, response)
 
     def get_agent(self, agent_id: str) -> AgentResponse:
@@ -2967,7 +3296,10 @@ class BrokerAdmin:
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
         response = self._request_json("GET", f"agents/{agent_id}")
-        _require_mapping(response, "agent", "get_agent")
+        response["agent"] = _normalize_agent_detail_payload(
+            _require_mapping(response, "agent", "get_agent"),
+            context="get_agent.agent",
+        )
         return cast(AgentResponse, response)
 
     def create_agent(
@@ -3002,7 +3334,10 @@ class BrokerAdmin:
             }
         }
         response = self._request_json("POST", "agents", payload)
-        _require_mapping(response, "agent", "create_agent")
+        response["agent"] = _normalize_agent_detail_payload(
+            _require_mapping(response, "agent", "create_agent"),
+            context="create_agent.agent",
+        )
         return cast(AgentResponse, response)
 
     def update_agent(self, agent_id: str, **fields: Any) -> AgentResponse:
@@ -3023,7 +3358,10 @@ class BrokerAdmin:
         response = self._request_json(
             "PATCH", f"agents/{agent_id}", {"servicer_agent": fields}
         )
-        _require_mapping(response, "agent", "update_agent")
+        response["agent"] = _normalize_agent_detail_payload(
+            _require_mapping(response, "agent", "update_agent"),
+            context="update_agent.agent",
+        )
         return cast(AgentResponse, response)
 
     def delete_agent(self, agent_id: str) -> StatusResponse:

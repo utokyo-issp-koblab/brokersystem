@@ -14,6 +14,88 @@ from brokersystem.agent import (
 BROKER_URL = "https://example.test"
 
 
+def _feedback(
+    *,
+    kind: str = "agent",
+    message: str = "",
+    fields: dict[str, str] | None = None,
+) -> dict[str, object]:
+    return {"kind": kind, "message": message, "fields": fields or {}}
+
+
+def _negotiation_content(**extra: object) -> dict[str, object]:
+    content: dict[str, object] = {
+        "user_info_request": [],
+        "input": {},
+        "condition": {},
+        "output": {},
+        "charge": 100,
+        "feedback": _feedback(),
+    }
+    content.update(extra)
+    return content
+
+
+def _agent_info() -> dict[str, object]:
+    return {
+        "input": {},
+        "condition": {},
+        "output": {},
+        "description": "Example agent",
+        "module_version": "0.3.0",
+        "user_info_request": [],
+    }
+
+
+def _user_summary() -> dict[str, object]:
+    return {
+        "id": "u1",
+        "auth": "auth0|owner",
+        "name": "Owner User",
+        "affiliation": "Owner Lab",
+        "point": 100,
+        "info": {},
+    }
+
+
+def _board_agent() -> dict[str, object]:
+    return {
+        "id": "a1",
+        "name": "Agent 1",
+        "type": "predict",
+        "category": "cat",
+        "is_public": True,
+        "active": True,
+        "info": _agent_info(),
+        "owner": {
+            "id": "u1",
+            "name": "Owner User",
+            "affiliation": "Owner Lab",
+        },
+    }
+
+
+def _agent_summary() -> dict[str, object]:
+    return {
+        "id": "a1",
+        "name": "Agent 1",
+        "type": "predict",
+        "category": "cat",
+        "is_public": True,
+        "point": 10,
+        "info": _agent_info(),
+    }
+
+
+def _agent_detail(*, name: str = "Agent 1") -> dict[str, object]:
+    return {
+        **_agent_summary(),
+        "name": name,
+        "owner": _user_summary(),
+        "secret_key": "secret-123",
+    }
+
+
 @responses.activate
 def test_broker_begin_negotiation() -> None:
     broker = Broker(broker_url=BROKER_URL, auth="token")
@@ -23,7 +105,7 @@ def test_broker_begin_negotiation() -> None:
         json={
             "negotiation_id": "n1",
             "state": "ok",
-            "content": {"user_info_request": []},
+            "content": _negotiation_content(),
         },
         status=200,
     )
@@ -33,7 +115,7 @@ def test_broker_begin_negotiation() -> None:
 
 
 @responses.activate
-def test_broker_begin_negotiation_normalizes_legacy_revision_feedback() -> None:
+def test_broker_begin_negotiation_returns_required_feedback_shape() -> None:
     broker = Broker(broker_url=BROKER_URL, auth="token")
     responses.add(
         responses.POST,
@@ -41,21 +123,22 @@ def test_broker_begin_negotiation_normalizes_legacy_revision_feedback() -> None:
         json={
             "negotiation_id": "n1",
             "state": "ok",
-            "content": {
-                "user_info_request": [],
-                "revision": {
-                    "message": "Legacy revision message.",
-                    "fields": {"x": "Set x to 5 or less."},
-                },
-            },
+            "content": _negotiation_content(
+                feedback=_feedback(
+                    message="Accepted with comments.",
+                    fields={"x": "Set x to 5 or less."},
+                )
+            ),
         },
         status=200,
     )
 
     response = broker.begin_negotiation("agent-1")
+    feedback = response["content"]["feedback"]
 
-    assert response["content"]["feedback"]["message"] == "Legacy revision message."
-    assert response["content"]["feedback"]["fields"]["x"] == "Set x to 5 or less."
+    assert feedback["kind"] == "agent"
+    assert feedback["message"] == "Accepted with comments."
+    assert feedback["fields"] == {"x": "Set x to 5 or less."}
 
 
 @responses.activate
@@ -67,7 +150,7 @@ def test_broker_negotiate_sends_user_info_consent() -> None:
         json={
             "negotiation_id": "n1",
             "state": "ok",
-            "content": {"user_info_request": []},
+            "content": _negotiation_content(),
         },
         status=200,
     )
@@ -89,25 +172,23 @@ def test_broker_negotiate_returns_feedback_for_ok_state() -> None:
         json={
             "negotiation_id": "n1",
             "state": "ok",
-            "content": {
-                "user_info_request": [],
-                "feedback": {
-                    "message": "Accepted with comments.",
-                    "fields": {"x": "x is accepted near the upper bound."},
-                },
-            },
+            "content": _negotiation_content(
+                feedback=_feedback(
+                    message="Accepted with comments.",
+                    fields={"x": "x is accepted near the upper bound."},
+                )
+            ),
         },
         status=200,
     )
 
     response = broker.negotiate("agent-1", {"x": 5})
+    feedback = response["content"]["feedback"]
 
     assert response["state"] == "ok"
-    assert response["content"]["feedback"]["message"] == "Accepted with comments."
-    assert (
-        response["content"]["feedback"]["fields"]["x"]
-        == "x is accepted near the upper bound."
-    )
+    assert feedback["kind"] == "agent"
+    assert feedback["message"] == "Accepted with comments."
+    assert feedback["fields"] == {"x": "x is accepted near the upper bound."}
 
 
 @responses.activate
@@ -116,11 +197,30 @@ def test_broker_board() -> None:
     responses.add(
         responses.GET,
         f"{BROKER_URL}/api/v1/client/board",
-        json={"agents": []},
+        json={"agents": [_board_agent()]},
         status=200,
     )
 
-    assert broker.board() == {"agents": []}
+    response = broker.board()
+    assert response["agents"][0]["info"]["description"] == "Example agent"
+    assert response["agents"][0]["info"]["user_info_request"] == []
+    assert response["agents"][0]["info"]["input"] == {}
+
+
+@responses.activate
+def test_broker_board_raises_on_malformed_agent_payload() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    malformed = _board_agent()
+    malformed.pop("owner")
+    responses.add(
+        responses.GET,
+        f"{BROKER_URL}/api/v1/client/board",
+        json={"agents": [malformed]},
+        status=200,
+    )
+
+    with pytest.raises(BrokerResponseError, match="Malformed broker response"):
+        broker.board()
 
 
 @responses.activate
@@ -143,11 +243,27 @@ def test_broker_begin_negotiation_raises_on_missing_user_info_request() -> None:
     responses.add(
         responses.POST,
         f"{BROKER_URL}/api/v1/client/negotiation/begin",
-        json={"negotiation_id": "n1", "state": "ok", "content": {}},
+        json={"negotiation_id": "n1", "state": "ok", "content": {"input": {}}},
         status=200,
     )
 
     with pytest.raises(BrokerResponseError):
+        broker.begin_negotiation("agent-1")
+
+
+@responses.activate
+def test_broker_begin_negotiation_raises_on_missing_feedback() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    content = _negotiation_content()
+    content.pop("feedback")
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/negotiation/begin",
+        json={"negotiation_id": "n1", "state": "ok", "content": content},
+        status=200,
+    )
+
+    with pytest.raises(BrokerResponseError, match="Malformed broker response"):
         broker.begin_negotiation("agent-1")
 
 
@@ -160,7 +276,7 @@ def test_broker_contract_flow_get_result() -> None:
         json={
             "negotiation_id": "n1",
             "state": "ok",
-            "content": {"user_info_request": []},
+            "content": _negotiation_content(),
         },
         status=200,
     )
@@ -203,7 +319,7 @@ def test_broker_ask_raises_on_non_ok_state() -> None:
         json={
             "negotiation_id": "n1",
             "state": "need_revision",
-            "content": {"user_info_request": [], "error_msg": "x too large"},
+            "content": _negotiation_content(feedback=_feedback(message="x too large")),
         },
         status=200,
     )
@@ -221,13 +337,12 @@ def test_broker_ask_uses_feedback_message_when_error_msg_is_missing() -> None:
         json={
             "negotiation_id": "n1",
             "state": "need_revision",
-            "content": {
-                "user_info_request": [],
-                "feedback": {
-                    "message": "Please reduce x before retrying.",
-                    "fields": {"x": "Set x to 5 or less."},
-                },
-            },
+            "content": _negotiation_content(
+                feedback=_feedback(
+                    message="Please reduce x before retrying.",
+                    fields={"x": "Set x to 5 or less."},
+                )
+            ),
         },
         status=200,
     )
@@ -242,19 +357,19 @@ def test_broker_admin_agents_and_tokens() -> None:
     responses.add(
         responses.GET,
         f"{BROKER_URL}/api/v1/broker/agents",
-        json={"agents": []},
+        json={"agents": [_agent_summary()]},
         status=200,
     )
     responses.add(
         responses.POST,
         f"{BROKER_URL}/api/v1/broker/agents",
-        json={"agent": {"id": "a1", "name": "name"}},
+        json={"agent": _agent_detail(name="name")},
         status=200,
     )
     responses.add(
         responses.PATCH,
         f"{BROKER_URL}/api/v1/broker/agents/a1",
-        json={"agent": {"id": "a1", "name": "updated"}},
+        json={"agent": _agent_detail(name="updated")},
         status=200,
     )
     responses.add(
@@ -282,7 +397,9 @@ def test_broker_admin_agents_and_tokens() -> None:
         status=200,
     )
 
-    assert admin.list_agents() == {"agents": []}
+    agents = admin.list_agents()["agents"]
+    assert agents[0]["info"]["description"] == "Example agent"
+    assert agents[0]["info"]["output"] == {}
     assert (
         admin.create_agent("name", "predict", "cat", is_public=False)["agent"]["id"]
         == "a1"
