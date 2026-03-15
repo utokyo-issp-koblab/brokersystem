@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 import responses
@@ -7,6 +8,7 @@ from brokersystem.agent import (
     Broker,
     BrokerAdmin,
     BrokerHTTPError,
+    BrokerUploadError,
     BrokerResponseError,
     UserInfoField,
 )
@@ -189,6 +191,134 @@ def test_broker_negotiate_returns_feedback_for_ok_state() -> None:
     assert feedback["kind"] == "agent"
     assert feedback["message"] == "Accepted with comments."
     assert feedback["fields"] == {"x": "x is accepted near the upper bound."}
+
+
+@responses.activate
+def test_broker_upload_returns_file_id(tmp_path: Path) -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("hello", encoding="utf-8")
+
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/upload",
+        json={"status": "ok", "file_id": "file-1.txt"},
+        status=200,
+    )
+
+    file_id = broker.upload("txt", file_path)
+
+    assert file_id == "file-1.txt"
+
+
+@responses.activate
+def test_broker_upload_raises_on_storage_rejection(tmp_path: Path) -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("hello", encoding="utf-8")
+
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/upload",
+        json={
+            "status": "error",
+            "error": "storage_limit_exceeded",
+            "error_msg": "Not enough storage is available for this upload.",
+        },
+        status=200,
+    )
+
+    with pytest.raises(BrokerUploadError, match="Not enough storage") as exc:
+        broker.upload("txt", file_path)
+
+    assert exc.value.code == "storage_limit_exceeded"
+
+
+@responses.activate
+def test_broker_negotiate_uploads_local_file_inputs(tmp_path: Path) -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    file_path = tmp_path / "input.txt"
+    file_path.write_text("payload", encoding="utf-8")
+
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/negotiation/begin",
+        json={
+            "negotiation_id": "n-begin",
+            "state": "begin",
+            "content": _negotiation_content(
+                input={
+                    "@type": {"attachment": "file"},
+                    "@constraints": {"attachment": {"file_type": "txt"}},
+                    "@value": ["attachment"],
+                }
+            ),
+        },
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/upload",
+        json={"status": "ok", "file_id": "uploaded.txt"},
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/negotiate",
+        json={
+            "negotiation_id": "n-final",
+            "state": "ok",
+            "content": _negotiation_content(),
+        },
+        status=200,
+    )
+
+    response = broker.negotiate("agent-1", {"attachment": file_path})
+
+    assert response["negotiation_id"] == "n-final"
+    begin_body = responses.calls[0].request.body
+    assert begin_body is not None
+    begin_payload = json.loads(
+        begin_body.decode("utf-8") if isinstance(begin_body, bytes) else begin_body
+    )
+    assert begin_payload == {"agent_id": "agent-1"}
+
+    negotiate_body = responses.calls[2].request.body
+    assert negotiate_body is not None
+    negotiate_payload = json.loads(
+        negotiate_body.decode("utf-8")
+        if isinstance(negotiate_body, bytes)
+        else negotiate_body
+    )
+    assert negotiate_payload["negotiation_id"] == "n-begin"
+    assert negotiate_payload["request"]["attachment"] == "uploaded.txt"
+
+
+@responses.activate
+def test_broker_negotiate_rejects_local_file_for_non_file_input(tmp_path: Path) -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    file_path = tmp_path / "input.txt"
+    file_path.write_text("payload", encoding="utf-8")
+
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/negotiation/begin",
+        json={
+            "negotiation_id": "n-begin",
+            "state": "begin",
+            "content": _negotiation_content(
+                input={
+                    "@type": {"attachment": "string"},
+                    "@constraints": {},
+                    "@value": ["attachment"],
+                }
+            ),
+        },
+        status=200,
+    )
+
+    with pytest.raises(BrokerResponseError, match="local file data was provided"):
+        broker.negotiate("agent-1", {"attachment": file_path})
 
 
 @responses.activate

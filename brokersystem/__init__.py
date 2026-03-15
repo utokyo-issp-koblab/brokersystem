@@ -18,6 +18,7 @@ from brokersystem.agent import (
     BrokerConnectionError,
     BrokerError,
     BrokerHTTPError,
+    BrokerUploadError,
     BrokerResponseError,
     Choice,
     File,

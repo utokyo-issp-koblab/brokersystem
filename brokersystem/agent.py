@@ -302,6 +302,21 @@ class BrokerResponseError(BrokerError):
         self.payload = payload
 
 
+class BrokerUploadError(BrokerError):
+    """Raised when the broker rejects a client-side upload request."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        payload: Any | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.payload = payload
+
+
 class AgentError(RuntimeError):
     """Base class for agent runtime errors."""
 
@@ -594,6 +609,10 @@ def _require_bool(payload: Mapping[str, object], key: str, context: str) -> bool
             context, f"field '{key}' is not a bool: {value!r}", payload
         )
     return value
+
+
+def _is_local_file_value(value: object) -> bool:
+    return isinstance(value, (bytes, bytearray, memoryview, PathLike))
 
 
 def _backoff_seconds(attempt: int, base: float, cap: float) -> float:
@@ -2908,7 +2927,9 @@ class Broker:
 
         Args:
             agent_id: Target agent id.
-            request: Input payload for negotiation.
+            request: Input payload for negotiation. For `file` / `image` inputs,
+                pass a broker file id string or a local `Path` / bytes value.
+                Local file values are uploaded automatically before negotiation.
             user_info_consent: Optional consent fields (`user_id`, `email`,
                 `name_affiliation`) to include in the request.
 
@@ -2918,8 +2939,11 @@ class Broker:
         Raises:
             BrokerConnectionError: If the broker server cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
+            BrokerUploadError: If the broker rejects an input file upload.
             BrokerResponseError: If the response payload is malformed or indicates error
                 (including negotiation states other than "ok").
+            TypeError: If a local file input value is not bytes or a valid path-like.
+            OSError: If a local file input path cannot be read.
         """
         negotiation = self.negotiate(
             agent_id, request, user_info_consent=user_info_consent
@@ -2950,7 +2974,9 @@ class Broker:
 
         Args:
             agent_id: Target agent id.
-            request: Input payload for negotiation.
+            request: Input payload for negotiation. For `file` / `image` inputs,
+                pass a broker file id string or a local `Path` / bytes value.
+                Local file values are uploaded automatically before negotiation.
             user_info_consent: Optional consent fields to include in the request.
 
         Returns:
@@ -2959,12 +2985,31 @@ class Broker:
         Raises:
             BrokerConnectionError: If the broker server cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
+            BrokerUploadError: If the broker rejects an input file upload.
             BrokerResponseError: If the response payload is malformed or indicates error.
+            TypeError: If a local file input value is not bytes or a valid path-like.
+            OSError: If a local file input path cannot be read.
         """
         request_payload = self._with_user_info_consent(request, user_info_consent)
-        response = self.post(
-            "negotiate", {"agent_id": agent_id, "request": request_payload}
-        )
+        if self._request_contains_local_files(request_payload):
+            begin = self.begin_negotiation(agent_id)
+            prepared_request = self._prepare_request_uploads(
+                request_payload,
+                begin["content"]["input"],
+                context=f"negotiate({agent_id})",
+            )
+            response = self.post(
+                "negotiate",
+                {
+                    "negotiation_id": begin["negotiation_id"],
+                    "request": prepared_request,
+                },
+            )
+        else:
+            response = self.post(
+                "negotiate",
+                {"agent_id": agent_id, "request": request_payload},
+            )
         _require_key(response, "negotiation_id", "negotiate")
         content = _require_mapping(response, "content", "negotiate")
         response["content"] = _normalize_negotiation_content_feedback(
@@ -3138,6 +3183,38 @@ class Broker:
             )
         return response
 
+    def upload(
+        self,
+        file_type: str,
+        value: BinaryData | PathLike[str] | str,
+    ) -> str:
+        """Upload a client-side input file and return the broker file id.
+
+        Args:
+            file_type: File extension/type declared by the agent input schema.
+            value: Bytes-like content or a local file path.
+
+        Returns:
+            Broker file id string suitable for `file` / `image` request fields.
+
+        Raises:
+            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+            BrokerUploadError: If the broker rejects the upload payload.
+            BrokerResponseError: If the broker returns malformed JSON.
+            TypeError: If `value` is neither bytes-like nor a path-like object.
+            OSError: If the local file path cannot be read.
+        """
+        file_id, _format = File(file_type).format_for_output(
+            value, self._upload_binary_data
+        )
+        if not isinstance(file_id, str):
+            raise BrokerResponseError(
+                f"Malformed broker response in upload: missing file id for {file_type!r}",
+                payload=file_id,
+            )
+        return file_id
+
     def _request_json(
         self, method: str, uri: str, payload: JsonDict | None = None
     ) -> JsonDict:
@@ -3169,6 +3246,123 @@ class Broker:
             isinstance(k, str) for k in obj.keys()
         ), f"Some of response keys were not str: {obj.keys()}"
         return obj
+
+    def _request_contains_local_files(self, request: Mapping[str, object]) -> bool:
+        return any(
+            key != "_user_info_consent" and _is_local_file_value(value)
+            for key, value in request.items()
+        )
+
+    def _prepare_request_uploads(
+        self,
+        request: Mapping[str, object],
+        input_schema: TemplateSchema,
+        *,
+        context: str,
+    ) -> JsonDict:
+        types = input_schema.get("@type")
+        constraints = input_schema.get("@constraints")
+        if not isinstance(types, Mapping):
+            _raise_malformed_response(context, "missing input.@type", input_schema)
+        if not isinstance(constraints, Mapping):
+            _raise_malformed_response(
+                context, "missing input.@constraints", input_schema
+            )
+
+        prepared = dict(request)
+        for key, value in request.items():
+            if key == "_user_info_consent" or not _is_local_file_value(value):
+                continue
+
+            declared_type = types.get(key)
+            if declared_type not in ("file", "image"):
+                raise BrokerResponseError(
+                    f"{context} failed: local file data was provided for '{key}', "
+                    f"but the input schema declares {declared_type!r}",
+                    payload=input_schema,
+                )
+
+            constraint = constraints.get(key)
+            if not isinstance(constraint, Mapping):
+                _raise_malformed_response(
+                    context, f"missing constraints for file input '{key}'", input_schema
+                )
+            file_type = constraint.get("file_type")
+            if not isinstance(file_type, str) or file_type == "":
+                _raise_malformed_response(
+                    context, f"missing file_type for file input '{key}'", input_schema
+                )
+
+            prepared[key] = self.upload(
+                file_type,
+                cast(BinaryData | PathLike[str] | str, value),
+            )
+
+        return prepared
+
+    def _upload_binary_data(self, file_type: str, binary_data: bytes) -> JsonDict:
+        extension = file_type.strip().lower().lstrip(".")
+        file_name = f"__file_name__.{extension}" if extension else "__file_name__"
+        content_type, _encoding = mimetypes.guess_type(file_name)
+        if content_type is None:
+            content_type = "application/octet-stream"
+
+        files = {"file": (file_name, binary_data, content_type)}
+        uri = "upload"
+
+        try:
+            response = requests.post(
+                f"{self.broker_url}/api/v1/client/{uri}",
+                headers=self.header_auth,
+                files=files,
+            )
+        except requests.exceptions.RequestException as exc:
+            logger.exception("Connection error on upload request; %s", uri)
+            raise BrokerConnectionError(
+                f"Connection error on upload request; {uri=}"
+            ) from exc
+
+        if response.status_code != 200:
+            logger.exception(
+                "Not 200: response.status_code=%s; uri=%s, response.content=%r",
+                response.status_code,
+                uri,
+                response.content,
+            )
+            raise BrokerHTTPError(
+                response.status_code, uri, _coerce_error_content(response.content)
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise BrokerResponseError(
+                "Malformed broker response in upload: expected JSON object",
+                payload=response.text,
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise BrokerResponseError(
+                "Malformed broker response in upload: expected JSON object",
+                payload=payload,
+            )
+
+        if payload.get("status") == "error":
+            message = (
+                payload.get("error_msg") or payload.get("error") or "unknown error"
+            )
+            raise BrokerUploadError(
+                str(message),
+                code=(
+                    payload.get("error")
+                    if isinstance(payload.get("error"), str)
+                    else None
+                ),
+                payload=payload,
+            )
+
+        file_id = _require_str(payload, "file_id", "upload")
+        return {"file_id": file_id}
 
 
 class BrokerAdmin:
