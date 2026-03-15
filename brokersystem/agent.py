@@ -31,6 +31,7 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 ResultValue = str | int | float | bool | None | list[Any] | dict[str, Any]
+NegotiationStatus = Literal["ok", "need_revision", "ng"]
 NegotiationState = Literal[
     "begin",
     "request",
@@ -104,6 +105,17 @@ class UserInfo(TypedDict):
     name_affiliation: UserInfoNameAffiliation
 
 
+NegotiationFeedback = TypedDict(
+    "NegotiationFeedback",
+    {
+        "message": str,
+        "fields": dict[str, str],
+    },
+    total=False,
+)
+NegotiationDecision = tuple[NegotiationStatus, NegotiationFeedback]
+
+
 class NegotiationContentBase(TypedDict):
     user_info_request: list[UserInfoField]
 
@@ -114,6 +126,9 @@ class NegotiationContent(NegotiationContentBase, total=False):
     output: TemplateSchema
     charge: int
     ui_preview: UiPreview
+    error_msg: str
+    feedback: NegotiationFeedback
+    revision: NegotiationFeedback
 
 
 class NegotiationResponse(TypedDict):
@@ -334,6 +349,18 @@ def _ensure_response_dict(payload: Any, context: str) -> JsonDict:
     return payload
 
 
+def _normalize_negotiation_content_feedback(
+    content: Mapping[str, Any],
+) -> NegotiationContent:
+    normalized = dict(content)
+    feedback = _feedback_from_payload(normalized)
+    if feedback:
+        normalized["feedback"] = feedback
+    else:
+        normalized.pop("feedback", None)
+    return cast(NegotiationContent, normalized)
+
+
 def _require_key(payload: Mapping[str, Any], key: str, context: str) -> Any:
     if key not in payload:
         raise BrokerResponseError(f"{context} missing '{key}'", payload=payload)
@@ -445,6 +472,142 @@ def _normalize_ui_preview(value: Mapping[str, Any]) -> UiPreview:
         raise TypeError("ui_preview.spec must be a mapping when set")
     preview["spec"] = dict(spec)
     return cast(UiPreviewVega, preview)
+
+
+def _normalize_feedback_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    trimmed = value.strip()
+    if trimmed == "":
+        return None
+    return trimmed
+
+
+def _normalize_feedback(
+    message: Any = None,
+    fields: Mapping[str, str] = {},
+) -> NegotiationFeedback:
+    """Normalize negotiation feedback into the broker-facing JSON shape."""
+    normalized: dict[str, Any] = {}
+    normalized_message = _normalize_feedback_text(message)
+    if normalized_message is not None:
+        normalized["message"] = normalized_message
+
+    normalized_fields: dict[str, str] = {}
+    for key, value in fields.items():
+        key_text = str(key).strip()
+        value_text = _normalize_feedback_text(value)
+        if key_text and value_text is not None:
+            normalized_fields[key_text] = value_text
+    if normalized_fields:
+        normalized["fields"] = normalized_fields
+
+    return cast(NegotiationFeedback, normalized)
+
+
+def _feedback_from_payload(payload: Mapping[str, Any]) -> NegotiationFeedback:
+    feedback = payload.get("feedback")
+    if isinstance(feedback, Mapping):
+        return _normalize_feedback(feedback.get("message"), feedback.get("fields", {}))
+
+    revision = payload.get("revision")
+    if isinstance(revision, Mapping):
+        return _normalize_feedback(revision.get("message"), revision.get("fields", {}))
+
+    return _normalize_feedback(payload.get("error_msg"))
+
+
+def _feedback_response(
+    status: NegotiationStatus,
+    *,
+    message: str | None = None,
+    fields: Mapping[str, str] = {},
+) -> NegotiationDecision:
+    return status, _normalize_feedback(message, fields)
+
+
+def ok_response(
+    *,
+    message: str | None = None,
+    fields: Mapping[str, str] = {},
+) -> tuple[Literal["ok"], NegotiationFeedback]:
+    """Return an `ok` negotiation decision with optional feedback."""
+    return cast(
+        tuple[Literal["ok"], NegotiationFeedback],
+        _feedback_response("ok", message=message, fields=fields),
+    )
+
+
+def need_revision_response(
+    *,
+    message: str | None = None,
+    fields: Mapping[str, str] = {},
+) -> tuple[Literal["need_revision"], NegotiationFeedback]:
+    """Return a `need_revision` negotiation decision with optional feedback."""
+    return cast(
+        tuple[Literal["need_revision"], NegotiationFeedback],
+        _feedback_response("need_revision", message=message, fields=fields),
+    )
+
+
+def ng_response(
+    *,
+    message: str | None = None,
+    fields: Mapping[str, str] = {},
+) -> tuple[Literal["ng"], NegotiationFeedback]:
+    """Return an `ng` negotiation decision with optional feedback."""
+    return cast(
+        tuple[Literal["ng"], NegotiationFeedback],
+        _feedback_response("ng", message=message, fields=fields),
+    )
+
+
+def revision_response(
+    *,
+    message: str | None = None,
+    fields: Mapping[str, str] = {},
+) -> tuple[Literal["need_revision"], NegotiationFeedback]:
+    """Alias for `need_revision_response(...)`."""
+    return need_revision_response(message=message, fields=fields)
+
+
+def _attach_feedback(
+    response: JsonDict,
+    status: NegotiationStatus,
+    feedback: Mapping[str, Any] | None,
+) -> JsonDict:
+    payload = dict(response)
+    normalized = _normalize_feedback(
+        (feedback or {}).get("message") if isinstance(feedback, Mapping) else None,
+        (feedback or {}).get("fields", {}) if isinstance(feedback, Mapping) else {},
+    )
+
+    default_message = None
+    if "message" not in normalized and status == "need_revision":
+        default_message = "The agent asked for revisions before it can continue."
+    if "message" not in normalized and status == "ng":
+        default_message = "The agent rejected this request."
+    if default_message is not None:
+        normalized["message"] = default_message
+
+    if normalized:
+        payload["feedback"] = normalized
+        if status == "need_revision":
+            payload["revision"] = normalized
+        else:
+            payload.pop("revision", None)
+
+        if status in ["need_revision", "ng"] and "message" in normalized:
+            payload["error_msg"] = normalized["message"]
+        elif status == "ok":
+            payload.pop("error_msg", None)
+    else:
+        payload.pop("feedback", None)
+        payload.pop("revision", None)
+        if status == "ok":
+            payload.pop("error_msg", None)
+
+    return payload
 
 
 def _safe_debug_value(value: Any) -> Any:
@@ -1003,6 +1166,7 @@ class AgentInterface:
         self.condition: TemplateContainer = TemplateContainer("condition")
         self.output: TemplateContainer = TemplateContainer("output")
         self.func_dict: dict[str, Callable[..., Any]] = {}
+        self.last_feedback: NegotiationFeedback | None = None
 
     def prepare(self, func_dict: Mapping[str, Callable[..., Any]]) -> None:
         """Validate required agent hooks and refresh config templates."""
@@ -1063,15 +1227,25 @@ class AgentInterface:
         """Validate a request payload and return (msg, input_template)."""
         template_dict = self.input._get_template()
         msg = "ok"
+        field_feedback: dict[str, str] = {}
+        self.last_feedback = None
         for key in template_dict["@keys"]:
             if key in input_dict:
                 try:
                     value = self.input[key].cast(input_dict[key])
                     template_dict[key] = value
-                except (AssertionError, TypeError):
+                except (AssertionError, TypeError, ValueError):
                     msg = "need_revision"
+                    field_feedback[key] = "The provided value could not be accepted."
             else:
                 msg = "need_revision"
+                field_feedback[key] = "This parameter is required."
+
+        if msg == "need_revision":
+            self.last_feedback = _normalize_feedback(
+                "Some parameters need revision before the agent can continue.",
+                field_feedback,
+            )
         return msg, template_dict
 
     def cast(self, key: str, input_value: Any) -> Any:
@@ -1530,11 +1704,16 @@ class Agent:
         msg, input_response = self.interface.validate(request)
         response["input"] = input_response
         if msg == "ok" and self.interface.has_func("negotiation"):
-            msg, response = self.interface.func_dict["negotiation"](request, response)
+            msg, feedback = self.interface.func_dict["negotiation"](request)
             if msg not in ["ok", "need_revision", "ng"]:
                 logger.exception(
                     f"Negotiation func in {self.interface.name} returns a wrong msg: should be one of 'ok', 'need_revision' or 'ng'"
                 )
+            response = _attach_feedback(response, msg, feedback)
+        elif msg == "need_revision":
+            response = _attach_feedback(response, msg, self.interface.last_feedback)
+        else:
+            response = _attach_feedback(response, msg, None)
 
         if msg == "ok" and self.interface.has_func("charge_func"):
             response["charge"] = round(
@@ -1790,25 +1969,24 @@ class Agent:
 
     def negotiation(
         self,
-        func: Callable[
-            [JsonDict, JsonDict],
-            tuple[Literal["ok", "need_revision", "ng"], JsonDict],
-        ],
-    ) -> Callable[
-        [JsonDict, JsonDict],
-        tuple[Literal["ok", "need_revision", "ng"], JsonDict],
-    ]:
-        """Decorator for custom negotiation logic.
+        func: Callable[[JsonDict], NegotiationDecision],
+    ) -> Callable[[JsonDict], NegotiationDecision]:
+        """Register custom negotiation logic for broker requests.
 
-        Optional: If omitted, only schema validation runs and the
-        default response is returned.
+        If this decorator is omitted, the SDK applies schema validation only.
+
+        The callback receives the submitted request values for the current
+        round. When user info disclosure is enabled, `_user_info` is included
+        in the request.
+
+        Return `ok_response(...)`, `need_revision_response(...)`, or
+        `ng_response(...)`. Use `message` for a round-level note and `fields`
+        for sparse per-parameter notes.
         """
 
         @functools.wraps(func)
-        def wrapper(
-            request: JsonDict, response: JsonDict
-        ) -> tuple[Literal["ok", "need_revision", "ng"], JsonDict]:
-            return func(request, response)
+        def wrapper(request: JsonDict) -> NegotiationDecision:
+            return func(request)
 
         self.register_func("negotiation", wrapper)
         return wrapper
@@ -2391,6 +2569,10 @@ class Broker:
             error_msg = None
             if isinstance(content, dict):
                 error_msg = content.get("error_msg")
+                if error_msg is None and isinstance(content.get("feedback"), Mapping):
+                    error_msg = content["feedback"].get("message")
+                if error_msg is None and isinstance(content.get("revision"), Mapping):
+                    error_msg = content["revision"].get("message")
             message = f"Negotiation returned {state}"
             if error_msg:
                 message = f"{message}: {error_msg}"
@@ -2432,6 +2614,7 @@ class Broker:
         content = _require_mapping(response, "content", "negotiate")
         requested = _require_str_list(content, "user_info_request", "negotiate")
         content["user_info_request"] = _normalize_user_info_fields(requested)
+        response["content"] = _normalize_negotiation_content_feedback(content)
         return cast(NegotiationResponse, response)
 
     def begin_negotiation(self, agent_id: str) -> NegotiationResponse:
@@ -2456,6 +2639,7 @@ class Broker:
         content = _require_mapping(response, "content", "begin_negotiation")
         requested = _require_str_list(content, "user_info_request", "begin_negotiation")
         content["user_info_request"] = _normalize_user_info_fields(requested)
+        response["content"] = _normalize_negotiation_content_feedback(content)
         return cast(NegotiationResponse, response)
 
     def contract(self, negotiation_id: str) -> ContractResponse:

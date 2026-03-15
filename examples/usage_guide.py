@@ -26,7 +26,6 @@ import os
 import sys
 import uuid
 import time
-from typing import Literal
 
 from brokersystem import (
     Agent,
@@ -39,9 +38,13 @@ from brokersystem import (
     File,
     Job,
     JsonDict,
+    NegotiationDecision,
     Number,
     Table,
     UserInfoField,
+    need_revision_response,
+    ng_response,
+    ok_response,
 )
 
 
@@ -81,7 +84,7 @@ def build_agent(enable_upload: bool) -> Agent:
             unit="µm",
         )
         agent.input.mode = Choice(
-            ["fast", "safe", "special"],
+            ["fast", "standard"],
         )
         agent.input.include_offset = Bool(
             False,
@@ -104,24 +107,34 @@ def build_agent(enable_upload: bool) -> Agent:
         return 100
 
     @agent.negotiation
-    def negotiation(
-        request: JsonDict, response: JsonDict
-    ) -> tuple[Literal["ok", "need_revision", "ng"], JsonDict]:
+    def negotiation(request: JsonDict) -> NegotiationDecision:
         """Optional: if omitted, only schema validation runs."""
         mode = request["mode"]
         x_value = request["x"]
+        user_info = request["_user_info"]
+        email = user_info["email"]
+
+        if email == "evil_user@example.com":
+            return ng_response(message="This account is blocked from using this agent.")
 
         if mode == "fast" and x_value > 5:
-            response["error_msg"] = "Fast mode requires x <= 5."
-            return "need_revision", response
+            return need_revision_response(
+                message="Fast mode requires x <= 5.",
+                fields={
+                    "x": "Reduce x to 5 or less, or switch away from fast mode.",
+                    "mode": "Use fast mode only when x is small enough.",
+                },
+            )
 
-        if mode == "special":
-            user_info = request["_user_info"]
-            email = user_info["email"]
-            if email != "admin@example.com":
-                response["error_msg"] = "Special mode requires admin@example.com email."
-                return "ng", response
-        return "ok", response
+        if mode == "fast" and x_value == 5:
+            return ok_response(
+                message="Fast mode was accepted at its upper bound.",
+                fields={
+                    "x": "x = 5 is accepted, but values above that require another negotiation round."
+                },
+            )
+
+        return ok_response()
 
     @agent.job_func
     def job_func(job: Job) -> JsonDict:
@@ -174,7 +187,7 @@ def run_client(agent_id: str, step_by_step: bool) -> None:
     print("Client board:", board)
     print("Client board agent count:", len(agents))
 
-    request = {"x": 2, "mode": "safe", "include_offset": True}
+    request = {"x": 2, "mode": "standard", "include_offset": True}
     begin = broker.begin_negotiation(agent_id)
     begin_content = begin["content"]
     user_info_request = begin_content["user_info_request"]

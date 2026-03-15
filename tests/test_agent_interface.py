@@ -10,6 +10,9 @@ from brokersystem.agent import (
     Number,
     Table,
     UserInfoField,
+    need_revision_response,
+    ng_response,
+    ok_response,
 )
 
 
@@ -27,6 +30,10 @@ def test_validate_returns_need_revision_for_invalid_input() -> None:
     msg, template = interface.validate({"value": 999})
     assert msg == "need_revision"
     assert "value" not in template or template["value"] != 999
+    assert interface.last_feedback is not None
+    assert interface.last_feedback["fields"]["value"] == (
+        "The provided value could not be accepted."
+    )
 
 
 def test_validate_returns_need_revision_for_missing_input() -> None:
@@ -35,6 +42,33 @@ def test_validate_returns_need_revision_for_missing_input() -> None:
     msg, template = interface.validate({})
     assert msg == "need_revision"
     assert "value" not in template
+    assert interface.last_feedback is not None
+    assert interface.last_feedback["fields"]["value"] == "This parameter is required."
+
+
+def test_need_revision_response_adds_global_and_field_messages() -> None:
+    msg, payload = need_revision_response(
+        message="Please review the highlighted fields.",
+        fields={"value": "Enter a smaller value."},
+    )
+
+    assert msg == "need_revision"
+    assert payload["message"] == "Please review the highlighted fields."
+    assert payload["fields"]["value"] == "Enter a smaller value."
+
+
+def test_ok_and_ng_response_support_feedback() -> None:
+    ok_msg, ok_payload = ok_response(message="Accepted near the upper bound.")
+    ng_msg, ng_payload = ng_response(
+        fields={"mode": "This account is not allowed to use fast mode."}
+    )
+
+    assert ok_msg == "ok"
+    assert ok_payload["message"] == "Accepted near the upper bound."
+    assert ng_msg == "ng"
+    assert (
+        ng_payload["fields"]["mode"] == "This account is not allowed to use fast mode."
+    )
 
 
 def test_validate_returns_ok_for_valid_bool_input() -> None:

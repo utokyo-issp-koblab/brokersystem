@@ -33,6 +33,32 @@ def test_broker_begin_negotiation() -> None:
 
 
 @responses.activate
+def test_broker_begin_negotiation_normalizes_legacy_revision_feedback() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/negotiation/begin",
+        json={
+            "negotiation_id": "n1",
+            "state": "ok",
+            "content": {
+                "user_info_request": [],
+                "revision": {
+                    "message": "Legacy revision message.",
+                    "fields": {"x": "Set x to 5 or less."},
+                },
+            },
+        },
+        status=200,
+    )
+
+    response = broker.begin_negotiation("agent-1")
+
+    assert response["content"]["feedback"]["message"] == "Legacy revision message."
+    assert response["content"]["feedback"]["fields"]["x"] == "Set x to 5 or less."
+
+
+@responses.activate
 def test_broker_negotiate_sends_user_info_consent() -> None:
     broker = Broker(broker_url=BROKER_URL, auth="token")
     responses.add(
@@ -52,6 +78,36 @@ def test_broker_negotiate_sends_user_info_consent() -> None:
     assert body is not None
     payload = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
     assert payload["request"]["_user_info_consent"] == ["email"]
+
+
+@responses.activate
+def test_broker_negotiate_returns_feedback_for_ok_state() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/negotiate",
+        json={
+            "negotiation_id": "n1",
+            "state": "ok",
+            "content": {
+                "user_info_request": [],
+                "feedback": {
+                    "message": "Accepted with comments.",
+                    "fields": {"x": "x is accepted near the upper bound."},
+                },
+            },
+        },
+        status=200,
+    )
+
+    response = broker.negotiate("agent-1", {"x": 5})
+
+    assert response["state"] == "ok"
+    assert response["content"]["feedback"]["message"] == "Accepted with comments."
+    assert (
+        response["content"]["feedback"]["fields"]["x"]
+        == "x is accepted near the upper bound."
+    )
 
 
 @responses.activate
@@ -154,6 +210,30 @@ def test_broker_ask_raises_on_non_ok_state() -> None:
 
     with pytest.raises(BrokerResponseError):
         broker.ask("agent-1", {"x": 1})
+
+
+@responses.activate
+def test_broker_ask_uses_feedback_message_when_error_msg_is_missing() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/negotiate",
+        json={
+            "negotiation_id": "n1",
+            "state": "need_revision",
+            "content": {
+                "user_info_request": [],
+                "feedback": {
+                    "message": "Please reduce x before retrying.",
+                    "fields": {"x": "Set x to 5 or less."},
+                },
+            },
+        },
+        status=200,
+    )
+
+    with pytest.raises(BrokerResponseError, match="Please reduce x before retrying."):
+        broker.ask("agent-1", {"x": 10})
 
 
 @responses.activate
