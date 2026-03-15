@@ -1656,6 +1656,20 @@ class Job(Mapping[str, Any]):
         and the UI/client APIs read the latest stored snapshot. Fields omitted
         from a report keep their previous values. The broker merges partial
         result payloads into the stored snapshot.
+
+        Args:
+            msg: Optional status text to show in the broker UI.
+            progress: Optional fractional progress in the range 0..1.
+            result: Optional partial result payload. If this includes `File` or
+                image outputs, the SDK uploads the corresponding binary data
+                before sending the report.
+
+        Raises:
+            AgentConnectionError: If the broker cannot be reached after retries.
+            AgentHTTPError: If the broker responds with a non-200 HTTP status.
+            AgentResponseError: If the broker responds with malformed JSON.
+            AgentUploadError: If file/image data in `result` cannot be uploaded,
+                including broker-side storage-capacity rejections.
         """
         payload: JsonDict = dict(
             negotiation_id=self._negotiation_id, status=self._status
@@ -1700,11 +1714,23 @@ class Job(Mapping[str, Any]):
         self._agent.post("report", payload)
 
     def msg(self, msg: str) -> None:
-        """Send a message-only update."""
+        """Send a message-only update.
+
+        Raises:
+            AgentConnectionError: If the broker cannot be reached after retries.
+            AgentHTTPError: If the broker responds with a non-200 HTTP status.
+            AgentResponseError: If the broker responds with malformed JSON.
+        """
         self.report(msg=msg)
 
     def progress(self, progress: float, msg: str | None = None) -> None:
-        """Send a progress update (0..1)."""
+        """Send a progress update (0..1).
+
+        Raises:
+            AgentConnectionError: If the broker cannot be reached after retries.
+            AgentHTTPError: If the broker responds with a non-200 HTTP status.
+            AgentResponseError: If the broker responds with malformed JSON.
+        """
         self.report(progress=progress, msg=msg)
 
     def periodic_report(
@@ -1714,7 +1740,13 @@ class Job(Mapping[str, Any]):
         callback_func: Callable[..., str] | None = None,
         **kwargs: Any,
     ) -> None:
-        """Send periodic progress updates until job completion."""
+        """Send periodic progress updates until job completion.
+
+        Raises:
+            AgentConnectionError: If the broker cannot be reached after retries.
+            AgentHTTPError: If the broker responds with a non-200 HTTP status.
+            AgentResponseError: If the broker responds with malformed JSON.
+        """
         if "start_time" not in kwargs:
             kwargs["start_time"] = time.perf_counter()
         if self._status not in ["done", "error"]:
