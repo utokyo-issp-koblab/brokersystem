@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
 from os import PathLike
@@ -44,6 +45,7 @@ ResultValue = str | int | float | bool | None | list[Any] | dict[str, Any]
 NegotiationStatus = Literal["ok", "need_revision", "ng"]
 NegotiationFeedbackKind = Literal["agent", "validation"]
 JobErrorDetailLevel = Literal["summary", "traceback"]
+ContractRunPhase = Literal["starting", "running", "done", "error"]
 NegotiationState = Literal[
     "begin",
     "request",
@@ -617,6 +619,42 @@ def _is_local_file_value(value: object) -> bool:
 
 def _backoff_seconds(attempt: int, base: float, cap: float) -> float:
     return min(cap, base * (2**attempt))
+
+
+def _retryable_http_status(status_code: int) -> bool:
+    return status_code in {408, 425, 429, 500, 502, 503, 504}
+
+
+def _retry_deadline_remaining(started_at: float, deadline_seconds: float) -> float:
+    return deadline_seconds - (time.perf_counter() - started_at)
+
+
+def _sleep_for_retry(
+    started_at: float,
+    deadline_seconds: float,
+    attempt: int,
+    base: float,
+    cap: float,
+) -> bool:
+    remaining = _retry_deadline_remaining(started_at, deadline_seconds)
+    if remaining <= 0:
+        return False
+    time.sleep(min(remaining, _backoff_seconds(attempt, base, cap)))
+    return True
+
+
+def _request_timeout_tuple(
+    started_at: float,
+    deadline_seconds: float,
+    *,
+    connect_timeout: float,
+    read_timeout_cap: float,
+) -> tuple[float, float]:
+    remaining = max(1.0, _retry_deadline_remaining(started_at, deadline_seconds))
+    return (
+        min(connect_timeout, remaining),
+        min(read_timeout_cap, remaining),
+    )
 
 
 def _normalize_user_info_fields(
@@ -1814,14 +1852,29 @@ class Job(Mapping[str, Any]):
         self._status = status
 
 
+@dataclass
+class _ContractRunState:
+    negotiation_id: str
+    job: Job
+    thread: threading.Thread
+    started_at: float
+    phase: ContractRunPhase = "starting"
+    finished: bool = False
+    cleanup_reported: bool = False
+
+
 class Agent:
     """Agent runtime that connects to broker and handles negotiation/contract flow."""
 
     RESTART_INTERVAL_CRITERIA = 30
     HEARTBEAT_INTERVAL = 2
-    REQUEST_RETRY_LIMIT = 3
+    REQUEST_RETRY_DEADLINE = 180.0
     REQUEST_RETRY_BASE = 0.5
     REQUEST_RETRY_MAX = 5.0
+    REQUEST_CONNECT_TIMEOUT = 10.0
+    REQUEST_READ_TIMEOUT = 30.0
+    UPLOAD_READ_TIMEOUT = 120.0
+    SUPERVISOR_INTERVAL = 2.0
     POLLING_BACKOFF_MAX = 10
     _automatic_built_agents: dict[str, "Agent"] = {}
 
@@ -1835,6 +1888,9 @@ class Agent:
         self.auth: str = ""
         self.polling_interval: int = 0
         self.last_heartbeat: float = 0.0
+        self._contract_runs: dict[str, _ContractRunState] = {}
+        self._contract_runs_lock = threading.Lock()
+        self._supervisor_thread: threading.Thread | None = None
 
     def _increase_polling_interval(self) -> None:
         if self.polling_interval <= 0:
@@ -1858,6 +1914,7 @@ class Agent:
         if self.register_config():
             self.running = True
             threading.Thread(target=self.connect, daemon=True).start()
+            self._ensure_supervisor_thread()
             # threading.Thread(target=self.heartbeat).start()
             if not _automatic:
                 try:
@@ -1907,6 +1964,16 @@ class Agent:
     def goodbye(self) -> None:
         """Stop agent loops and allow threads to exit."""
         self.running = False
+
+    def _ensure_supervisor_thread(self) -> None:
+        if self._supervisor_thread is not None and self._supervisor_thread.is_alive():
+            return
+        self._supervisor_thread = threading.Thread(
+            target=self._supervise_contract_runs,
+            daemon=True,
+            name=f"{self.interface.name}-contract-supervisor",
+        )
+        self._supervisor_thread.start()
 
     def register_config(self, *, raise_on_fail: bool = True) -> bool:
         """Register agent config and obtain an access token."""
@@ -1984,6 +2051,77 @@ class Agent:
             else:
                 restart_timer = None
             time.sleep(self.HEARTBEAT_INTERVAL)
+
+    def _supervise_contract_runs(self) -> None:
+        """Detect worker threads that died before reaching a terminal state."""
+        while self.running:
+            stale_runs: list[_ContractRunState] = []
+            finished_ids: list[str] = []
+            with self._contract_runs_lock:
+                for negotiation_id, state in self._contract_runs.items():
+                    if state.thread.is_alive():
+                        continue
+                    if state.finished or state.cleanup_reported:
+                        finished_ids.append(negotiation_id)
+                    else:
+                        state.cleanup_reported = True
+                        stale_runs.append(state)
+                        finished_ids.append(negotiation_id)
+                for negotiation_id in finished_ids:
+                    self._contract_runs.pop(negotiation_id, None)
+
+            for state in stale_runs:
+                self._handle_unexpected_contract_death(state)
+
+            time.sleep(self.SUPERVISOR_INTERVAL)
+
+    def _handle_unexpected_contract_death(self, state: _ContractRunState) -> None:
+        message = (
+            "Job worker thread terminated unexpectedly before reaching a "
+            f"terminal status (phase={state.phase!r})."
+        )
+        logger.error("%s negotiation_id=%s", message, state.negotiation_id)
+        state.job._set_status("error")
+        try:
+            state.job._report_internal(
+                msg=message,
+                progress=-1,
+                result={
+                    "error_msg": message,
+                    "error_type": "WorkerThreadUnexpectedTermination",
+                    "negotiation_id": state.negotiation_id,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to report unexpected worker termination; negotiation_id=%s",
+                state.negotiation_id,
+            )
+
+    def _register_contract_run(
+        self, negotiation_id: str, job: Job, thread: threading.Thread
+    ) -> None:
+        with self._contract_runs_lock:
+            self._contract_runs[negotiation_id] = _ContractRunState(
+                negotiation_id=negotiation_id,
+                job=job,
+                thread=thread,
+                started_at=time.perf_counter(),
+            )
+
+    def _mark_contract_phase(
+        self, negotiation_id: str, phase: ContractRunPhase
+    ) -> None:
+        with self._contract_runs_lock:
+            state = self._contract_runs.get(negotiation_id)
+            if state is not None:
+                state.phase = phase
+
+    def _finish_contract_run(self, negotiation_id: str) -> None:
+        with self._contract_runs_lock:
+            state = self._contract_runs.get(negotiation_id)
+            if state is not None:
+                state.finished = True
 
     def connect(self) -> None:
         """Poll the agent message box and dispatch handlers."""
@@ -2079,10 +2217,21 @@ class Agent:
 
     def process_contract(self, msg: Mapping[str, Any]) -> None:
         """Run the job function and report progress/results."""
-        st = time.perf_counter()
         negotiation_id = msg["negotiation_id"]
         request = msg["request"]
         job = Job(self, negotiation_id, request)
+        worker = threading.Thread(
+            target=self._run_contract_job,
+            args=(msg, job),
+            daemon=True,
+            name=f"contract-{negotiation_id[:8]}",
+        )
+        self._register_contract_run(negotiation_id, job, worker)
+        worker.start()
+
+    def _run_contract_job(self, msg: Mapping[str, Any], job: Job) -> None:
+        st = time.perf_counter()
+        negotiation_id = cast(str, msg["negotiation_id"])
         try:
             self.post(
                 "contract/accept",
@@ -2090,6 +2239,7 @@ class Agent:
                 allow_empty=True,
             )
             job._set_status("running")
+            self._mark_contract_phase(negotiation_id, "running")
             job.msg(f"{self.interface.name} starts running...")
 
             result = self.interface.func_dict["job_func"](job)
@@ -2097,13 +2247,15 @@ class Agent:
             if result is None:
                 result = {}
             job._set_status("done")
+            self._mark_contract_phase(negotiation_id, "done")
             try:
                 job.report(msg="Job done.", progress=1, result=result)
             except Exception:
                 logger.exception("Failed to report job completion")
-        except Exception as exc:
+        except BaseException as exc:
             logger.exception(f"Error occured during the job execution; {msg=}")
             job._set_status("error")
+            self._mark_contract_phase(negotiation_id, "error")
             try:
                 error_summary = _job_error_summary(exc)
                 error_result = _job_error_result(
@@ -2116,7 +2268,32 @@ class Agent:
                 )
             except Exception:
                 logger.exception("Failed to report job error status")
-        logger.debug(f"{negotiation_id} took {time.perf_counter()-st:.3f} s.")
+        finally:
+            if job._status not in ["done", "error"]:
+                message = (
+                    "Job worker exited without reporting a terminal status; "
+                    f"status={job._status!r}"
+                )
+                logger.error("%s negotiation_id=%s", message, negotiation_id)
+                job._set_status("error")
+                self._mark_contract_phase(negotiation_id, "error")
+                try:
+                    job._report_internal(
+                        msg=message,
+                        progress=-1,
+                        result={
+                            "error_msg": message,
+                            "error_type": "WorkerExitedWithoutTerminalStatus",
+                            "negotiation_id": negotiation_id,
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to report non-terminal worker exit; negotiation_id=%s",
+                        negotiation_id,
+                    )
+            self._finish_contract_run(negotiation_id)
+            logger.debug(f"{negotiation_id} took {time.perf_counter()-st:.3f} s.")
 
     def header(self, basic_auth: bool = False, upload: bool = False) -> JsonDict:
         """Return request headers for JSON or multipart uploads."""
@@ -2142,35 +2319,48 @@ class Agent:
         allow_empty: bool = False,
     ) -> JsonDict:
         url = f"{self.broker_url}/api/v1/agent/{uri}"
-        attempt_limit = self.REQUEST_RETRY_LIMIT if retries is None else retries
-        for attempt in range(attempt_limit + 1):
+        retry_deadline = (
+            self.REQUEST_RETRY_DEADLINE if retries is None else max(float(retries), 0.0)
+        )
+        started_at = time.perf_counter()
+        attempt = 0
+        while True:
+            timeout = _request_timeout_tuple(
+                started_at,
+                retry_deadline,
+                connect_timeout=self.REQUEST_CONNECT_TIMEOUT,
+                read_timeout_cap=self.REQUEST_READ_TIMEOUT,
+            )
             try:
                 response = requests.request(
                     method,
                     url,
                     json=payload,
                     headers=self.header(basic_auth),
+                    timeout=timeout,
                 )
             except requests.exceptions.RequestException as exc:
                 logger.warning(
-                    "Connection error on %s request; %s (attempt %s/%s)",
+                    "Connection error on %s request; %s (attempt %s, deadline %.1fs)",
                     method,
                     uri,
                     attempt + 1,
-                    attempt_limit + 1,
+                    retry_deadline,
                 )
                 logger.debug("Connection error details: %s", exc)
-                if attempt < attempt_limit:
-                    time.sleep(
-                        _backoff_seconds(
-                            attempt, self.REQUEST_RETRY_BASE, self.REQUEST_RETRY_MAX
-                        )
-                    )
+                if _sleep_for_retry(
+                    started_at,
+                    retry_deadline,
+                    attempt,
+                    self.REQUEST_RETRY_BASE,
+                    self.REQUEST_RETRY_MAX,
+                ):
+                    attempt += 1
                     continue
                 logger.error(
-                    "Giving up %s request after %s attempts; %s",
+                    "Giving up %s request after %.1fs; %s",
                     method,
-                    attempt_limit + 1,
+                    retry_deadline,
                     uri,
                 )
                 raise AgentConnectionError(
@@ -2181,6 +2371,41 @@ class Agent:
                 if self.register_config(raise_on_fail=False):
                     continue
                 logger.error("Re-auth failed; aborting %s request; %s", method, uri)
+                raise AgentHTTPError(
+                    response.status_code, uri, _coerce_error_content(response.content)
+                )
+            if _retryable_http_status(response.status_code):
+                logger.warning(
+                    "Transient HTTP status on %s request; %s status=%s "
+                    "(attempt %s, deadline %.1fs)",
+                    method,
+                    uri,
+                    response.status_code,
+                    attempt + 1,
+                    retry_deadline,
+                )
+                logger.debug(
+                    "Retryable HTTP response content on %s %s: %r",
+                    method,
+                    uri,
+                    response.content,
+                )
+                if _sleep_for_retry(
+                    started_at,
+                    retry_deadline,
+                    attempt,
+                    self.REQUEST_RETRY_BASE,
+                    self.REQUEST_RETRY_MAX,
+                ):
+                    attempt += 1
+                    continue
+                logger.error(
+                    "Giving up %s request after retryable HTTP status %s and %.1fs; %s",
+                    method,
+                    response.status_code,
+                    retry_deadline,
+                    uri,
+                )
                 raise AgentHTTPError(
                     response.status_code, uri, _coerce_error_content(response.content)
                 )
@@ -2266,29 +2491,70 @@ class Agent:
         if content_type is None:
             content_type = "application/octet-stream"
         files = {"file": (file_name, binary_data, content_type)}
-        for attempt in range(self.REQUEST_RETRY_LIMIT + 1):
+        started_at = time.perf_counter()
+        attempt = 0
+        while True:
+            timeout = _request_timeout_tuple(
+                started_at,
+                self.REQUEST_RETRY_DEADLINE,
+                connect_timeout=self.REQUEST_CONNECT_TIMEOUT,
+                read_timeout_cap=self.UPLOAD_READ_TIMEOUT,
+            )
             try:
                 response = requests.post(
                     f"{self.broker_url}/api/v1/agent/upload",
                     headers=self.header(upload=True),
                     files=files,
+                    timeout=timeout,
                 )
             except requests.exceptions.RequestException as exc:
                 logger.warning(
-                    "Connection error during upload (attempt %s/%s)",
+                    "Connection error during upload (attempt %s, deadline %.1fs)",
                     attempt + 1,
-                    self.REQUEST_RETRY_LIMIT + 1,
+                    self.REQUEST_RETRY_DEADLINE,
                 )
                 logger.debug("Upload connection error details: %s", exc)
-                if attempt < self.REQUEST_RETRY_LIMIT:
-                    time.sleep(
-                        _backoff_seconds(
-                            attempt, self.REQUEST_RETRY_BASE, self.REQUEST_RETRY_MAX
-                        )
-                    )
+                if _sleep_for_retry(
+                    started_at,
+                    self.REQUEST_RETRY_DEADLINE,
+                    attempt,
+                    self.REQUEST_RETRY_BASE,
+                    self.REQUEST_RETRY_MAX,
+                ):
+                    attempt += 1
                     continue
-                logger.error("Giving up upload after retries")
+                logger.error(
+                    "Giving up upload after %.1fs", self.REQUEST_RETRY_DEADLINE
+                )
                 raise AgentConnectionError("Connection error during upload") from exc
+            if _retryable_http_status(response.status_code):
+                logger.warning(
+                    "Transient HTTP status during upload: status=%s "
+                    "(attempt %s, deadline %.1fs)",
+                    response.status_code,
+                    attempt + 1,
+                    self.REQUEST_RETRY_DEADLINE,
+                )
+                logger.debug("Retryable upload response content: %r", response.content)
+                if _sleep_for_retry(
+                    started_at,
+                    self.REQUEST_RETRY_DEADLINE,
+                    attempt,
+                    self.REQUEST_RETRY_BASE,
+                    self.REQUEST_RETRY_MAX,
+                ):
+                    attempt += 1
+                    continue
+                logger.error(
+                    "Giving up upload after retryable HTTP status %s and %.1fs",
+                    response.status_code,
+                    self.REQUEST_RETRY_DEADLINE,
+                )
+                raise AgentHTTPError(
+                    response.status_code,
+                    "upload",
+                    _coerce_error_content(response.content),
+                )
             if response.status_code != 200:
                 logger.error(
                     "Upload failed: status=%s; response=%s",
@@ -3164,24 +3430,69 @@ class Broker:
             BrokerConnectionError: If the broker server cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
         """
-        try:
-            response = requests.get(
-                f"{self.broker_url}/api/v1/client/{uri}", headers=self.header_auth
+        started_at = time.perf_counter()
+        attempt = 0
+        while True:
+            timeout = _request_timeout_tuple(
+                started_at,
+                Agent.REQUEST_RETRY_DEADLINE,
+                connect_timeout=Agent.REQUEST_CONNECT_TIMEOUT,
+                read_timeout_cap=Agent.UPLOAD_READ_TIMEOUT,
             )
-        except requests.exceptions.RequestException as exc:
-            logger.exception(f"Connection error on get request; {uri=}")
-            raise BrokerConnectionError(
-                f"Connection error on get request; {uri=}"
-            ) from exc
+            try:
+                response = requests.get(
+                    f"{self.broker_url}/api/v1/client/{uri}",
+                    headers=self.header_auth,
+                    timeout=timeout,
+                )
+            except requests.exceptions.RequestException as exc:
+                logger.warning(
+                    "Connection error on get request; %s (attempt %s, deadline %.1fs)",
+                    uri,
+                    attempt + 1,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                )
+                logger.debug("Broker get_file connection error details: %s", exc)
+                if _sleep_for_retry(
+                    started_at,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                    attempt,
+                    Agent.REQUEST_RETRY_BASE,
+                    Agent.REQUEST_RETRY_MAX,
+                ):
+                    attempt += 1
+                    continue
+                raise BrokerConnectionError(
+                    f"Connection error on get request; {uri=}"
+                ) from exc
 
-        if response.status_code != 200:
-            logger.exception(
-                f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
-            )
-            raise BrokerHTTPError(
-                response.status_code, uri, _coerce_error_content(response.content)
-            )
-        return response
+            if _retryable_http_status(response.status_code):
+                logger.warning(
+                    "Transient HTTP status on get request; %s status=%s "
+                    "(attempt %s, deadline %.1fs)",
+                    uri,
+                    response.status_code,
+                    attempt + 1,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                )
+                if _sleep_for_retry(
+                    started_at,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                    attempt,
+                    Agent.REQUEST_RETRY_BASE,
+                    Agent.REQUEST_RETRY_MAX,
+                ):
+                    attempt += 1
+                    continue
+
+            if response.status_code != 200:
+                logger.exception(
+                    f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
+                )
+                raise BrokerHTTPError(
+                    response.status_code, uri, _coerce_error_content(response.content)
+                )
+            return response
 
     def upload(
         self,
@@ -3219,21 +3530,79 @@ class Broker:
         self, method: str, uri: str, payload: JsonDict | None = None
     ) -> JsonDict:
         url = f"{self.broker_url}/api/v1/client/{uri}"
-        try:
-            response = requests.request(method, url, json=payload, headers=self.header)
-        except requests.exceptions.RequestException as exc:
-            logger.exception(f"Connection error on {method} request; {uri=}")
-            raise BrokerConnectionError(
-                f"Connection error on {method} request; {uri=}"
-            ) from exc
+        started_at = time.perf_counter()
+        attempt = 0
+        while True:
+            timeout = _request_timeout_tuple(
+                started_at,
+                Agent.REQUEST_RETRY_DEADLINE,
+                connect_timeout=Agent.REQUEST_CONNECT_TIMEOUT,
+                read_timeout_cap=Agent.REQUEST_READ_TIMEOUT,
+            )
+            try:
+                response = requests.request(
+                    method,
+                    url,
+                    json=payload,
+                    headers=self.header,
+                    timeout=timeout,
+                )
+            except requests.exceptions.RequestException as exc:
+                logger.warning(
+                    "Connection error on %s request; %s (attempt %s, deadline %.1fs)",
+                    method,
+                    uri,
+                    attempt + 1,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                )
+                logger.debug("Broker request connection error details: %s", exc)
+                if _sleep_for_retry(
+                    started_at,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                    attempt,
+                    Agent.REQUEST_RETRY_BASE,
+                    Agent.REQUEST_RETRY_MAX,
+                ):
+                    attempt += 1
+                    continue
+                raise BrokerConnectionError(
+                    f"Connection error on {method} request; {uri=}"
+                ) from exc
 
-        if response.status_code != 200:
-            logger.exception(
-                f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
-            )
-            raise BrokerHTTPError(
-                response.status_code, uri, _coerce_error_content(response.content)
-            )
+            if _retryable_http_status(response.status_code):
+                logger.warning(
+                    "Transient HTTP status on %s request; %s status=%s "
+                    "(attempt %s, deadline %.1fs)",
+                    method,
+                    uri,
+                    response.status_code,
+                    attempt + 1,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                )
+                logger.debug(
+                    "Retryable broker response content on %s %s: %r",
+                    method,
+                    uri,
+                    response.content,
+                )
+                if _sleep_for_retry(
+                    started_at,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                    attempt,
+                    Agent.REQUEST_RETRY_BASE,
+                    Agent.REQUEST_RETRY_MAX,
+                ):
+                    attempt += 1
+                    continue
+
+            if response.status_code != 200:
+                logger.exception(
+                    f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
+                )
+                raise BrokerHTTPError(
+                    response.status_code, uri, _coerce_error_content(response.content)
+                )
+            break
 
         try:
             obj = response.json()
@@ -3310,28 +3679,76 @@ class Broker:
         files = {"file": (file_name, binary_data, content_type)}
         uri = "upload"
 
-        try:
-            response = requests.post(
-                f"{self.broker_url}/api/v1/client/{uri}",
-                headers=self.header_auth,
-                files=files,
+        started_at = time.perf_counter()
+        attempt = 0
+        while True:
+            timeout = _request_timeout_tuple(
+                started_at,
+                Agent.REQUEST_RETRY_DEADLINE,
+                connect_timeout=Agent.REQUEST_CONNECT_TIMEOUT,
+                read_timeout_cap=Agent.UPLOAD_READ_TIMEOUT,
             )
-        except requests.exceptions.RequestException as exc:
-            logger.exception("Connection error on upload request; %s", uri)
-            raise BrokerConnectionError(
-                f"Connection error on upload request; {uri=}"
-            ) from exc
+            try:
+                response = requests.post(
+                    f"{self.broker_url}/api/v1/client/{uri}",
+                    headers=self.header_auth,
+                    files=files,
+                    timeout=timeout,
+                )
+            except requests.exceptions.RequestException as exc:
+                logger.warning(
+                    "Connection error on upload request; %s (attempt %s, deadline %.1fs)",
+                    uri,
+                    attempt + 1,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                )
+                logger.debug("Broker upload connection error details: %s", exc)
+                if _sleep_for_retry(
+                    started_at,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                    attempt,
+                    Agent.REQUEST_RETRY_BASE,
+                    Agent.REQUEST_RETRY_MAX,
+                ):
+                    attempt += 1
+                    continue
+                raise BrokerConnectionError(
+                    f"Connection error on upload request; {uri=}"
+                ) from exc
 
-        if response.status_code != 200:
-            logger.exception(
-                "Not 200: response.status_code=%s; uri=%s, response.content=%r",
-                response.status_code,
-                uri,
-                response.content,
-            )
-            raise BrokerHTTPError(
-                response.status_code, uri, _coerce_error_content(response.content)
-            )
+            if _retryable_http_status(response.status_code):
+                logger.warning(
+                    "Transient HTTP status on upload request; %s status=%s "
+                    "(attempt %s, deadline %.1fs)",
+                    uri,
+                    response.status_code,
+                    attempt + 1,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                )
+                logger.debug(
+                    "Retryable broker upload response content: %r", response.content
+                )
+                if _sleep_for_retry(
+                    started_at,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                    attempt,
+                    Agent.REQUEST_RETRY_BASE,
+                    Agent.REQUEST_RETRY_MAX,
+                ):
+                    attempt += 1
+                    continue
+
+            if response.status_code != 200:
+                logger.exception(
+                    "Not 200: response.status_code=%s; uri=%s, response.content=%r",
+                    response.status_code,
+                    uri,
+                    response.content,
+                )
+                raise BrokerHTTPError(
+                    response.status_code, uri, _coerce_error_content(response.content)
+                )
+            break
 
         try:
             payload = response.json()
@@ -3390,26 +3807,74 @@ class BrokerAdmin:
     def _request_json(
         self, method: str, uri: str, payload: JsonDict | None = None
     ) -> JsonDict:
-        try:
-            response = requests.request(
-                method,
-                f"{self.broker_url}/api/v1/broker/{uri}",
-                json=payload,
-                headers=self.header,
+        started_at = time.perf_counter()
+        attempt = 0
+        while True:
+            timeout = _request_timeout_tuple(
+                started_at,
+                Agent.REQUEST_RETRY_DEADLINE,
+                connect_timeout=Agent.REQUEST_CONNECT_TIMEOUT,
+                read_timeout_cap=Agent.REQUEST_READ_TIMEOUT,
             )
-        except requests.exceptions.RequestException as exc:
-            logger.exception(f"Connection error on {method} request; {uri=}")
-            raise BrokerConnectionError(
-                f"Connection error on {method} request; {uri=}"
-            ) from exc
+            try:
+                response = requests.request(
+                    method,
+                    f"{self.broker_url}/api/v1/broker/{uri}",
+                    json=payload,
+                    headers=self.header,
+                    timeout=timeout,
+                )
+            except requests.exceptions.RequestException as exc:
+                logger.warning(
+                    "Connection error on broker %s request; %s "
+                    "(attempt %s, deadline %.1fs)",
+                    method,
+                    uri,
+                    attempt + 1,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                )
+                logger.debug("BrokerAdmin request connection error details: %s", exc)
+                if _sleep_for_retry(
+                    started_at,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                    attempt,
+                    Agent.REQUEST_RETRY_BASE,
+                    Agent.REQUEST_RETRY_MAX,
+                ):
+                    attempt += 1
+                    continue
+                raise BrokerConnectionError(
+                    f"Connection error on {method} request; {uri=}"
+                ) from exc
 
-        if response.status_code != 200:
-            logger.exception(
-                f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
-            )
-            raise BrokerHTTPError(
-                response.status_code, uri, _coerce_error_content(response.content)
-            )
+            if _retryable_http_status(response.status_code):
+                logger.warning(
+                    "Transient HTTP status on broker %s request; %s status=%s "
+                    "(attempt %s, deadline %.1fs)",
+                    method,
+                    uri,
+                    response.status_code,
+                    attempt + 1,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                )
+                if _sleep_for_retry(
+                    started_at,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                    attempt,
+                    Agent.REQUEST_RETRY_BASE,
+                    Agent.REQUEST_RETRY_MAX,
+                ):
+                    attempt += 1
+                    continue
+
+            if response.status_code != 200:
+                logger.exception(
+                    f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
+                )
+                raise BrokerHTTPError(
+                    response.status_code, uri, _coerce_error_content(response.content)
+                )
+            break
 
         try:
             obj = response.json()
@@ -3424,25 +3889,73 @@ class BrokerAdmin:
         return obj
 
     def _request_raw(self, uri: str) -> requests.Response:
-        try:
-            response = requests.get(
-                f"{self.broker_url}/api/v1/broker/{uri}", headers=self.header_auth
+        started_at = time.perf_counter()
+        attempt = 0
+        while True:
+            timeout = _request_timeout_tuple(
+                started_at,
+                Agent.REQUEST_RETRY_DEADLINE,
+                connect_timeout=Agent.REQUEST_CONNECT_TIMEOUT,
+                read_timeout_cap=Agent.UPLOAD_READ_TIMEOUT,
             )
-        except requests.exceptions.RequestException as exc:
-            logger.exception(f"Connection error on get request; {uri=}")
-            raise BrokerConnectionError(
-                f"Connection error on get request; {uri=}"
-            ) from exc
+            try:
+                response = requests.get(
+                    f"{self.broker_url}/api/v1/broker/{uri}",
+                    headers=self.header_auth,
+                    timeout=timeout,
+                )
+            except requests.exceptions.RequestException as exc:
+                logger.warning(
+                    "Connection error on broker get request; %s "
+                    "(attempt %s, deadline %.1fs)",
+                    uri,
+                    attempt + 1,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                )
+                logger.debug(
+                    "BrokerAdmin raw request connection error details: %s", exc
+                )
+                if _sleep_for_retry(
+                    started_at,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                    attempt,
+                    Agent.REQUEST_RETRY_BASE,
+                    Agent.REQUEST_RETRY_MAX,
+                ):
+                    attempt += 1
+                    continue
+                raise BrokerConnectionError(
+                    f"Connection error on get request; {uri=}"
+                ) from exc
 
-        if response.status_code != 200:
-            logger.exception(
-                f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
-            )
-            raise BrokerHTTPError(
-                response.status_code, uri, _coerce_error_content(response.content)
-            )
+            if _retryable_http_status(response.status_code):
+                logger.warning(
+                    "Transient HTTP status on broker get request; %s status=%s "
+                    "(attempt %s, deadline %.1fs)",
+                    uri,
+                    response.status_code,
+                    attempt + 1,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                )
+                if _sleep_for_retry(
+                    started_at,
+                    Agent.REQUEST_RETRY_DEADLINE,
+                    attempt,
+                    Agent.REQUEST_RETRY_BASE,
+                    Agent.REQUEST_RETRY_MAX,
+                ):
+                    attempt += 1
+                    continue
 
-        return response
+            if response.status_code != 200:
+                logger.exception(
+                    f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
+                )
+                raise BrokerHTTPError(
+                    response.status_code, uri, _coerce_error_content(response.content)
+                )
+
+            return response
 
     # Board + results
     def board(self) -> BoardResponse:
