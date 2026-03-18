@@ -24,7 +24,7 @@ testpaths = ["tests"]
 
 [tool.pyright]
 pythonVersion = "3.11"
-typeCheckingMode = "basic"
+typeCheckingMode = "standard"
 include = ["brokersystem", "tests"]
 
 
