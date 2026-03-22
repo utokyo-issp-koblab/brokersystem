@@ -8,6 +8,7 @@ from brokersystem.agent import (
     AgentHTTPError,
     AgentResponseError,
     AgentUploadError,
+    Job,
 )
 
 BROKER_URL = "https://example.test"
@@ -17,6 +18,9 @@ def build_agent() -> Agent:
     agent = Agent(BROKER_URL)
     agent.auth = "agent-id:secret"
     agent.access_token = "agent-token"
+    agent.REQUEST_RETRY_DEADLINE = 0.0
+    agent.REQUEST_RETRY_BASE = 0.0
+    agent.REQUEST_RETRY_MAX = 0.0
     return agent
 
 
@@ -98,6 +102,98 @@ def test_agent_upload_raises_on_broker_rejection() -> None:
 
 
 @responses.activate
+def test_agent_upload_re_registers_after_401() -> None:
+    agent = build_agent()
+
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/agent/upload",
+        status=401,
+        body="Invalid token",
+    )
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/agent/config",
+        status=200,
+        json={"status": "ok", "token": "fresh-token"},
+    )
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/agent/upload",
+        status=200,
+        json={"file_id": "file-1"},
+    )
+
+    response = agent.upload("txt", b"hello")
+
+    assert response["file_id"] == "file-1"
+    assert agent.access_token == "fresh-token"
+
+
+@responses.activate
+def test_agent_acknowledges_claimed_message_after_successful_processing() -> None:
+    agent = build_agent()
+    seen: list[dict[str, object]] = []
+    agent.process_negotiation_request = lambda body: seen.append(body)  # type: ignore[method-assign]
+
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/agent/msgbox/ack",
+        status=200,
+        json={},
+    )
+
+    agent._process_and_ack_message(
+        {
+            "msg_type": "negotiation_request",
+            "body": {"negotiation_id": "neg-1"},
+            "_message_box_id": "msg-1",
+            "_message_box_claim_token": "claim-1",
+        }
+    )
+
+    assert seen == [{"negotiation_id": "neg-1"}]
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_agent_ack_msgbox_returns_cleanly_after_success() -> None:
+    agent = build_agent()
+
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/agent/msgbox/ack",
+        status=200,
+        json={},
+    )
+
+    agent.ack_msgbox("msg-1", "claim-1")
+
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_agent_leaves_claimed_message_unacked_after_processing_failure() -> None:
+    agent = build_agent()
+
+    def explode(_body):
+        raise RuntimeError("boom")
+
+    agent.process_negotiation_request = explode  # type: ignore[method-assign]
+
+    agent._process_and_ack_message(
+        {
+            "msg_type": "negotiation_request",
+            "body": {"negotiation_id": "neg-2"},
+            "_message_box_id": "msg-2",
+            "_message_box_claim_token": "claim-2",
+        }
+    )
+
+    assert len(responses.calls) == 0
+
+
+@responses.activate
 def test_process_contract_reports_traceback_details_by_default() -> None:
     agent = build_agent()
 
@@ -125,7 +221,8 @@ def test_process_contract_reports_traceback_details_by_default() -> None:
         json={"status": "ok"},
     )
 
-    agent.process_contract({"negotiation_id": "neg-1", "request": {}})
+    job = Job(agent, "neg-1", {})
+    agent._run_contract_job({"negotiation_id": "neg-1", "request": {}}, job)
 
     report_call = responses.calls[-1]
     body = report_call.request.body
@@ -168,7 +265,8 @@ def test_process_contract_can_report_summary_without_traceback() -> None:
         json={"status": "ok"},
     )
 
-    agent.process_contract({"negotiation_id": "neg-2", "request": {}})
+    job = Job(agent, "neg-2", {})
+    agent._run_contract_job({"negotiation_id": "neg-2", "request": {}}, job)
 
     report_call = responses.calls[-1]
     body = report_call.request.body

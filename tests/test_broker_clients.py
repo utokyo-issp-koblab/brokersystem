@@ -5,6 +5,7 @@ import pytest
 import responses
 
 from brokersystem.agent import (
+    Agent,
     Broker,
     BrokerAdmin,
     BrokerHTTPError,
@@ -14,6 +15,10 @@ from brokersystem.agent import (
 )
 
 BROKER_URL = "https://example.test"
+
+Agent.REQUEST_RETRY_DEADLINE = 0.0
+Agent.REQUEST_RETRY_BASE = 0.0
+Agent.REQUEST_RETRY_MAX = 0.0
 
 
 def _feedback(

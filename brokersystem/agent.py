@@ -1673,7 +1673,7 @@ class DummyJob(Mapping[str, Any]):
     def __getitem__(self, key: str) -> Any:
         return self._request[key]
 
-    def __contains__(self, key: str) -> bool:
+    def __contains__(self, key: object) -> bool:
         return key in self._request
 
     def __iter__(self):
@@ -1831,7 +1831,7 @@ class Job(Mapping[str, Any]):
     def __getitem__(self, key: str) -> Any:
         return self._agent.interface.cast(key, self._request[key])
 
-    def __contains__(self, key: str) -> bool:
+    def __contains__(self, key: object) -> bool:
         return key in self._request
 
     @property
@@ -1890,6 +1890,9 @@ class Agent:
         self.last_heartbeat: float = 0.0
         self._contract_runs: dict[str, _ContractRunState] = {}
         self._contract_runs_lock = threading.Lock()
+        self._connect_thread: threading.Thread | None = None
+        self._connect_thread_lock = threading.Lock()
+        self._heartbeat_thread: threading.Thread | None = None
         self._supervisor_thread: threading.Thread | None = None
 
     def _increase_polling_interval(self) -> None:
@@ -1913,9 +1916,9 @@ class Agent:
         self.last_heartbeat = time.perf_counter()
         if self.register_config():
             self.running = True
-            threading.Thread(target=self.connect, daemon=True).start()
+            self._ensure_connect_thread()
+            self._ensure_heartbeat_thread()
             self._ensure_supervisor_thread()
-            # threading.Thread(target=self.heartbeat).start()
             if not _automatic:
                 try:
                     if sys.stdin.isatty():
@@ -1964,6 +1967,27 @@ class Agent:
     def goodbye(self) -> None:
         """Stop agent loops and allow threads to exit."""
         self.running = False
+
+    def _ensure_connect_thread(self) -> None:
+        with self._connect_thread_lock:
+            if self._connect_thread is not None and self._connect_thread.is_alive():
+                return
+            self._connect_thread = threading.Thread(
+                target=self.connect,
+                daemon=True,
+                name=f"{self.interface.name}-msgbox-poller",
+            )
+            self._connect_thread.start()
+
+    def _ensure_heartbeat_thread(self) -> None:
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_thread = threading.Thread(
+            target=self.heartbeat,
+            daemon=True,
+            name=f"{self.interface.name}-heartbeat",
+        )
+        self._heartbeat_thread.start()
 
     def _ensure_supervisor_thread(self) -> None:
         if self._supervisor_thread is not None and self._supervisor_thread.is_alive():
@@ -2032,24 +2056,19 @@ class Agent:
         return False
 
     def heartbeat(self) -> None:
-        """Monitor heartbeat and trigger reconnection if needed."""
-        restart_timer = None
+        """Keep the message polling loop alive across deploys and restarts."""
         while self.running:
             if (
-                time.perf_counter() - self.last_heartbeat
-                > self.RESTART_INTERVAL_CRITERIA
+                self._connect_thread is None
+                or not self._connect_thread.is_alive()
+                or (
+                    self.last_heartbeat > 0
+                    and time.perf_counter() - self.last_heartbeat
+                    > self.RESTART_INTERVAL_CRITERIA
+                )
             ):
-                if restart_timer is None:
-                    restart_timer = time.perf_counter()
-                elif (
-                    time.perf_counter() - restart_timer
-                    >= self.RESTART_INTERVAL_CRITERIA
-                ):
-                    restart_timer = None
-                    logger.info("Automatic reconnection...")
-                    threading.Thread(target=self.connect, daemon=True).start()
-            else:
-                restart_timer = None
+                logger.info("Automatic reconnection...")
+                self._ensure_connect_thread()
             time.sleep(self.HEARTBEAT_INTERVAL)
 
     def _supervise_contract_runs(self) -> None:
@@ -2132,7 +2151,9 @@ class Agent:
                 self._reset_polling_interval()
                 for message in messages:
                     threading.Thread(
-                        target=self.process_message, args=[message], daemon=True
+                        target=self._process_and_ack_message,
+                        args=[message],
+                        daemon=True,
                     ).start()
             except AgentError as exc:
                 logger.warning("Message polling failed: %s", exc)
@@ -2153,21 +2174,40 @@ class Agent:
             )
         return messages
 
-    def process_message(self, message: Mapping[str, Any]) -> None:
+    def _process_and_ack_message(self, message: Mapping[str, Any]) -> None:
+        processed = self.process_message(message)
+        if not processed:
+            return
+
+        msg_id = message.get("_message_box_id")
+        claim_token = message.get("_message_box_claim_token")
+        if not isinstance(msg_id, str) or not isinstance(claim_token, str):
+            return
+
+        try:
+            self.ack_msgbox(msg_id, claim_token)
+        except AgentError as exc:
+            logger.warning("Message ack failed for %s: %s", msg_id, exc)
+        except Exception:
+            logger.exception("Unexpected error during message ack; %s", msg_id)
+
+    def process_message(self, message: Mapping[str, Any]) -> bool:
         """Dispatch a broker message to the appropriate handler."""
         try:
             logger.debug(f"Message: {message}")
             if "msg_type" not in message or "body" not in message:
                 logger.exception(f"Wrong message format: {message}")
-                return
+                return False
             if message["msg_type"] == "negotiation_request":
                 self.process_negotiation_request(message["body"])
             if message["msg_type"] == "negotiation":
                 self.process_negotiation(message["body"])
             if message["msg_type"] == "contract":
                 self.process_contract(message["body"])
-        except:
+            return True
+        except Exception:
             logger.exception(f"Error occured during process_message; {message=}")
+            return False
 
     def process_negotiation_request(self, body: Mapping[str, Any]) -> None:
         """Respond with config to a negotiation request."""
@@ -2305,6 +2345,7 @@ class Agent:
             headers.update({"authorization": f"Basic {self.auth}"})
         elif self.access_token:
             headers.update({"authorization": f"Token {self.access_token}"})
+            headers.update({"x-brokersystem-msgbox-ack": "1"})
 
         return headers
 
@@ -2527,6 +2568,15 @@ class Agent:
                     "Giving up upload after %.1fs", self.REQUEST_RETRY_DEADLINE
                 )
                 raise AgentConnectionError("Connection error during upload") from exc
+            if response.status_code == 401:
+                if self.register_config(raise_on_fail=False):
+                    continue
+                logger.error("Re-auth failed; aborting upload")
+                raise AgentHTTPError(
+                    response.status_code,
+                    "upload",
+                    _coerce_error_content(response.content),
+                )
             if _retryable_http_status(response.status_code):
                 logger.warning(
                     "Transient HTTP status during upload: status=%s "
@@ -2583,7 +2633,14 @@ class Agent:
                 logger.error("Upload rejected by broker: code=%s payload=%r", code, obj)
                 raise AgentUploadError(error_msg, code=code, payload=obj)
             return obj
-        raise AgentConnectionError("Connection error during upload")
+
+    def ack_msgbox(self, msg_id: str, claim_token: str) -> None:
+        """Acknowledge successful processing of a claimed message."""
+        self.post(
+            "msgbox/ack",
+            {"messages": [{"msg_id": msg_id, "claim_token": claim_token}]},
+            allow_empty=True,
+        )
 
     def register_func(self, func_name: str, func: Callable[..., Any]) -> None:
         """Register a handler function on the agent."""
