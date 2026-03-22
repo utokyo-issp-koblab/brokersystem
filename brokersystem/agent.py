@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -618,6 +619,8 @@ def _is_local_file_value(value: object) -> bool:
 
 
 def _backoff_seconds(attempt: int, base: float, cap: float) -> float:
+    if base <= 0 or cap <= 0:
+        return 0.0
     return min(cap, base * (2**attempt))
 
 
@@ -639,7 +642,10 @@ def _sleep_for_retry(
     remaining = _retry_deadline_remaining(started_at, deadline_seconds)
     if remaining <= 0:
         return False
-    time.sleep(min(remaining, _backoff_seconds(attempt, base, cap)))
+    delay = min(remaining, _backoff_seconds(attempt, base, cap))
+    if delay <= 0:
+        return False
+    time.sleep(delay)
     return True
 
 
@@ -1861,6 +1867,7 @@ class _ContractRunState:
     phase: ContractRunPhase = "starting"
     finished: bool = False
     cleanup_reported: bool = False
+    last_lease_sent: float = 0.0
 
 
 class Agent:
@@ -1875,6 +1882,9 @@ class Agent:
     REQUEST_READ_TIMEOUT = 30.0
     UPLOAD_READ_TIMEOUT = 120.0
     SUPERVISOR_INTERVAL = 2.0
+    CONTRACT_LEASE_INTERVAL = 10.0
+    CONTRACT_LEASE_TIMEOUT = 90
+    CONTRACT_LEASE_RETRY_DEADLINE = 8.0
     POLLING_BACKOFF_MAX = 10
     _automatic_built_agents: dict[str, "Agent"] = {}
 
@@ -1886,6 +1896,7 @@ class Agent:
         self.running: bool = False
         self.interface: AgentInterface = AgentInterface()
         self.auth: str = ""
+        self.runtime_instance_id = str(uuid.uuid4())
         self.polling_interval: int = 0
         self.last_heartbeat: float = 0.0
         self._contract_runs: dict[str, _ContractRunState] = {}
@@ -2079,6 +2090,8 @@ class Agent:
             with self._contract_runs_lock:
                 for negotiation_id, state in self._contract_runs.items():
                     if state.thread.is_alive():
+                        if not state.finished:
+                            self._maybe_renew_contract_lease(state)
                         continue
                     if state.finished or state.cleanup_reported:
                         finished_ids.append(negotiation_id)
@@ -2093,6 +2106,27 @@ class Agent:
                 self._handle_unexpected_contract_death(state)
 
             time.sleep(self.SUPERVISOR_INTERVAL)
+
+    def _maybe_renew_contract_lease(self, state: _ContractRunState) -> None:
+        if state.phase not in ("running",):
+            return
+        now = time.perf_counter()
+        if now - state.last_lease_sent < self.CONTRACT_LEASE_INTERVAL:
+            return
+        try:
+            self.renew_contract_lease(state.negotiation_id)
+            state.last_lease_sent = now
+        except AgentError as exc:
+            logger.warning(
+                "Contract lease renewal failed for %s: %s",
+                state.negotiation_id,
+                exc,
+            )
+        except Exception:
+            logger.exception(
+                "Unexpected error while renewing contract lease; negotiation_id=%s",
+                state.negotiation_id,
+            )
 
     def _handle_unexpected_contract_death(self, state: _ContractRunState) -> None:
         message = (
@@ -2260,26 +2294,39 @@ class Agent:
         negotiation_id = msg["negotiation_id"]
         request = msg["request"]
         job = Job(self, negotiation_id, request)
+        self.post(
+            "contract/accept",
+            {"negotiation_id": negotiation_id},
+            allow_empty=True,
+        )
+        self.renew_contract_lease(negotiation_id)
+        job._set_status("running")
         worker = threading.Thread(
-            target=self._run_contract_job,
-            args=(msg, job),
+            target=self._run_running_contract_job,
+            args=(cast(str, negotiation_id), job),
             daemon=True,
             name=f"contract-{negotiation_id[:8]}",
         )
         self._register_contract_run(negotiation_id, job, worker)
+        self._mark_contract_phase(negotiation_id, "running")
         worker.start()
 
     def _run_contract_job(self, msg: Mapping[str, Any], job: Job) -> None:
-        st = time.perf_counter()
+        """Backward-compatible wrapper for tests and direct callers."""
         negotiation_id = cast(str, msg["negotiation_id"])
+        self.post(
+            "contract/accept",
+            {"negotiation_id": negotiation_id},
+            allow_empty=True,
+        )
+        self.renew_contract_lease(negotiation_id)
+        job._set_status("running")
+        self._mark_contract_phase(negotiation_id, "running")
+        self._run_running_contract_job(negotiation_id, job)
+
+    def _run_running_contract_job(self, negotiation_id: str, job: Job) -> None:
+        st = time.perf_counter()
         try:
-            self.post(
-                "contract/accept",
-                {"negotiation_id": negotiation_id},
-                allow_empty=True,
-            )
-            job._set_status("running")
-            self._mark_contract_phase(negotiation_id, "running")
             job.msg(f"{self.interface.name} starts running...")
 
             result = self.interface.func_dict["job_func"](job)
@@ -2293,7 +2340,10 @@ class Agent:
             except Exception:
                 logger.exception("Failed to report job completion")
         except BaseException as exc:
-            logger.exception(f"Error occured during the job execution; {msg=}")
+            logger.exception(
+                "Error occured during the job execution; negotiation_id=%s",
+                negotiation_id,
+            )
             job._set_status("error")
             self._mark_contract_phase(negotiation_id, "error")
             try:
@@ -2356,7 +2406,7 @@ class Agent:
         payload: JsonDict | None = None,
         *,
         basic_auth: bool = False,
-        retries: int | None = None,
+        retries: float | None = None,
         allow_empty: bool = False,
     ) -> JsonDict:
         url = f"{self.broker_url}/api/v1/agent/{uri}"
@@ -2639,6 +2689,19 @@ class Agent:
         self.post(
             "msgbox/ack",
             {"messages": [{"msg_id": msg_id, "claim_token": claim_token}]},
+            allow_empty=True,
+        )
+
+    def renew_contract_lease(self, negotiation_id: str) -> None:
+        """Refresh the running-contract lease on the broker."""
+        self._request_json_with_retry(
+            "POST",
+            "contract/lease",
+            {
+                "negotiation_id": negotiation_id,
+                "lease_owner": self.runtime_instance_id,
+            },
+            retries=self.CONTRACT_LEASE_RETRY_DEADLINE,
             allow_empty=True,
         )
 

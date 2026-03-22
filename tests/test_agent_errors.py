@@ -21,6 +21,7 @@ def build_agent() -> Agent:
     agent.REQUEST_RETRY_DEADLINE = 0.0
     agent.REQUEST_RETRY_BASE = 0.0
     agent.REQUEST_RETRY_MAX = 0.0
+    agent.CONTRACT_LEASE_RETRY_DEADLINE = 0.0
     return agent
 
 
@@ -173,6 +174,22 @@ def test_agent_ack_msgbox_returns_cleanly_after_success() -> None:
 
 
 @responses.activate
+def test_agent_renew_contract_lease_returns_cleanly_after_success() -> None:
+    agent = build_agent()
+
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/agent/contract/lease",
+        status=200,
+        json={},
+    )
+
+    agent.renew_contract_lease("neg-1")
+
+    assert len(responses.calls) == 1
+
+
+@responses.activate
 def test_agent_leaves_claimed_message_unacked_after_processing_failure() -> None:
     agent = build_agent()
 
@@ -210,6 +227,12 @@ def test_process_contract_reports_traceback_details_by_default() -> None:
     )
     responses.add(
         responses.POST,
+        f"{BROKER_URL}/api/v1/agent/contract/lease",
+        status=200,
+        json={},
+    )
+    responses.add(
+        responses.POST,
         f"{BROKER_URL}/api/v1/agent/report",
         status=200,
         json={"status": "ok"},
@@ -237,6 +260,31 @@ def test_process_contract_reports_traceback_details_by_default() -> None:
 
 
 @responses.activate
+def test_contract_message_is_not_acked_when_accept_fails() -> None:
+    agent = build_agent()
+
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/agent/contract/accept",
+        status=500,
+        json={"status": "error"},
+    )
+
+    agent._process_and_ack_message(
+        {
+            "msg_type": "contract",
+            "body": {"negotiation_id": "neg-accept-fail", "request": {}},
+            "_message_box_id": "msg-1",
+            "_message_box_claim_token": "claim-1",
+        }
+    )
+
+    assert [call.request.url for call in responses.calls] == [
+        f"{BROKER_URL}/api/v1/agent/contract/accept"
+    ]
+
+
+@responses.activate
 def test_process_contract_can_report_summary_without_traceback() -> None:
     agent = build_agent()
     agent.job_error_detail_level = "summary"
@@ -249,6 +297,12 @@ def test_process_contract_can_report_summary_without_traceback() -> None:
     responses.add(
         responses.POST,
         f"{BROKER_URL}/api/v1/agent/contract/accept",
+        status=200,
+        json={},
+    )
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/agent/contract/lease",
         status=200,
         json={},
     )
