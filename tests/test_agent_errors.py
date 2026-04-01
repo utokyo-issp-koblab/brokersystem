@@ -1,4 +1,5 @@
 import json
+import threading
 
 import pytest
 import responses
@@ -9,6 +10,7 @@ from brokersystem.agent import (
     AgentResponseError,
     AgentUploadError,
     Job,
+    _relay_socket_url,
 )
 
 BROKER_URL = "https://example.test"
@@ -37,6 +39,17 @@ def test_agent_get_raises_on_http_error() -> None:
 
     with pytest.raises(AgentHTTPError):
         agent.get("msgbox", basic_auth=True)
+
+
+def test_relay_socket_url_normalizes_http_and_https() -> None:
+    assert (
+        _relay_socket_url("http://localhost:4000")
+        == "ws://localhost:4000/api/v1/agent/relay/socket"
+    )
+    assert (
+        _relay_socket_url("https://broker.example.com/base")
+        == "wss://broker.example.com/base/api/v1/agent/relay/socket"
+    )
 
 
 @responses.activate
@@ -257,6 +270,86 @@ def test_process_contract_reports_traceback_details_by_default() -> None:
     assert payload["result"]["error_type"] == "ZeroDivisionError"
     assert payload["result"]["error_message"] == "division by zero"
     assert "Traceback (most recent call last):" in payload["result"]["traceback"]
+
+
+def test_serve_relay_file_sends_binary_chunks_and_eof(tmp_path) -> None:
+    agent = build_agent()
+    relay_path = tmp_path / "archive.bin"
+    relay_path.write_bytes(b"hello relay")
+    metadata = agent.register_relay_file(relay_path, None, None)
+
+    sent_frames: list[tuple[object, int | None]] = []
+
+    class DummyWebSocket:
+        def send(self, payload: object, opcode: int | None = None) -> None:
+            sent_frames.append((payload, opcode))
+
+    agent._relay_socket = DummyWebSocket()  # type: ignore[assignment]
+
+    agent._serve_relay_file(
+        "12345678-1234-1234-1234-123456789012",
+        str(metadata["source_id"]),
+        0,
+        relay_path.stat().st_size - 1,
+        4,
+        threading.Event(),
+    )
+
+    binary_frames = [
+        payload
+        for payload, opcode in sent_frames
+        if opcode is not None and isinstance(payload, bytes)
+    ]
+    text_frames = [payload for payload, opcode in sent_frames if opcode is None]
+
+    assert len(binary_frames) == 3
+    assert b"hello relay" == b"".join(frame[46:] for frame in binary_frames)
+    assert text_frames[-1] == json.dumps(
+        {"type": "eof", "stream_id": "12345678-1234-1234-1234-123456789012"}
+    )
+
+
+def test_handle_relay_cancel_sets_stream_event() -> None:
+    agent = build_agent()
+    cancel_event = threading.Event()
+    with agent._relay_cancel_events_lock:
+        agent._relay_cancel_events["stream-1"] = cancel_event
+
+    agent._handle_relay_control_message({"type": "cancel", "stream_id": "stream-1"})
+
+    assert cancel_event.is_set() is True
+
+
+def test_handle_relay_control_message_starts_file_server_thread(tmp_path) -> None:
+    agent = build_agent()
+    relay_path = tmp_path / "archive.bin"
+    relay_path.write_bytes(b"relay-thread")
+    metadata = agent.register_relay_file(relay_path, None, None)
+
+    seen_calls: list[tuple[str, str, int, int, int]] = []
+    done = threading.Event()
+
+    def fake_serve(
+        stream_id, source_id, start_byte, end_byte, chunk_size, cancel_event
+    ):
+        seen_calls.append((stream_id, source_id, start_byte, end_byte, chunk_size))
+        done.set()
+
+    agent._serve_relay_file = fake_serve  # type: ignore[method-assign]
+
+    agent._handle_relay_control_message(
+        {
+            "type": "serve_file",
+            "stream_id": "stream-2",
+            "source_id": metadata["source_id"],
+            "start_byte": 1,
+            "end_byte": 5,
+            "chunk_size": 3,
+        }
+    )
+
+    assert done.wait(timeout=1.0)
+    assert seen_calls == [("stream-2", metadata["source_id"], 1, 5, 3)]
 
 
 @responses.activate

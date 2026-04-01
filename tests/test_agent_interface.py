@@ -8,6 +8,7 @@ from brokersystem.agent import (
     Bool,
     File,
     Number,
+    RelayFile,
     Table,
     UserInfoField,
     need_revision_response,
@@ -121,6 +122,49 @@ def test_format_for_output_includes_tables_and_files() -> None:
     assert "table" in result["@keys"]
     assert "image" in result["@keys"]
     assert upload_calls == [("png", b"data")]
+
+
+def test_format_for_output_registers_relay_files_without_upload(tmp_path) -> None:
+    interface = AgentInterface()
+    interface.output.archive = RelayFile(
+        help="Large archive streamed through the broker."
+    )
+
+    relay_path = tmp_path / "archive.bin"
+    relay_path.write_bytes(b"relay-bytes")
+
+    upload_calls = []
+    relay_calls = []
+
+    def fake_uploader(file_type: str, data: bytes):
+        upload_calls.append((file_type, data))
+        return {"file_id": "unexpected"}
+
+    def fake_relay_registrar(path, name, content_type):
+        relay_calls.append((path, name, content_type))
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_file",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": "src_456",
+            "name": "archive.bin",
+            "size_bytes": 11,
+            "content_type": "application/octet-stream",
+            "availability": "agent_online_required",
+        }
+
+    result = interface.format_for_output(
+        {"archive": relay_path},
+        fake_uploader,
+        fake_relay_registrar,
+    )
+
+    assert upload_calls == []
+    assert relay_calls == [(relay_path, None, None)]
+    assert result["archive"]["source_id"] == "src_456"
+    assert result["@type"]["archive"] == "relay_file"
 
 
 def test_make_config_includes_user_info_request() -> None:

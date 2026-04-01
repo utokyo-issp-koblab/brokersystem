@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import uuid
+from urllib.parse import urlsplit, urlunsplit
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -31,6 +32,7 @@ from typing import (
 import pandas as pd
 import PIL.Image
 import requests
+import websocket
 from logzero import logger
 
 from . import __version__
@@ -38,6 +40,7 @@ from . import __version__
 JsonDict = dict[str, Any]
 JsonPayload = dict[str, Any]
 BinaryData = bytes | bytearray | memoryview
+RelayRegistrar = Callable[[PathLike[str] | str, str | None, str | None], JsonDict]
 AgentFactory = Callable[[Callable[..., JsonDict | None]], Callable[..., "Agent"]]
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -154,6 +157,19 @@ class ResultResponse(TypedDict):
     msg: str
     progress: float
     result: ResultPayload
+
+
+RelayFileValue = TypedDict(
+    "RelayFileValue",
+    {
+        "$brokersystem": dict[str, str | int],
+        "source_id": str,
+        "name": str,
+        "size_bytes": int,
+        "content_type": str,
+        "availability": str,
+    },
+)
 
 
 class BoardResponse(TypedDict):
@@ -947,6 +963,24 @@ def _attach_feedback(
     return payload
 
 
+def _relay_socket_url(broker_url: str) -> str:
+    """Build the broker relay WebSocket URL from the broker base URL."""
+    parsed = urlsplit(broker_url)
+    if parsed.scheme == "https":
+        ws_scheme = "wss"
+    elif parsed.scheme == "http":
+        ws_scheme = "ws"
+    elif parsed.scheme in ("ws", "wss"):
+        ws_scheme = parsed.scheme
+    else:
+        raise ValueError(
+            f"Unsupported broker URL scheme for relay socket: {parsed.scheme}"
+        )
+
+    relay_path = parsed.path.rstrip("/") + "/api/v1/agent/relay/socket"
+    return urlunsplit((ws_scheme, parsed.netloc, relay_path, "", ""))
+
+
 def _safe_debug_value(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray, memoryview)):
         return f"<{len(value)} bytes>"
@@ -995,7 +1029,10 @@ class ValueTemplate:
         return value
 
     def format_for_output(
-        self, value: Any, uploader: Callable[[str, bytes], JsonDict]
+        self,
+        value: Any,
+        uploader: Callable[[str, bytes], JsonDict],
+        relay_registrar: RelayRegistrar | None = None,
     ) -> tuple[Any, JsonDict]:
         """Format an output value and return (value, format_dict)."""
         format_dict = {"@type": self.type, "@unit": self.unit}
@@ -1074,6 +1111,8 @@ class ValueTemplate:
                         "y": format_dict["@repr"]["key_y"],
                     }
                 template = Table(unit_dict=unit_dict, graph=graph)
+            case "relay_file":
+                template = RelayFile()
             case _ as unknown_type:
                 raise NotImplementedError(f"Unknown type: {unknown_type}")
         if "@constraints" in format_dict:
@@ -1233,6 +1272,7 @@ class File(ValueTemplate):
         self,
         value: BinaryData | PathLike[str] | str,
         uploader: Callable[[str, bytes], JsonDict],
+        relay_registrar: RelayRegistrar | None = None,
     ) -> tuple[Any, JsonDict]:
         """Upload a file and return the broker-side file id."""
         if isinstance(value, (bytes, bytearray, memoryview)):
@@ -1279,6 +1319,45 @@ class File(ValueTemplate):
         value = response["file_id"]
 
         return value, self.format_dict
+
+
+class RelayFile(ValueTemplate):
+    """Relay-backed file template for large artifacts kept on the agent host."""
+
+    def __init__(
+        self,
+        name: str | None = None,
+        content_type: str | None = None,
+        help: str | None = None,
+    ) -> None:
+        super().__init__(help=help)
+        self.type = "relay_file"
+        self.name = name
+        self.content_type = content_type
+
+    def format_for_output(
+        self,
+        value: PathLike[str] | str,
+        uploader: Callable[[str, bytes], JsonDict],
+        relay_registrar: RelayRegistrar | None = None,
+    ) -> tuple[Any, JsonDict]:
+        """Register a relay source and return tagged relay metadata."""
+        if relay_registrar is None:
+            raise RuntimeError("Relay registrar is required for RelayFile outputs")
+
+        try:
+            path = Path(value)
+        except Exception as exc:
+            raise TypeError(
+                f"a RelayFile value must be a file path but got: {value} (type: {type(value)}); {exc}"
+            ) from exc
+
+        metadata = relay_registrar(path, self.name, self.content_type)
+        if not isinstance(metadata, dict):
+            raise RuntimeError(
+                f"Relay registration returned invalid metadata: {metadata!r}"
+            )
+        return metadata, self.format_dict
 
 
 class Choice(ValueTemplate):
@@ -1360,7 +1439,10 @@ class Table(ValueTemplate):
         return format_dict
 
     def format_for_output(
-        self, value: Any, uploader: Callable[[str, bytes], JsonDict]
+        self,
+        value: Any,
+        uploader: Callable[[str, bytes], JsonDict],
+        relay_registrar: RelayRegistrar | None = None,
     ) -> tuple[Any, JsonDict]:
         """Convert a table value into the broker output schema."""
         format_dict = self.format_dict
@@ -1602,6 +1684,7 @@ class AgentInterface:
         self,
         result_dict: JsonDict,
         uploader: Callable[[str, bytes], JsonDict],
+        relay_registrar: RelayRegistrar | None = None,
     ) -> JsonDict:
         """Convert raw job results to the broker output schema."""
         output_dict = {
@@ -1617,7 +1700,7 @@ class AgentInterface:
             if key not in self.output:
                 continue
             output_value, format_dict = self.output[key].format_for_output(
-                value, uploader
+                value, uploader, relay_registrar
             )
             if output_value is None:
                 continue
@@ -1631,7 +1714,7 @@ class AgentInterface:
                 output_dict["@unit"].update(format_dict["_unit_dict"])
                 output_dict["@type"].update({k: "number" for k in table_keys})
 
-            elif format_dict["@type"] in ["image", "file"]:
+            elif format_dict["@type"] in ["image", "file", "relay_file"]:
                 if "@file" not in output_dict:
                     output_dict["@file"] = {}
             else:
@@ -1752,7 +1835,7 @@ class Job(Mapping[str, Any]):
                 result, dict
             ), "Result should be given as a dict: {result_key: result_value}"
             payload["result"] = self._agent.interface.format_for_output(
-                result, self._agent.upload
+                result, self._agent.upload, self._agent.register_relay_file
             )
 
         self._agent.post("report", payload)
@@ -1870,6 +1953,17 @@ class _ContractRunState:
     last_lease_sent: float = 0.0
 
 
+@dataclass
+class _RelayFileSource:
+    source_id: str
+    path: Path
+    name: str
+    size_bytes: int
+    content_type: str
+    created_at: float
+    last_accessed_at: float
+
+
 class Agent:
     """Agent runtime that connects to broker and handles negotiation/contract flow."""
 
@@ -1886,6 +1980,11 @@ class Agent:
     CONTRACT_LEASE_TIMEOUT = 90
     CONTRACT_LEASE_RETRY_DEADLINE = 8.0
     POLLING_BACKOFF_MAX = 10
+    RELAY_RECONNECT_BASE = 1.0
+    RELAY_RECONNECT_MAX = 10.0
+    RELAY_HEARTBEAT_INTERVAL = 20.0
+    RELAY_SOURCE_TTL_SECONDS = 86_400
+    RELAY_CHUNK_SIZE = 64 * 1024
     _automatic_built_agents: dict[str, "Agent"] = {}
 
     def __init__(self, broker_url: str) -> None:
@@ -1905,6 +2004,15 @@ class Agent:
         self._connect_thread_lock = threading.Lock()
         self._heartbeat_thread: threading.Thread | None = None
         self._supervisor_thread: threading.Thread | None = None
+        self._relay_thread: threading.Thread | None = None
+        self._relay_thread_lock = threading.Lock()
+        self._relay_socket: websocket.WebSocketApp | None = None
+        self._relay_socket_lock = threading.Lock()
+        self._relay_send_lock = threading.Lock()
+        self._relay_sources: dict[str, _RelayFileSource] = {}
+        self._relay_sources_lock = threading.Lock()
+        self._relay_cancel_events: dict[str, threading.Event] = {}
+        self._relay_cancel_events_lock = threading.Lock()
 
     def _increase_polling_interval(self) -> None:
         if self.polling_interval <= 0:
@@ -1928,6 +2036,7 @@ class Agent:
         if self.register_config():
             self.running = True
             self._ensure_connect_thread()
+            self._ensure_relay_thread()
             self._ensure_heartbeat_thread()
             self._ensure_supervisor_thread()
             if not _automatic:
@@ -1978,6 +2087,13 @@ class Agent:
     def goodbye(self) -> None:
         """Stop agent loops and allow threads to exit."""
         self.running = False
+        with self._relay_socket_lock:
+            if self._relay_socket is not None:
+                try:
+                    self._relay_socket.close()
+                except Exception:
+                    logger.debug("Ignoring relay socket close failure", exc_info=True)
+                self._relay_socket = None
 
     def _ensure_connect_thread(self) -> None:
         with self._connect_thread_lock:
@@ -2000,6 +2116,17 @@ class Agent:
         )
         self._heartbeat_thread.start()
 
+    def _ensure_relay_thread(self) -> None:
+        with self._relay_thread_lock:
+            if self._relay_thread is not None and self._relay_thread.is_alive():
+                return
+            self._relay_thread = threading.Thread(
+                target=self.relay_loop,
+                daemon=True,
+                name=f"{self.interface.name}-relay",
+            )
+            self._relay_thread.start()
+
     def _ensure_supervisor_thread(self) -> None:
         if self._supervisor_thread is not None and self._supervisor_thread.is_alive():
             return
@@ -2009,6 +2136,291 @@ class Agent:
             name=f"{self.interface.name}-contract-supervisor",
         )
         self._supervisor_thread.start()
+
+    def relay_loop(self) -> None:
+        """Maintain the broker relay WebSocket connection."""
+        attempt = 0
+        while self.running:
+            try:
+                headers = [f"authorization: Basic {self.auth}"]
+                ws = websocket.WebSocketApp(
+                    _relay_socket_url(self.broker_url),
+                    header=headers,
+                    on_open=self._on_relay_open,
+                    on_message=self._on_relay_message,
+                    on_error=self._on_relay_error,
+                    on_close=self._on_relay_close,
+                )
+                with self._relay_socket_lock:
+                    self._relay_socket = ws
+
+                ws.run_forever(
+                    ping_interval=self.RELAY_HEARTBEAT_INTERVAL,
+                    ping_timeout=max(self.RELAY_HEARTBEAT_INTERVAL / 2.0, 5.0),
+                )
+                attempt = 0
+            except Exception:
+                logger.exception("Relay socket loop crashed")
+            finally:
+                with self._relay_socket_lock:
+                    self._relay_socket = None
+
+            if not self.running:
+                break
+
+            time.sleep(
+                _backoff_seconds(
+                    attempt, self.RELAY_RECONNECT_BASE, self.RELAY_RECONNECT_MAX
+                )
+            )
+            attempt += 1
+
+    def _on_relay_open(self, ws: websocket.WebSocketApp) -> None:
+        logger.info("Relay socket connected.")
+        self._relay_send_text(
+            {"type": "hello", "runtime_instance_id": self.runtime_instance_id}, ws=ws
+        )
+
+    def _on_relay_message(
+        self, ws: websocket.WebSocketApp, message: str | bytes
+    ) -> None:
+        try:
+            if isinstance(message, bytes):
+                logger.warning("Unexpected binary control message on relay socket")
+                return
+
+            payload = json.loads(message)
+            if not isinstance(payload, dict):
+                logger.warning("Ignoring non-dict relay control message: %r", payload)
+                return
+            self._handle_relay_control_message(payload)
+        except Exception:
+            logger.exception("Failed to process relay control message")
+
+    def _on_relay_error(
+        self,
+        _ws: websocket.WebSocketApp,
+        error: Exception | str,
+    ) -> None:
+        logger.warning("Relay socket error: %s", error)
+
+    def _on_relay_close(
+        self,
+        _ws: websocket.WebSocketApp,
+        status_code: int | None,
+        close_msg: str | None,
+    ) -> None:
+        if self.running:
+            logger.warning(
+                "Relay socket closed: status_code=%r close_msg=%r",
+                status_code,
+                close_msg,
+            )
+
+    def _handle_relay_control_message(self, payload: Mapping[str, Any]) -> None:
+        msg_type = payload.get("type")
+        if msg_type == "serve_file":
+            stream_id = payload.get("stream_id")
+            source_id = payload.get("source_id")
+            start_byte = payload.get("start_byte")
+            end_byte = payload.get("end_byte")
+            chunk_size = payload.get("chunk_size")
+
+            if not (
+                isinstance(stream_id, str)
+                and isinstance(source_id, str)
+                and isinstance(start_byte, int)
+                and isinstance(end_byte, int)
+                and isinstance(chunk_size, int)
+            ):
+                logger.warning(
+                    "Ignoring malformed serve_file relay command: %r", payload
+                )
+                return
+
+            cancel_event = threading.Event()
+            with self._relay_cancel_events_lock:
+                self._relay_cancel_events[stream_id] = cancel_event
+
+            threading.Thread(
+                target=self._serve_relay_file,
+                args=(
+                    stream_id,
+                    source_id,
+                    start_byte,
+                    end_byte,
+                    chunk_size,
+                    cancel_event,
+                ),
+                daemon=True,
+                name=f"relay-{stream_id[:8]}",
+            ).start()
+            return
+
+        if msg_type == "cancel":
+            stream_id = payload.get("stream_id")
+            if isinstance(stream_id, str):
+                with self._relay_cancel_events_lock:
+                    event = self._relay_cancel_events.get(stream_id)
+                if event is not None:
+                    event.set()
+            return
+
+        logger.warning("Unknown relay control message: %r", payload)
+
+    def register_relay_file(
+        self,
+        value: PathLike[str] | str,
+        download_name: str | None,
+        content_type_override: str | None,
+    ) -> JsonDict:
+        """Register a local file as a broker relay source and return tagged metadata."""
+        path = Path(value)
+        stat = path.stat()
+        name = download_name or path.name
+        content_type = content_type_override or mimetypes.guess_type(path.name)[0]
+        if content_type is None:
+            content_type = "application/octet-stream"
+        source_id = f"src_{uuid.uuid4()}"
+        now = time.perf_counter()
+        source = _RelayFileSource(
+            source_id=source_id,
+            path=path,
+            name=name,
+            size_bytes=stat.st_size,
+            content_type=content_type,
+            created_at=now,
+            last_accessed_at=now,
+        )
+        with self._relay_sources_lock:
+            self._relay_sources[source_id] = source
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_file",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": source_id,
+            "name": name,
+            "size_bytes": stat.st_size,
+            "content_type": content_type,
+            "availability": "agent_online_required",
+        }
+
+    def _prune_relay_sources(self) -> None:
+        cutoff = time.perf_counter() - self.RELAY_SOURCE_TTL_SECONDS
+        with self._relay_sources_lock:
+            stale_ids = [
+                source_id
+                for source_id, source in self._relay_sources.items()
+                if source.last_accessed_at < cutoff
+            ]
+            for source_id in stale_ids:
+                self._relay_sources.pop(source_id, None)
+
+    def _get_relay_source(self, source_id: str) -> _RelayFileSource | None:
+        with self._relay_sources_lock:
+            source = self._relay_sources.get(source_id)
+            if source is None:
+                return None
+            source.last_accessed_at = time.perf_counter()
+            return source
+
+    def _serve_relay_file(
+        self,
+        stream_id: str,
+        source_id: str,
+        start_byte: int,
+        end_byte: int,
+        chunk_size: int,
+        cancel_event: threading.Event,
+    ) -> None:
+        try:
+            source = self._get_relay_source(source_id)
+            if source is None:
+                self._relay_send_text(
+                    {
+                        "type": "error",
+                        "stream_id": stream_id,
+                        "code": "source_missing",
+                        "message": "Relay source is no longer available on the agent.",
+                    }
+                )
+                return
+
+            current_size = source.path.stat().st_size
+            if current_size != source.size_bytes:
+                self._relay_send_text(
+                    {
+                        "type": "error",
+                        "stream_id": stream_id,
+                        "code": "source_changed",
+                        "message": "Relay source size changed after the result was reported.",
+                    }
+                )
+                return
+
+            with source.path.open("rb") as handle:
+                handle.seek(start_byte)
+                offset = start_byte
+                remaining = end_byte - start_byte + 1
+                read_size = max(1, min(chunk_size, self.RELAY_CHUNK_SIZE))
+                while remaining > 0 and not cancel_event.is_set():
+                    chunk = handle.read(min(read_size, remaining))
+                    if chunk == b"":
+                        break
+                    self._relay_send_binary_chunk(stream_id, offset, chunk)
+                    offset += len(chunk)
+                    remaining -= len(chunk)
+
+            if not cancel_event.is_set():
+                self._relay_send_text({"type": "eof", "stream_id": stream_id})
+        except FileNotFoundError:
+            self._relay_send_text(
+                {
+                    "type": "error",
+                    "stream_id": stream_id,
+                    "code": "source_missing",
+                    "message": "Relay source file no longer exists on the agent.",
+                }
+            )
+        except Exception as exc:
+            logger.exception("Relay file serving failed; stream_id=%s", stream_id)
+            self._relay_send_text(
+                {
+                    "type": "error",
+                    "stream_id": stream_id,
+                    "code": "relay_failed",
+                    "message": str(exc),
+                }
+            )
+        finally:
+            with self._relay_cancel_events_lock:
+                self._relay_cancel_events.pop(stream_id, None)
+
+    def _relay_send_text(
+        self, payload: Mapping[str, Any], *, ws: websocket.WebSocketApp | None = None
+    ) -> None:
+        if ws is None:
+            with self._relay_socket_lock:
+                ws = self._relay_socket
+        if ws is None:
+            raise RuntimeError("Relay socket is not connected")
+        with self._relay_send_lock:
+            ws.send(json.dumps(dict(payload)))
+
+    def _relay_send_binary_chunk(
+        self, stream_id: str, offset: int, data: bytes
+    ) -> None:
+        with self._relay_socket_lock:
+            ws = self._relay_socket
+        if ws is None:
+            raise RuntimeError("Relay socket is not connected")
+        frame = (
+            bytes([1, 0]) + stream_id.encode("ascii") + offset.to_bytes(8, "big") + data
+        )
+        with self._relay_send_lock:
+            ws.send(frame, opcode=websocket.ABNF.OPCODE_BINARY)
 
     def register_config(self, *, raise_on_fail: bool = True) -> bool:
         """Register agent config and obtain an access token."""
@@ -2080,6 +2492,9 @@ class Agent:
             ):
                 logger.info("Automatic reconnection...")
                 self._ensure_connect_thread()
+            if self._relay_thread is None or not self._relay_thread.is_alive():
+                logger.info("Automatic relay reconnection...")
+                self._ensure_relay_thread()
             time.sleep(self.HEARTBEAT_INTERVAL)
 
     def _supervise_contract_runs(self) -> None:
@@ -2105,6 +2520,7 @@ class Agent:
             for state in stale_runs:
                 self._handle_unexpected_contract_death(state)
 
+            self._prune_relay_sources()
             time.sleep(self.SUPERVISOR_INTERVAL)
 
     def _maybe_renew_contract_lease(self, state: _ContractRunState) -> None:

@@ -1,7 +1,16 @@
 import pandas as pd
 import pytest
 
-from brokersystem.agent import Bool, Choice, File, Number, String, Table, ValueTemplate
+from brokersystem.agent import (
+    Bool,
+    Choice,
+    File,
+    Number,
+    RelayFile,
+    String,
+    Table,
+    ValueTemplate,
+)
 
 
 def test_guess_from_value_number() -> None:
@@ -68,6 +77,37 @@ def test_file_format_for_output_uploads_bytes() -> None:
     assert value == "file-123.png"
     assert fmt["@type"] == "image"
     assert fmt["@help"] == "Rendered preview image."
+
+
+def test_relay_file_format_for_output_registers_source(tmp_path) -> None:
+    relay_path = tmp_path / "all_png.zip"
+    relay_path.write_bytes(b"data")
+    calls = []
+
+    def fake_registrar(path, name, content_type):
+        calls.append((path, name, content_type))
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_file",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": "src_123",
+            "name": "all_png.zip",
+            "size_bytes": 4,
+            "content_type": "application/zip",
+            "availability": "agent_online_required",
+        }
+
+    relay_template = RelayFile(help="Large archive kept on the producer host.")
+    value, fmt = relay_template.format_for_output(
+        relay_path, lambda *_: {}, fake_registrar
+    )
+
+    assert calls == [(relay_path, None, None)]
+    assert value["source_id"] == "src_123"
+    assert fmt["@type"] == "relay_file"
+    assert fmt["@help"] == "Large archive kept on the producer host."
 
 
 def test_number_cast_preserves_float() -> None:

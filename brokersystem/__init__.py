@@ -37,6 +37,7 @@ from brokersystem.agent import (
     ResultPayload,
     ResultStatus,
     ResultValue,
+    RelayFile,
     String,
     Table,
     TemplateSchema,
