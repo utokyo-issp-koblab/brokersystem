@@ -487,6 +487,37 @@ def test_broker_ask_uses_feedback_message_when_error_msg_is_missing() -> None:
 
 
 @responses.activate
+def test_broker_board_raises_on_status_error_without_canonical_detail() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.GET,
+        f"{BROKER_URL}/api/v1/client/board",
+        json={"status": "error"},
+        status=200,
+    )
+
+    with pytest.raises(
+        BrokerResponseError,
+        match=r"Malformed broker response.*status=error payload must include error_msg or error",
+    ):
+        broker.board()
+
+
+@responses.activate
+def test_broker_board_uses_error_code_when_error_msg_is_missing() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.GET,
+        f"{BROKER_URL}/api/v1/client/board",
+        json={"status": "error", "error": "forbidden"},
+        status=200,
+    )
+
+    with pytest.raises(BrokerResponseError, match=r"GET board failed: forbidden"):
+        broker.board()
+
+
+@responses.activate
 def test_broker_admin_agents_and_tokens() -> None:
     admin = BrokerAdmin(BROKER_URL, token="user-token")
     responses.add(

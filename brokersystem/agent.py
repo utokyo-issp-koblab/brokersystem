@@ -400,6 +400,9 @@ def _raise_malformed_response(
 
 
 def _ensure_response_dict(payload: object, context: str) -> JsonDict:
+    # Generic broker API errors must use the canonical envelope:
+    # {"status": "error", "error_msg": <detail>, "error": <optional code>}.
+    # Do not fall back to unrelated payload fields here.
     if not isinstance(payload, dict):
         _raise_malformed_response(
             context, f"expected a JSON object, got {payload!r}", payload
@@ -407,7 +410,13 @@ def _ensure_response_dict(payload: object, context: str) -> JsonDict:
     if not payload:
         _raise_malformed_response(context, "returned an empty payload", payload)
     if payload.get("status") == "error":
-        detail = payload.get("error_msg") or payload.get("error") or "unknown error"
+        detail = payload.get("error_msg") or payload.get("error")
+        if detail is None:
+            _raise_malformed_response(
+                context,
+                "status=error payload must include error_msg or error",
+                payload,
+            )
         raise BrokerResponseError(
             f"{context} failed: {detail}",
             payload=payload,
