@@ -17,6 +17,19 @@ Run examples:
     python examples/usage_guide.py client --agent-id <agent_id> [--step-by-step]
   BROKER_URL=https://... BROKER_TOKEN=... \
     python examples/usage_guide.py admin [--deposit-user] [--delete-user]
+
+Relay examples:
+  BROKER_URL=https://... AGENT_ID=... AGENT_SECRET=... \
+    python examples/relay_large_file.py agent
+  BROKER_URL=https://... BROKER_TOKEN=... \
+    python examples/relay_large_file.py client --agent-id <agent_id>
+  BROKER_URL=https://... AGENT_ID=... AGENT_SECRET=... \
+    python examples/relay_segmented_video.py agent
+  BROKER_URL=https://... BROKER_TOKEN=... \
+    python examples/relay_segmented_video.py client --agent-id <agent_id>
+
+The relay examples generate their own demo assets, so you do not need to
+prepare sample files manually.
 """
 
 from __future__ import annotations
