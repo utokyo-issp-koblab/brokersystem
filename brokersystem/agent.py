@@ -401,9 +401,16 @@ def _raise_malformed_response(
 
 
 def _ensure_response_dict(payload: object, context: str) -> JsonDict:
-    # Generic broker API errors must use the canonical envelope:
-    # {"status": "error", "error_msg": <detail>, "error": <optional code>}.
-    # Do not fall back to unrelated payload fields here.
+    """Validate a generic broker JSON envelope.
+
+    Generic broker transport errors must use the canonical envelope:
+    `{"status": "error", "error_msg": <detail>, "error": <optional code>}`.
+
+    `error_msg` is the human-readable detail. `error` is an optional machine-
+    readable code. User agent callbacks should not construct this transport
+    envelope directly; they should use the public negotiation helpers or raise
+    exceptions and let the SDK/server translate them.
+    """
     if not isinstance(payload, dict):
         _raise_malformed_response(
             context, f"expected a JSON object, got {payload!r}", payload
@@ -899,7 +906,11 @@ def ok_response(
     message: str | None = None,
     fields: Mapping[str, str] = {},
 ) -> tuple[Literal["ok"], NegotiationFeedback]:
-    """Return an `ok` negotiation decision with optional feedback."""
+    """Return an `ok` negotiation decision with optional feedback.
+
+    This returns a negotiation helper result, not a raw broker transport
+    envelope such as `{"status": "error", ...}`.
+    """
     return cast(
         tuple[Literal["ok"], NegotiationFeedback],
         _feedback_response("ok", message=message, fields=fields),
@@ -911,7 +922,11 @@ def need_revision_response(
     message: str | None = None,
     fields: Mapping[str, str] = {},
 ) -> tuple[Literal["need_revision"], NegotiationFeedback]:
-    """Return a `need_revision` negotiation decision with optional feedback."""
+    """Return a `need_revision` negotiation decision with optional feedback.
+
+    This returns a negotiation helper result, not a raw broker transport
+    envelope such as `{"status": "error", ...}`.
+    """
     return cast(
         tuple[Literal["need_revision"], NegotiationFeedback],
         _feedback_response("need_revision", message=message, fields=fields),
@@ -923,7 +938,11 @@ def ng_response(
     message: str | None = None,
     fields: Mapping[str, str] = {},
 ) -> tuple[Literal["ng"], NegotiationFeedback]:
-    """Return an `ng` negotiation decision with optional feedback."""
+    """Return an `ng` negotiation decision with optional feedback.
+
+    This returns a negotiation helper result, not a raw broker transport
+    envelope such as `{"status": "error", ...}`.
+    """
     return cast(
         tuple[Literal["ng"], NegotiationFeedback],
         _feedback_response("ng", message=message, fields=fields),
@@ -965,6 +984,8 @@ def _attach_feedback(
 
     payload["feedback"] = normalized
     payload.pop("revision", None)
+    # For non-ok negotiation outcomes, propagate the round-level feedback
+    # message into the canonical broker error detail field.
     if status in ["need_revision", "ng"] and normalized["message"] != "":
         payload["error_msg"] = normalized["message"]
     elif status == "ok":
@@ -3105,6 +3126,8 @@ class Agent:
                 logger.error("Upload returned empty response")
                 raise AgentResponseError("Upload returned empty response", payload=obj)
             if obj.get("status") == "error":
+                # Upload responses use the same canonical broker error envelope:
+                # error_msg = detail, error = optional machine-readable code.
                 code = obj.get("error")
                 error_msg = obj.get("error_msg") or "Upload rejected by broker"
                 logger.error("Upload rejected by broker: code=%s payload=%r", code, obj)
