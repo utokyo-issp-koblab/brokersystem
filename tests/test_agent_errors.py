@@ -277,6 +277,7 @@ def test_serve_relay_file_sends_binary_chunks_and_eof(tmp_path) -> None:
     relay_path = tmp_path / "archive.bin"
     relay_path.write_bytes(b"hello relay")
     metadata = agent.register_relay_file(relay_path, None, None)
+    assert metadata["runtime_instance_id"] == agent.runtime_instance_id
 
     sent_frames: list[tuple[object, int | None]] = []
 

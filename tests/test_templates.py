@@ -93,6 +93,7 @@ def test_relay_file_format_for_output_registers_source(tmp_path) -> None:
                 "transport": "broker_relay_v1",
             },
             "source_id": "src_123",
+            "runtime_instance_id": "runtime-1",
             "name": "all_png.zip",
             "size_bytes": 4,
             "content_type": "application/zip",
@@ -106,6 +107,7 @@ def test_relay_file_format_for_output_registers_source(tmp_path) -> None:
 
     assert calls == [(relay_path, None, None)]
     assert value["source_id"] == "src_123"
+    assert value["runtime_instance_id"] == "runtime-1"
     assert fmt["@type"] == "relay_file"
     assert fmt["@help"] == "Large archive kept on the producer host."
 

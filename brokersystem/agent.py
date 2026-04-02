@@ -164,6 +164,7 @@ RelayFileValue = TypedDict(
     {
         "$brokersystem": dict[str, str | int],
         "source_id": str,
+        "runtime_instance_id": str,
         "name": str,
         "size_bytes": int,
         "content_type": str,
@@ -2310,6 +2311,7 @@ class Agent:
                 "transport": "broker_relay_v1",
             },
             "source_id": source_id,
+            "runtime_instance_id": self.runtime_instance_id,
             "name": name,
             "size_bytes": stat.st_size,
             "content_type": content_type,

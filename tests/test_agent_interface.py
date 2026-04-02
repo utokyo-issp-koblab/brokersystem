@@ -149,6 +149,7 @@ def test_format_for_output_registers_relay_files_without_upload(tmp_path) -> Non
                 "transport": "broker_relay_v1",
             },
             "source_id": "src_456",
+            "runtime_instance_id": "runtime-2",
             "name": "archive.bin",
             "size_bytes": 11,
             "content_type": "application/octet-stream",
@@ -164,6 +165,7 @@ def test_format_for_output_registers_relay_files_without_upload(tmp_path) -> Non
     assert upload_calls == []
     assert relay_calls == [(relay_path, None, None)]
     assert result["archive"]["source_id"] == "src_456"
+    assert result["archive"]["runtime_instance_id"] == "runtime-2"
     assert result["@type"]["archive"] == "relay_file"
 
 
