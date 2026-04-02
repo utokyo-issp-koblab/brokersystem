@@ -3163,7 +3163,8 @@ class Agent:
 
         Return `ok_response(...)`, `need_revision_response(...)`, or
         `ng_response(...)`. Use `message` for a round-level note and `fields`
-        for sparse per-parameter notes.
+        for sparse per-parameter notes. Do not return raw broker transport
+        envelopes such as `{"status": "error", ...}` from user code.
         """
 
         @functools.wraps(func)
