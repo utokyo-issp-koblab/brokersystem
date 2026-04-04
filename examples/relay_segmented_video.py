@@ -6,7 +6,7 @@ It is not WebRTC or true low-latency media streaming, but it maps well to the
 current broker relay features.
 
 Run:
-  BROKER_URL=https://... AGENT_ID=... AGENT_SECRET=... \
+  BROKER_URL=https://... AGENT_AUTH='<agent_id>:<agent_secret>' \
     python examples/relay_segmented_video.py agent
 
   BROKER_URL=https://... BROKER_TOKEN=... \
@@ -35,6 +35,15 @@ def require_env(key: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required env var: {key}")
     return value
+
+
+def require_agent_auth() -> str:
+    agent_auth = os.environ.get("AGENT_AUTH")
+    if agent_auth:
+        return agent_auth
+    agent_id = require_env("AGENT_ID")
+    agent_secret = require_env("AGENT_SECRET")
+    return f"{agent_id}:{agent_secret}"
 
 
 def create_demo_segments(
@@ -93,15 +102,14 @@ def require_result_str(value: object, *, field: str) -> str:
 
 def build_segment_agent(segments: list[Path], segment_duration_s: float) -> Agent:
     broker_url = require_env("BROKER_URL")
-    agent_id = require_env("AGENT_ID")
-    agent_secret = require_env("AGENT_SECRET")
+    agent_auth = require_agent_auth()
 
     agent = Agent(broker_url)
 
     @agent.config
     def make_config() -> None:
         agent.name = "relay-segmented-video-example"
-        agent.secret_token = f"{agent_id}:{agent_secret}"
+        agent.agent_auth = agent_auth
         agent.description = "Serves short local video segments through broker relay one request at a time."
         agent.charge = 1
         agent.input.request_kind = Choice(

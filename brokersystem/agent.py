@@ -298,7 +298,7 @@ class BrokerError(RuntimeError):
 
 
 class BrokerConnectionError(BrokerError):
-    """Raised when the broker server cannot be reached."""
+    """Raised when the broker URL cannot be reached."""
 
 
 class BrokerHTTPError(BrokerError):
@@ -342,7 +342,7 @@ class AgentError(RuntimeError):
 
 
 class AgentConnectionError(AgentError):
-    """Raised when the broker server cannot be reached by an agent."""
+    """Raised when an Agent request cannot reach the broker URL."""
 
 
 class AgentHTTPError(AgentError):
@@ -1123,7 +1123,7 @@ class ValueTemplate:
     def from_dict(
         cls, format_dict: JsonDict, unit_dict: dict[str, str | None]
     ) -> "ValueTemplate":
-        """Build a template from a broker-side schema dict."""
+        """Build a template from an API schema dict."""
         match format_dict["@type"]:
             case "number":
                 template = Number()
@@ -1305,7 +1305,7 @@ class File(ValueTemplate):
         uploader: Callable[[str, bytes], JsonDict],
         relay_registrar: RelayRegistrar | None = None,
     ) -> tuple[Any, JsonDict]:
-        """Upload a file and return the broker-side file id."""
+        """Upload a file and return the API file id."""
         if isinstance(value, (bytes, bytearray, memoryview)):
             binary_data = value
         else:
@@ -1445,7 +1445,7 @@ class Table(ValueTemplate):
 
         Args:
             unit_dict: Units for each numeric column.
-            graph: Optional graph metadata for broker-side previews.
+            graph: Optional graph metadata for API-rendered previews.
             help: Optional helper text for UI display.
         """
         super().__init__(unit=None, help=help)
@@ -1605,10 +1605,14 @@ class AgentInterface:
     """In-memory representation of agent settings and schemas."""
 
     def __init__(self) -> None:
-        self.secret_token: str = ""
+        self.agent_auth: str = ""
+        """Credential string `<agent_id>:<agent_secret>` used by `Agent` for `/api/v1/agent/*` requests."""
         self.name: str | None = None
+        """Display name shown in broker listings."""
         self.charge: int = 10000
+        """Default charge in points before any charge_func override."""
         self.job_error_detail_level: JobErrorDetailLevel = "traceback"
+        """How much structured error detail to expose when a job fails."""
         self.convention: str = ""
         self.description: str = ""
         self.user_info_request: list[UserInfoField] = []
@@ -1623,9 +1627,9 @@ class AgentInterface:
         """Validate required agent hooks and refresh config templates."""
         self.func_dict = dict(func_dict)
         if "make_config" not in self.func_dict and (
-            self.secret_token == "" or self.name is None
+            self.agent_auth == "" or self.name is None
         ):
-            message = "Secret_token and name should be specified."
+            message = "agent_auth and name should be specified."
             logger.exception(message)
             raise RuntimeError(message)
         if "job_func" not in self.func_dict:
@@ -1642,8 +1646,8 @@ class AgentInterface:
                 message = "Agent's name should be set in config function"
                 logger.exception(message)
                 raise RuntimeError(message)
-            if self.secret_token == "":
-                message = "Agent's secret_token should be set in config function"
+            if self.agent_auth == "":
+                message = "Agent's agent_auth should be set in config function"
                 logger.exception(message)
                 raise RuntimeError(message)
         config_dict = dict[str, Any]()
@@ -1771,7 +1775,7 @@ class DummyJob(Mapping[str, Any]):
     ) -> None:
         class DummyAgentInterface:
             def __init__(self):
-                self.secret_token = config["secret_token"]
+                self.agent_auth = config["agent_auth"]
 
         class DummyAgent:
             def __init__(self):
@@ -1846,7 +1850,7 @@ class Job(Mapping[str, Any]):
             AgentHTTPError: If the broker responds with a non-200 HTTP status.
             AgentResponseError: If the broker responds with malformed JSON.
             AgentUploadError: If file/image data in `result` cannot be uploaded,
-                including broker-side storage-capacity rejections.
+                including API storage-capacity rejections.
         """
         payload: JsonDict = dict(
             negotiation_id=self._negotiation_id, status=self._status
@@ -2061,7 +2065,7 @@ class Agent:
         if self.running:
             return
         self.interface.prepare(self.agent_funcs)
-        self.auth = self.interface.secret_token
+        self.auth = self.interface.agent_auth
         self.polling_interval = 0
         self.last_heartbeat = time.perf_counter()
         if self.register_config():
@@ -3164,7 +3168,7 @@ class Agent:
         """Decorator for the configuration builder.
 
         Optional: You may omit this if you set `agent.name` and
-        `agent.secret_token` programmatically before running the agent.
+        `agent.agent_auth` programmatically before running the agent.
         """
 
         @functools.wraps(func)
@@ -3265,14 +3269,27 @@ class Agent:
 
     @classmethod
     def add_config(
-        cls, broker_url: str | None = None, secret_token: str | None = None
+        cls,
+        broker_url: str | None = None,
+        agent_auth: str | None = None,
+        secret_token: str | None = None,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]:
-        """Decorator to inject broker_url/secret_token into a job func."""
+        """Decorator to inject broker_url/agent_auth into a job func."""
         config_dict = dict[str, str]()
         if broker_url is not None:
             config_dict["broker_url"] = broker_url
-        if secret_token is not None:
-            config_dict["secret_token"] = secret_token
+        if (
+            agent_auth is not None
+            and secret_token is not None
+            and agent_auth != secret_token
+        ):
+            raise ValueError(
+                "agent_auth and secret_token must match when both are provided"
+            )
+        if agent_auth is not None:
+            config_dict["agent_auth"] = agent_auth
+        elif secret_token is not None:
+            config_dict["agent_auth"] = secret_token
 
         def add_config_func(func: Callable[P, R]) -> Callable[P, R]:
             @functools.wraps(func)
@@ -3306,13 +3323,22 @@ class Agent:
         return self.interface.condition
 
     @property
+    def agent_auth(self):
+        """Credential string `<agent_id>:<agent_secret>` used for `/api/v1/agent/*` requests."""
+        return self.interface.agent_auth
+
+    @agent_auth.setter
+    def agent_auth(self, auth: str):
+        self.interface.agent_auth = auth
+
+    @property
     def secret_token(self):
-        """Agent secret token used for broker authentication."""
-        return self.interface.secret_token
+        """Deprecated alias for `agent_auth`."""
+        return self.interface.agent_auth
 
     @secret_token.setter
     def secret_token(self, token: str):
-        self.interface.secret_token = token
+        self.interface.agent_auth = token
 
     @property
     def name(self):
@@ -3463,7 +3489,7 @@ class AgentConstructor:
                 input_params,
                 {
                     "broker_url": self.config["broker_url"],
-                    "secret_token": self.config["secret_token"],
+                    "agent_auth": self.config["agent_auth"],
                 },
             )
         result = self.job_func(**input_params)
@@ -3653,17 +3679,48 @@ class AgentConstructor:
             raise exc
 
     def fill_config(self) -> None:
-        """Fill required top-level config values (broker_url, secret_token, etc.)."""
+        """Fill required top-level config values (broker_url, agent_auth, etc.)."""
         broker_url = self.fill_config_item("broker_url")
         if not broker_url.startswith("http"):
             raise ValueError("broker_url should be properly specified.")
-        secret_token = self.fill_config_item("secret_token")
-        if len(secret_token) == 0:
-            raise ValueError("secret_token should be set")
+        agent_auth = self.fill_agent_auth_item()
+        if len(agent_auth) == 0:
+            raise ValueError("agent_auth should be set")
         charge = self.fill_config_item("charge", int)
         if charge <= 0:
             raise ValueError("charge should be larger than 0")
         _ = self.fill_config_item("description")
+
+    def fill_agent_auth_item(self) -> str:
+        """Fill `agent_auth`."""
+        if "agent_auth" in self.config:
+            value = str(self.config["agent_auth"])
+        elif "secret_token" in self.config:
+            value = str(self.config["secret_token"])
+            self.config_changed = True
+        elif hasattr(self.job_func, "_additional_config") and "agent_auth" in getattr(
+            self.job_func, "_additional_config"
+        ):
+            value = str(getattr(self.job_func, "_additional_config")["agent_auth"])
+            self.config_changed = True
+        elif hasattr(self.job_func, "_additional_config") and "secret_token" in getattr(
+            self.job_func, "_additional_config"
+        ):
+            value = str(getattr(self.job_func, "_additional_config")["secret_token"])
+            self.config_changed = True
+        elif "agent_auth" in self.kwargs:
+            value = str(self.kwargs["agent_auth"])
+            self.config_changed = True
+        elif "secret_token" in self.kwargs:
+            value = str(self.kwargs["secret_token"])
+            self.config_changed = True
+        else:
+            value = input("agent_auth:")
+            self.config_changed = True
+
+        self.config.pop("secret_token", None)
+        self.config["agent_auth"] = value
+        return value
 
     def fill_config_item(self, key: str, astype: type = str) -> Any:
         """Read a config item from decorator, kwargs, or user input."""
@@ -3685,9 +3742,10 @@ class AgentConstructor:
     def make_config_func(self) -> None:
         """Apply loaded config values to the Agent instance."""
         assert self.agent is not None, "Agent has not been properly prepared."
-        keys = ["name", "secret_token", "charge", "description"]
+        keys = ["name", "charge", "description"]
         for key in keys:
             setattr(self.agent, key, self.config[key])
+        self.agent.agent_auth = str(self.config["agent_auth"])
 
         item_types = ["input", "output", "condition"]
         for item_type in item_types:
@@ -3731,10 +3789,10 @@ class AgentConstructor:
 
 
 class Broker:
-    """Client for the broker-side API used by end users.
+    """Client for `/api/v1/client/*`.
 
     `/api/v1/client/board` mirrors `/api/v1/broker/board` payloads but accepts
-    either agent secret (Basic <agent_id>:<secret>) or user tokens.
+    either `agent_auth` (`"<agent_id>:<agent_secret>"`) or user tokens.
     """
 
     def __init__(
@@ -3743,13 +3801,25 @@ class Broker:
         broker_url: str | None = None,
         auth: str | None = None,
     ) -> None:
+        """Create a client for `/api/v1/client/*`.
+
+        Args:
+            job: Existing Job wrapper; uses the agent's configured `agent_auth`.
+            broker_url: Base URL used for `/api/v1/client/*`.
+            auth: Credential string for the client API. Accepted values:
+                - bare user token string
+                - bare ephemeral token string
+                - `"<agent_id>:<agent_secret>"` `agent_auth` string
+
+                Do not prefix token values with `"Token "`.
+        """
         if job is None:
             assert broker_url is not None and auth is not None
             self.broker_url = broker_url
             self.auth = auth
         elif isinstance(job, Job) or hasattr(job, "_to_show_i_am_job_class"):
             self.broker_url = job._agent.broker_url
-            self.auth = job._agent.interface.secret_token
+            self.auth = job._agent.interface.agent_auth
         else:
             raise TypeError
 
@@ -3774,7 +3844,7 @@ class Broker:
             Result payload once the job finishes.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerUploadError: If the broker rejects an input file upload.
             BrokerResponseError: If the response payload is malformed or indicates error
@@ -3820,7 +3890,7 @@ class Broker:
             Negotiation response payload including `negotiation_id`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerUploadError: If the broker rejects an input file upload.
             BrokerResponseError: If the response payload is malformed or indicates error.
@@ -3867,7 +3937,7 @@ class Broker:
             Response payload including `negotiation_id` and `content`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -3889,7 +3959,7 @@ class Broker:
             Contract response payload.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -3907,7 +3977,7 @@ class Broker:
             Final result payload when status reaches done.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -3937,7 +4007,7 @@ class Broker:
             Board payload with `agents`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -3978,7 +4048,7 @@ class Broker:
         """POST to the client API and return JSON.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -3988,7 +4058,7 @@ class Broker:
         """GET from the client API and return JSON.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -3998,7 +4068,7 @@ class Broker:
         """Download a file from the client API and return a raw Response.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
         """
         started_at = time.perf_counter()
@@ -4080,7 +4150,7 @@ class Broker:
             Broker file id string suitable for `file` / `image` request fields.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerUploadError: If the broker rejects the upload payload.
             BrokerResponseError: If the broker returns malformed JSON.
@@ -4354,12 +4424,19 @@ class Broker:
 
 
 class BrokerAdmin:
-    """Client for broker automation endpoints (/api/v1/broker).
+    """Client for `/api/v1/broker/*`.
 
-    These endpoints accept user tokens only (agent secrets are rejected).
+    These endpoints accept user tokens only. `agent_auth` strings and
+    ephemeral tokens are rejected.
     """
 
     def __init__(self, broker_url: str, token: str) -> None:
+        """Create a client for `/api/v1/broker/*`.
+
+        Args:
+            broker_url: Base URL used for `/api/v1/broker/*`.
+            token: Bare user token string. Do not include `"Token "`.
+        """
         self.broker_url = broker_url
         self.token = token
 
@@ -4538,7 +4615,7 @@ class BrokerAdmin:
             Board payload with `agents`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4561,7 +4638,7 @@ class BrokerAdmin:
             Results payload with `contracts`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4577,7 +4654,7 @@ class BrokerAdmin:
             Payload with `agents`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4601,7 +4678,7 @@ class BrokerAdmin:
             Payload with `agent`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4631,7 +4708,7 @@ class BrokerAdmin:
             Payload with `agent`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4661,7 +4738,7 @@ class BrokerAdmin:
             Payload with `agent`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4684,7 +4761,7 @@ class BrokerAdmin:
             Payload with `status`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4703,7 +4780,7 @@ class BrokerAdmin:
             Python source code template.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
         """
         path = (
@@ -4722,7 +4799,7 @@ class BrokerAdmin:
             Payload with `tokens`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4740,7 +4817,7 @@ class BrokerAdmin:
             Payload with `token`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4758,7 +4835,7 @@ class BrokerAdmin:
             Payload with `status`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4774,7 +4851,7 @@ class BrokerAdmin:
             Payload with `user`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4795,7 +4872,7 @@ class BrokerAdmin:
             Payload with `user`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4817,7 +4894,7 @@ class BrokerAdmin:
             Payload with `user`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4838,7 +4915,7 @@ class BrokerAdmin:
             Payload with `users`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4856,7 +4933,7 @@ class BrokerAdmin:
             Payload with `user`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4875,7 +4952,7 @@ class BrokerAdmin:
             Payload with `user`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4893,7 +4970,7 @@ class BrokerAdmin:
             Payload with `status`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """
@@ -4911,7 +4988,7 @@ class BrokerAdmin:
             Payload with `user`.
 
         Raises:
-            BrokerConnectionError: If the broker server cannot be reached.
+            BrokerConnectionError: If the broker URL cannot be reached.
             BrokerHTTPError: If the server returns a non-200 response.
             BrokerResponseError: If the response payload is malformed or indicates error.
         """

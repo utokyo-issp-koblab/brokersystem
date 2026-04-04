@@ -5,8 +5,7 @@ and can be rendered by the broker UI during negotiation.
 
 Run:
   export BROKER_URL="http://..."
-  export AGENT_ID="..."
-  export AGENT_SECRET="..."
+  export AGENT_AUTH="<agent_id>:<agent_secret>"
   python examples/vega_ui_preview.py
 
 Notes:
@@ -28,6 +27,15 @@ def require_env(key: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required env var: {key}")
     return value
+
+
+def require_agent_auth() -> str:
+    agent_auth = os.environ.get("AGENT_AUTH")
+    if agent_auth:
+        return agent_auth
+    agent_id = require_env("AGENT_ID")
+    agent_secret = require_env("AGENT_SECRET")
+    return f"{agent_id}:{agent_secret}"
 
 
 VEGA_SPEC: JsonDict = {
@@ -353,15 +361,14 @@ VEGA_SPEC: JsonDict = {
 
 def build_agent() -> Agent:
     broker_url = require_env("BROKER_URL")
-    agent_id = require_env("AGENT_ID")
-    agent_secret = require_env("AGENT_SECRET")
+    agent_auth = require_agent_auth()
 
     agent = Agent(broker_url)
 
     @agent.config
     def make_config() -> None:
         agent.name = "vega-ui-preview-agent"
-        agent.secret_token = f"{agent_id}:{agent_secret}"
+        agent.agent_auth = agent_auth
         agent.description = "Example agent that includes a Vega UI preview spec"
         agent.charge = 1
 

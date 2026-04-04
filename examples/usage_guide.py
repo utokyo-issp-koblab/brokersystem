@@ -1,35 +1,22 @@
 """Recommended usage patterns for brokersystem.
 
 Configure via env vars:
-- BROKER_URL: base URL of your broker server
-- BROKER_TOKEN: broker access token (client API + broker admin API)
-- AGENT_ID / AGENT_SECRET: agent credentials (agent API)
+- BROKER_URL: base URL used by Agent, Broker, and BrokerAdmin
+- BROKER_TOKEN: bare user token string for Broker/BrokerAdmin
+- AGENT_AUTH: full `agent_auth` string "<agent_id>:<agent_secret>" for Agent/Broker
 
 Notes:
 - `/api/v1/client/board` and `/api/v1/broker/board` return the same payload.
-- Broker (client API) accepts agent secret or user token.
-- BrokerAdmin (broker API) accepts user token only.
+- `Broker(auth=...)` accepts either a bare user token or an `AGENT_AUTH` string.
+- `BrokerAdmin(token=...)` accepts a bare user token only.
 
 Run examples:
-  BROKER_URL=https://... AGENT_ID=... AGENT_SECRET=... \
+  BROKER_URL=https://... AGENT_AUTH='<agent_id>:<agent_secret>' \
     python examples/usage_guide.py agent [--enable-upload]
   BROKER_URL=https://... BROKER_TOKEN=... \
     python examples/usage_guide.py client --agent-id <agent_id> [--step-by-step]
   BROKER_URL=https://... BROKER_TOKEN=... \
     python examples/usage_guide.py admin [--deposit-user] [--delete-user]
-
-Relay examples:
-  BROKER_URL=https://... AGENT_ID=... AGENT_SECRET=... \
-    python examples/relay_large_file.py agent
-  BROKER_URL=https://... BROKER_TOKEN=... \
-    python examples/relay_large_file.py client --agent-id <agent_id>
-  BROKER_URL=https://... AGENT_ID=... AGENT_SECRET=... \
-    python examples/relay_segmented_video.py agent
-  BROKER_URL=https://... BROKER_TOKEN=... \
-    python examples/relay_segmented_video.py client --agent-id <agent_id>
-
-The relay examples generate their own demo assets, so you do not need to
-prepare sample files manually.
 """
 
 from __future__ import annotations
@@ -69,18 +56,26 @@ def require_env(key: str) -> str:
     return value
 
 
+def require_agent_auth() -> str:
+    agent_auth = os.environ.get("AGENT_AUTH")
+    if agent_auth:
+        return agent_auth
+    agent_id = require_env("AGENT_ID")
+    agent_secret = require_env("AGENT_SECRET")
+    return f"{agent_id}:{agent_secret}"
+
+
 def build_agent(enable_upload: bool) -> Agent:
     """Create an Agent with config, negotiation, and job handlers."""
     broker_url = require_env("BROKER_URL")
-    agent_id = require_env("AGENT_ID")
-    agent_secret = require_env("AGENT_SECRET")
+    agent_auth = require_agent_auth()
 
     agent = Agent(broker_url)
 
     @agent.config
     def make_config() -> None:
         agent.name = "example-agent"
-        agent.secret_token = f"{agent_id}:{agent_secret}"
+        agent.agent_auth = agent_auth
         agent.description = "Example agent showing input/output templates"
         agent.charge = 100
         # Only request user info when necessary (e.g., for validation/decision logic).
@@ -393,7 +388,7 @@ def main() -> int:
             run_admin(args.deposit_user, args.delete_user)
     except (RuntimeError, BrokerError, AgentError) as exc:
         print(exc)
-        print("Set BROKER_URL, BROKER_TOKEN, AGENT_ID, AGENT_SECRET as needed.")
+        print("Set BROKER_URL, BROKER_TOKEN, and AGENT_AUTH as needed.")
         return 1
 
     return 0

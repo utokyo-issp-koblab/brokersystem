@@ -6,7 +6,7 @@ This is an UNOFFICIAL fork of [brokersystem · PyPI](https://pypi.org/project/br
 
 # Broker System
 
-Python module for connecting to a broker server as an agent. The broker server must have the following REST interfaces.
+Python module for connecting to the Broker System APIs. The service must expose the following REST interfaces.
 
 - /api/v1/agent/msgbox
 

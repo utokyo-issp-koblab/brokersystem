@@ -255,3 +255,22 @@ def test_agent_ui_preview_rejects_non_mapping() -> None:
     agent = Agent("https://example.test")
     with pytest.raises(TypeError):
         agent.ui_preview = cast(Any, 123)
+
+
+def test_agent_auth_alias_round_trips_with_legacy_secret_token() -> None:
+    agent = Agent("https://example.test")
+
+    agent.agent_auth = "agent-1:secret-1"
+    assert agent.secret_token == "agent-1:secret-1"
+
+    agent.secret_token = "agent-2:secret-2"
+    assert agent.agent_auth == "agent-2:secret-2"
+
+
+def test_add_config_rejects_mismatched_agent_auth_aliases() -> None:
+    with pytest.raises(ValueError):
+        Agent.add_config(
+            broker_url="https://example.test",
+            agent_auth="agent-1:secret-1",
+            secret_token="agent-1:secret-2",
+        )

@@ -4,7 +4,7 @@ This example keeps the artifact on the agent host and lets the broker relay it
 to a client without permanently storing the bytes on the broker.
 
 Run:
-  BROKER_URL=https://... AGENT_ID=... AGENT_SECRET=... \
+  BROKER_URL=https://... AGENT_AUTH='<agent_id>:<agent_secret>' \
     python examples/relay_large_file.py agent [--file /path/to/archive.zip]
 
   BROKER_URL=https://... BROKER_TOKEN=... \
@@ -32,6 +32,15 @@ def require_env(key: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required env var: {key}")
     return value
+
+
+def require_agent_auth() -> str:
+    agent_auth = os.environ.get("AGENT_AUTH")
+    if agent_auth:
+        return agent_auth
+    agent_id = require_env("AGENT_ID")
+    agent_secret = require_env("AGENT_SECRET")
+    return f"{agent_id}:{agent_secret}"
 
 
 def create_demo_large_file(path: Path, size_mib: int) -> Path:
@@ -78,15 +87,14 @@ def require_result_str(value: object, *, field: str) -> str:
 
 def build_agent(file_path: Path) -> Agent:
     broker_url = require_env("BROKER_URL")
-    agent_id = require_env("AGENT_ID")
-    agent_secret = require_env("AGENT_SECRET")
+    agent_auth = require_agent_auth()
 
     agent = Agent(broker_url)
 
     @agent.config
     def make_config() -> None:
         agent.name = "relay-large-file-example"
-        agent.secret_token = f"{agent_id}:{agent_secret}"
+        agent.agent_auth = agent_auth
         agent.description = "Streams a large local file through the broker relay path."
         agent.charge = 1
         agent.output.archive = RelayFile(
