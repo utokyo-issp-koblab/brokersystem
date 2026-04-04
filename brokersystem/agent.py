@@ -418,15 +418,20 @@ def _ensure_response_dict(payload: object, context: str) -> JsonDict:
     if not payload:
         _raise_malformed_response(context, "returned an empty payload", payload)
     if payload.get("status") == "error":
-        detail = payload.get("error_msg") or payload.get("error")
+        code = payload.get("error")
+        detail = payload.get("error_msg") or code
         if detail is None:
             _raise_malformed_response(
                 context,
                 "status=error payload must include error_msg or error",
                 payload,
             )
+        if code and payload.get("error_msg"):
+            message = f"{context} failed [{code}]: {detail}"
+        else:
+            message = f"{context} failed: {detail}"
         raise BrokerResponseError(
-            f"{context} failed: {detail}",
+            message,
             payload=payload,
         )
     if "error_msg" in payload:

@@ -518,6 +518,27 @@ def test_broker_board_uses_error_code_when_error_msg_is_missing() -> None:
 
 
 @responses.activate
+def test_broker_board_includes_error_code_when_error_msg_exists() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.GET,
+        f"{BROKER_URL}/api/v1/client/board",
+        json={
+            "status": "error",
+            "error": "agent_unresponsive",
+            "error_msg": "The agent did not respond.",
+        },
+        status=200,
+    )
+
+    with pytest.raises(
+        BrokerResponseError,
+        match=r"GET board failed \[agent_unresponsive\]: The agent did not respond.",
+    ):
+        broker.board()
+
+
+@responses.activate
 def test_broker_admin_agents_and_tokens() -> None:
     admin = BrokerAdmin(BROKER_URL, token="user-token")
     responses.add(
