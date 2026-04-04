@@ -5,7 +5,7 @@ and can be rendered by the broker UI during negotiation.
 
 Run:
   export BROKER_URL="http://..."
-  export AGENT_AUTH="<agent_id>:<agent_secret>"
+  export AGENT_AUTH="<agent_auth>"
   python examples/vega_ui_preview.py
 
 Notes:
@@ -30,12 +30,7 @@ def require_env(key: str) -> str:
 
 
 def require_agent_auth() -> str:
-    agent_auth = os.environ.get("AGENT_AUTH")
-    if agent_auth:
-        return agent_auth
-    agent_id = require_env("AGENT_ID")
-    agent_secret = require_env("AGENT_SECRET")
-    return f"{agent_id}:{agent_secret}"
+    return require_env("AGENT_AUTH")
 
 
 VEGA_SPEC: JsonDict = {

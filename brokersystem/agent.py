@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
 from os import PathLike
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import ModuleType
 from typing import (
     Any,
@@ -40,10 +40,60 @@ from . import __version__
 JsonDict = dict[str, Any]
 JsonPayload = dict[str, Any]
 BinaryData = bytes | bytearray | memoryview
-RelayRegistrar = Callable[[PathLike[str] | str, str | None, str | None], JsonDict]
 AgentFactory = Callable[[Callable[..., JsonDict | None]], Callable[..., "Agent"]]
 P = ParamSpec("P")
 R = TypeVar("R")
+
+
+@dataclass
+class RelayStreamSource:
+    """Generic broker-relayed byte stream source.
+
+    The `open_chunks` callback should return an iterable of byte chunks. The
+    callback receives a cancellation event that becomes set when the broker or
+    client closes the relay stream.
+    """
+
+    open_chunks: Callable[[threading.Event], Iterable[bytes]]
+
+
+@dataclass
+class RelaySessionSource:
+    """Generic broker-relayed text session source.
+
+    `open_session` is called when a client opens the relay session. The
+    callback receives:
+
+    - `cancel_event`: set when the broker or client closes the session
+    - `emit_text(text)`: send text output to the client
+    - `close_session()`: close the session cleanly
+
+    The callback should return a handler for inbound client text. The returned
+    handler receives each text payload sent by the client.
+    """
+
+    open_session: Callable[
+        [threading.Event, Callable[[str], None], Callable[[], None]],
+        Callable[[str], None] | None,
+    ]
+
+
+@dataclass
+class RelayAssetSource:
+    """Generic broker-relayed asset tree rooted on the agent host.
+
+    Use this when one logical relay handle needs multiple files under one root
+    directory, for example an HLS playlist plus media segments.
+    """
+
+    root_dir: PathLike[str] | str
+    entry_path: str
+
+
+RelaySourceValue = (
+    PathLike[str] | str | RelayStreamSource | RelaySessionSource | RelayAssetSource
+)
+RelayRegistrar = Callable[[RelaySourceValue, str | None, str | None], JsonDict]
 
 ResultValue = str | int | float | bool | None | list[Any] | dict[str, Any]
 NegotiationStatus = Literal["ok", "need_revision", "ng"]
@@ -171,6 +221,201 @@ RelayFileValue = TypedDict(
         "availability": str,
     },
 )
+
+
+RelayMediaValue = TypedDict(
+    "RelayMediaValue",
+    {
+        "$brokersystem": dict[str, str | int],
+        "source_id": str,
+        "runtime_instance_id": str,
+        "name": str,
+        "size_bytes": int,
+        "content_type": str,
+        "availability": str,
+        "live": bool,
+        "playback_uri": str,
+        "download_uri": str,
+    },
+    total=False,
+)
+
+
+RelaySessionValue = TypedDict(
+    "RelaySessionValue",
+    {
+        "$brokersystem": dict[str, str | int],
+        "source_id": str,
+        "runtime_instance_id": str,
+        "name": str,
+        "protocol": str,
+        "availability": str,
+        "session_uri": str,
+    },
+)
+
+
+@dataclass(frozen=True)
+class RelayFileHandle:
+    """Parsed relay-file handle returned by the client API."""
+
+    uri: str
+    name: str
+    size_bytes: int
+    content_type: str
+    availability: str
+
+
+@dataclass(frozen=True)
+class RelayMediaHandle:
+    """Parsed relay-media handle returned by the client API."""
+
+    playback_uri: str
+    download_uri: str | None
+    name: str
+    size_bytes: int
+    content_type: str
+    availability: str
+    live: bool
+
+
+@dataclass(frozen=True)
+class RelaySessionHandle:
+    """Parsed relay-session handle returned by the client API."""
+
+    session_uri: str
+    name: str
+    protocol: str
+    availability: str
+
+
+@dataclass
+class RelaySessionEvent:
+    """One event received from a relay-session connection."""
+
+    type: str
+    text: str | None = None
+    code: str | None = None
+    message: str | None = None
+
+
+class RelaySessionConnection:
+    """Bidirectional text session opened from a relay-session handle."""
+
+    def __init__(self, ws: websocket.WebSocket) -> None:
+        self._ws = ws
+        self._closed = False
+        self._socket_closed = False
+
+    def close(self) -> None:
+        """Close the underlying session socket."""
+        if self._socket_closed:
+            return
+        self._closed = True
+        self._socket_closed = True
+        self._ws.close()
+
+    def __enter__(self) -> "RelaySessionConnection":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        _ = (exc_type, exc, tb)
+        self.close()
+
+    def send_text(self, text: str) -> None:
+        """Send one text payload to the relay session."""
+        if self._closed:
+            raise BrokerConnectionError("Relay session is already closed.")
+        self._ws.send(json.dumps({"type": "input", "text": text}))
+
+    def recv_event(self, timeout: float | None = None) -> RelaySessionEvent:
+        """Receive one relay-session event."""
+        if self._closed:
+            raise BrokerConnectionError("Relay session is already closed.")
+        previous_timeout = self._ws.gettimeout()
+        if timeout is not None:
+            self._ws.settimeout(timeout)
+        try:
+            payload = self._ws.recv()
+        except websocket.WebSocketTimeoutException as exc:
+            raise TimeoutError("Timed out waiting for relay session event.") from exc
+        except websocket.WebSocketConnectionClosedException as exc:
+            self._closed = True
+            raise BrokerConnectionError("Relay session closed unexpectedly.") from exc
+        finally:
+            if timeout is not None:
+                self._ws.settimeout(previous_timeout)
+
+        if not isinstance(payload, str):
+            raise BrokerResponseError(
+                "Relay session received a non-text websocket frame.",
+                payload=payload,
+            )
+
+        try:
+            message = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise BrokerResponseError(
+                "Relay session received invalid JSON.",
+                payload=payload,
+            ) from exc
+
+        if not isinstance(message, dict):
+            raise BrokerResponseError(
+                "Relay session received a non-object event.",
+                payload=message,
+            )
+
+        event_type = message.get("type")
+        if not isinstance(event_type, str):
+            raise BrokerResponseError(
+                "Relay session event is missing a string 'type'.",
+                payload=message,
+            )
+
+        text = message.get("text")
+        code = message.get("code")
+        detail = message.get("message")
+
+        if text is not None and not isinstance(text, str):
+            raise BrokerResponseError(
+                "Relay session event field 'text' must be a string.",
+                payload=message,
+            )
+        if code is not None and not isinstance(code, str):
+            raise BrokerResponseError(
+                "Relay session event field 'code' must be a string.",
+                payload=message,
+            )
+        if detail is not None and not isinstance(detail, str):
+            raise BrokerResponseError(
+                "Relay session event field 'message' must be a string.",
+                payload=message,
+            )
+
+        if event_type in {"eof", "error"}:
+            self._closed = True
+
+        return RelaySessionEvent(type=event_type, text=text, code=code, message=detail)
+
+    def recv_text(self, timeout: float | None = None) -> str | None:
+        """Receive the next output text, returning None on EOF."""
+        while True:
+            event = self.recv_event(timeout=timeout)
+            if event.type == "ready":
+                continue
+            if event.type == "output":
+                return event.text or ""
+            if event.type == "eof":
+                return None
+            if event.type == "error":
+                raise BrokerResponseError(
+                    f"Relay session failed [{event.code or 'relay_error'}]: {event.message or 'Unknown error.'}"
+                )
+            raise BrokerResponseError(
+                f"Relay session received unknown event type: {event.type!r}",
+                payload=event,
+            )
 
 
 class BoardResponse(TypedDict):
@@ -650,6 +895,91 @@ def _require_bool(payload: Mapping[str, object], key: str, context: str) -> bool
             context, f"field '{key}' is not a bool: {value!r}", payload
         )
     return value
+
+
+def _require_optional_str(
+    payload: Mapping[str, object], key: str, context: str
+) -> str | None:
+    value = _require_key(payload, key, context)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        _raise_malformed_response(
+            context, f"field '{key}' is not a string or null: {value!r}", payload
+        )
+    return value
+
+
+def _get_optional_str(
+    payload: Mapping[str, object], key: str, context: str
+) -> str | None:
+    if key not in payload:
+        return None
+    return _require_optional_str(payload, key, context)
+
+
+def _parse_relay_file_handle(
+    value: Mapping[str, object], *, context: str
+) -> RelayFileHandle:
+    relay_value = _require_object_mapping(value, context)
+    relay_tag = _require_mapping(relay_value, "$brokersystem", context)
+    relay_kind = _require_str(relay_tag, "kind", f"{context}.$brokersystem")
+    if relay_kind != "relay_file":
+        _raise_malformed_response(
+            context,
+            f"expected relay_file metadata but got kind={relay_kind!r}",
+            relay_value,
+        )
+    return RelayFileHandle(
+        uri=_require_str(relay_value, "uri", context),
+        name=_require_str(relay_value, "name", context),
+        size_bytes=_require_int(relay_value, "size_bytes", context),
+        content_type=_require_str(relay_value, "content_type", context),
+        availability=_require_str(relay_value, "availability", context),
+    )
+
+
+def _parse_relay_media_handle(
+    value: Mapping[str, object], *, context: str
+) -> RelayMediaHandle:
+    relay_value = _require_object_mapping(value, context)
+    relay_tag = _require_mapping(relay_value, "$brokersystem", context)
+    relay_kind = _require_str(relay_tag, "kind", f"{context}.$brokersystem")
+    if relay_kind != "relay_media":
+        _raise_malformed_response(
+            context,
+            f"expected relay_media metadata but got kind={relay_kind!r}",
+            relay_value,
+        )
+    return RelayMediaHandle(
+        playback_uri=_require_str(relay_value, "playback_uri", context),
+        download_uri=_get_optional_str(relay_value, "download_uri", context),
+        name=_require_str(relay_value, "name", context),
+        size_bytes=_require_int(relay_value, "size_bytes", context),
+        content_type=_require_str(relay_value, "content_type", context),
+        availability=_require_str(relay_value, "availability", context),
+        live=_require_bool(relay_value, "live", context),
+    )
+
+
+def _parse_relay_session_handle(
+    value: Mapping[str, object], *, context: str
+) -> RelaySessionHandle:
+    relay_value = _require_object_mapping(value, context)
+    relay_tag = _require_mapping(relay_value, "$brokersystem", context)
+    relay_kind = _require_str(relay_tag, "kind", f"{context}.$brokersystem")
+    if relay_kind != "relay_session":
+        _raise_malformed_response(
+            context,
+            f"expected relay_session metadata but got kind={relay_kind!r}",
+            relay_value,
+        )
+    return RelaySessionHandle(
+        session_uri=_require_str(relay_value, "session_uri", context),
+        name=_require_str(relay_value, "name", context),
+        protocol=_require_str(relay_value, "protocol", context),
+        availability=_require_str(relay_value, "availability", context),
+    )
 
 
 def _is_local_file_value(value: object) -> bool:
@@ -1149,6 +1479,10 @@ class ValueTemplate:
                 template = Table(unit_dict=unit_dict, graph=graph)
             case "relay_file":
                 template = RelayFile()
+            case "relay_media":
+                template = RelayMedia()
+            case "relay_session":
+                template = RelaySession()
             case _ as unknown_type:
                 raise NotImplementedError(f"Unknown type: {unknown_type}")
         if "@constraints" in format_dict:
@@ -1396,6 +1730,106 @@ class RelayFile(ValueTemplate):
         return metadata, self.format_dict
 
 
+class RelayMedia(ValueTemplate):
+    """Relay-backed media template for playable stored or live media."""
+
+    def __init__(
+        self,
+        name: str | None = None,
+        content_type: str | None = None,
+        live: bool = False,
+        help: str | None = None,
+    ) -> None:
+        super().__init__(help=help)
+        self.type = "relay_media"
+        self.name = name
+        self.content_type = content_type
+        self.live = live
+
+    def format_for_output(
+        self,
+        value: PathLike[str] | str | RelayStreamSource | RelayAssetSource,
+        uploader: Callable[[str, bytes], JsonDict],
+        relay_registrar: RelayRegistrar | None = None,
+    ) -> tuple[Any, JsonDict]:
+        """Register a relay media source and return tagged media metadata."""
+        if relay_registrar is None:
+            raise RuntimeError("Relay registrar is required for RelayMedia outputs")
+
+        if self.live and isinstance(value, (RelayStreamSource, RelayAssetSource)):
+            metadata = relay_registrar(value, self.name, self.content_type)
+        else:
+            try:
+                path_value = cast(PathLike[str] | str, value)
+                path = Path(path_value)
+            except Exception as exc:
+                raise TypeError(
+                    "a RelayMedia value must be a file path, RelayStreamSource,"
+                    " or RelayAssetSource"
+                    f" but got: {value} (type: {type(value)}); {exc}"
+                ) from exc
+
+            metadata = relay_registrar(path, self.name, self.content_type)
+        if not isinstance(metadata, dict):
+            raise RuntimeError(
+                f"Relay registration returned invalid metadata: {metadata!r}"
+            )
+
+        tagged_metadata = dict(metadata)
+        relay_tag = tagged_metadata.get("$brokersystem")
+        if isinstance(relay_tag, dict):
+            relay_tag = dict(relay_tag)
+            relay_tag["kind"] = "relay_media"
+            tagged_metadata["$brokersystem"] = relay_tag
+        tagged_metadata["live"] = self.live
+        return tagged_metadata, self.format_dict
+
+
+class RelaySession(ValueTemplate):
+    """Relay-backed text session template for interactive outputs."""
+
+    def __init__(
+        self,
+        name: str | None = None,
+        protocol: str = "text",
+        help: str | None = None,
+    ) -> None:
+        super().__init__(help=help)
+        self.type = "relay_session"
+        self.name = name
+        self.protocol = protocol
+
+    def format_for_output(
+        self,
+        value: RelaySessionSource,
+        uploader: Callable[[str, bytes], JsonDict],
+        relay_registrar: RelayRegistrar | None = None,
+    ) -> tuple[Any, JsonDict]:
+        """Register a relay text session and return tagged session metadata."""
+        _ = uploader
+        if relay_registrar is None:
+            raise RuntimeError("Relay registrar is required for RelaySession outputs")
+        if not isinstance(value, RelaySessionSource):
+            raise TypeError(
+                "a RelaySession value must be a RelaySessionSource "
+                f"but got: {value} (type: {type(value)})"
+            )
+        metadata = relay_registrar(value, self.name, self.protocol)
+        if not isinstance(metadata, dict):
+            raise RuntimeError(
+                f"Relay registration returned invalid metadata: {metadata!r}"
+            )
+
+        tagged_metadata = dict(metadata)
+        relay_tag = tagged_metadata.get("$brokersystem")
+        if isinstance(relay_tag, dict):
+            relay_tag = dict(relay_tag)
+            relay_tag["kind"] = "relay_session"
+            tagged_metadata["$brokersystem"] = relay_tag
+        tagged_metadata["protocol"] = self.protocol
+        return tagged_metadata, self.format_dict
+
+
 class Choice(ValueTemplate):
     """Choice template with a fixed list of valid values."""
 
@@ -1611,7 +2045,7 @@ class AgentInterface:
 
     def __init__(self) -> None:
         self.agent_auth: str = ""
-        """Credential string `<agent_id>:<agent_secret>` used by `Agent` for `/api/v1/agent/*` requests."""
+        """`agent_auth` credential string used by `Agent` for `/api/v1/agent/*` requests."""
         self.name: str | None = None
         """Display name shown in broker listings."""
         self.charge: int = 10000
@@ -1754,7 +2188,13 @@ class AgentInterface:
                 output_dict["@unit"].update(format_dict["_unit_dict"])
                 output_dict["@type"].update({k: "number" for k in table_keys})
 
-            elif format_dict["@type"] in ["image", "file", "relay_file"]:
+            elif format_dict["@type"] in [
+                "image",
+                "file",
+                "relay_file",
+                "relay_media",
+                "relay_session",
+            ]:
                 if "@file" not in output_dict:
                     output_dict["@file"] = {}
             else:
@@ -1875,7 +2315,7 @@ class Job(Mapping[str, Any]):
                 result, dict
             ), "Result should be given as a dict: {result_key: result_value}"
             payload["result"] = self._agent.interface.format_for_output(
-                result, self._agent.upload, self._agent.register_relay_file
+                result, self._agent.upload, self._agent.register_relay_source
             )
 
         self._agent.post("report", payload)
@@ -2004,6 +2444,48 @@ class _RelayFileSource:
     last_accessed_at: float
 
 
+@dataclass
+class _RelayLiveSource:
+    source_id: str
+    name: str
+    content_type: str
+    created_at: float
+    last_accessed_at: float
+    open_chunks: Callable[[threading.Event], Iterable[bytes]]
+
+
+@dataclass
+class _RelayAssetTreeSource:
+    source_id: str
+    root_dir: Path
+    entry_path: str
+    name: str
+    size_bytes: int
+    content_type: str
+    created_at: float
+    last_accessed_at: float
+
+
+@dataclass
+class _RelaySessionRuntime:
+    stream_id: str
+    cancel_event: threading.Event
+    handle_input: Callable[[str], None] | None
+
+
+@dataclass
+class _RelaySessionRuntimeSource:
+    source_id: str
+    name: str
+    protocol: str
+    created_at: float
+    last_accessed_at: float
+    open_session: Callable[
+        [threading.Event, Callable[[str], None], Callable[[], None]],
+        Callable[[str], None] | None,
+    ]
+
+
 class Agent:
     """Agent runtime that connects to broker and handles negotiation/contract flow."""
 
@@ -2049,10 +2531,18 @@ class Agent:
         self._relay_socket: websocket.WebSocketApp | None = None
         self._relay_socket_lock = threading.Lock()
         self._relay_send_lock = threading.Lock()
-        self._relay_sources: dict[str, _RelayFileSource] = {}
+        self._relay_sources: dict[
+            str,
+            _RelayFileSource
+            | _RelayLiveSource
+            | _RelayAssetTreeSource
+            | _RelaySessionRuntimeSource,
+        ] = {}
         self._relay_sources_lock = threading.Lock()
         self._relay_cancel_events: dict[str, threading.Event] = {}
         self._relay_cancel_events_lock = threading.Lock()
+        self._relay_session_runtimes: dict[str, _RelaySessionRuntime] = {}
+        self._relay_session_runtimes_lock = threading.Lock()
 
     def _increase_polling_interval(self) -> None:
         if self.polling_interval <= 0:
@@ -2297,6 +2787,88 @@ class Agent:
             ).start()
             return
 
+        if msg_type == "serve_live_stream":
+            stream_id = payload.get("stream_id")
+            source_id = payload.get("source_id")
+
+            if not (isinstance(stream_id, str) and isinstance(source_id, str)):
+                logger.warning(
+                    "Ignoring malformed serve_live_stream relay command: %r", payload
+                )
+                return
+
+            cancel_event = threading.Event()
+            with self._relay_cancel_events_lock:
+                self._relay_cancel_events[stream_id] = cancel_event
+
+            threading.Thread(
+                target=self._serve_relay_live_stream,
+                args=(stream_id, source_id, cancel_event),
+                daemon=True,
+                name=f"relay-live-{stream_id[:8]}",
+            ).start()
+            return
+
+        if msg_type == "serve_asset":
+            stream_id = payload.get("stream_id")
+            source_id = payload.get("source_id")
+            asset_path = payload.get("asset_path")
+
+            if not (
+                isinstance(stream_id, str)
+                and isinstance(source_id, str)
+                and isinstance(asset_path, str)
+            ):
+                logger.warning(
+                    "Ignoring malformed serve_asset relay command: %r", payload
+                )
+                return
+
+            cancel_event = threading.Event()
+            with self._relay_cancel_events_lock:
+                self._relay_cancel_events[stream_id] = cancel_event
+
+            threading.Thread(
+                target=self._serve_relay_asset,
+                args=(stream_id, source_id, asset_path, cancel_event),
+                daemon=True,
+                name=f"relay-asset-{stream_id[:8]}",
+            ).start()
+            return
+
+        if msg_type == "open_text_session":
+            stream_id = payload.get("stream_id")
+            source_id = payload.get("source_id")
+
+            if not (isinstance(stream_id, str) and isinstance(source_id, str)):
+                logger.warning(
+                    "Ignoring malformed open_text_session relay command: %r", payload
+                )
+                return
+
+            cancel_event = threading.Event()
+            with self._relay_cancel_events_lock:
+                self._relay_cancel_events[stream_id] = cancel_event
+
+            threading.Thread(
+                target=self._serve_relay_text_session,
+                args=(stream_id, source_id, cancel_event),
+                daemon=True,
+                name=f"relay-session-{stream_id[:8]}",
+            ).start()
+            return
+
+        if msg_type == "session_input":
+            stream_id = payload.get("stream_id")
+            text = payload.get("text")
+            if not (isinstance(stream_id, str) and isinstance(text, str)):
+                logger.warning(
+                    "Ignoring malformed session_input relay command: %r", payload
+                )
+                return
+            self._handle_relay_session_input(stream_id, text)
+            return
+
         if msg_type == "cancel":
             stream_id = payload.get("stream_id")
             if isinstance(stream_id, str):
@@ -2304,9 +2876,37 @@ class Agent:
                     event = self._relay_cancel_events.get(stream_id)
                 if event is not None:
                     event.set()
+                self._clear_relay_session_runtime(stream_id)
             return
 
         logger.warning("Unknown relay control message: %r", payload)
+
+    def register_relay_source(
+        self,
+        value: RelaySourceValue,
+        download_name: str | None,
+        content_type_override: str | None,
+    ) -> JsonDict:
+        """Register a local file or live stream as a broker relay source."""
+        if isinstance(value, RelaySessionSource):
+            return self.register_relay_session(
+                value,
+                download_name,
+                content_type_override,
+            )
+        if isinstance(value, RelayAssetSource):
+            return self.register_relay_assets(
+                value,
+                download_name,
+                content_type_override,
+            )
+        if isinstance(value, RelayStreamSource):
+            return self.register_relay_stream(
+                value,
+                download_name,
+                content_type_override,
+            )
+        return self.register_relay_file(value, download_name, content_type_override)
 
     def register_relay_file(
         self,
@@ -2348,6 +2948,129 @@ class Agent:
             "availability": "agent_online_required",
         }
 
+    def register_relay_stream(
+        self,
+        value: RelayStreamSource,
+        download_name: str | None,
+        content_type_override: str | None,
+    ) -> JsonDict:
+        """Register a live byte stream as a broker relay source."""
+        name = download_name or "relay-stream"
+        content_type = content_type_override or "application/octet-stream"
+        source_id = f"src_{uuid.uuid4()}"
+        now = time.perf_counter()
+        source = _RelayLiveSource(
+            source_id=source_id,
+            name=name,
+            content_type=content_type,
+            created_at=now,
+            last_accessed_at=now,
+            open_chunks=value.open_chunks,
+        )
+        with self._relay_sources_lock:
+            self._relay_sources[source_id] = source
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_file",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": source_id,
+            "runtime_instance_id": self.runtime_instance_id,
+            "name": name,
+            "size_bytes": 0,
+            "content_type": content_type,
+            "availability": "agent_online_required",
+        }
+
+    def register_relay_assets(
+        self,
+        value: RelayAssetSource,
+        download_name: str | None,
+        content_type_override: str | None,
+    ) -> JsonDict:
+        """Register a rooted asset tree as a broker relay source."""
+        root_dir = Path(value.root_dir).expanduser().resolve()
+        if not root_dir.is_dir():
+            raise TypeError(
+                f"a RelayAssetSource root_dir must be an existing directory but got: {root_dir}"
+            )
+
+        entry_path = self._normalize_relay_asset_path(value.entry_path)
+        entry_file = root_dir / Path(*PurePosixPath(entry_path).parts)
+        if not entry_file.is_file():
+            raise TypeError(
+                "a RelayAssetSource entry_path must point to an existing file under"
+                f" root_dir but got: {value.entry_path!r}"
+            )
+
+        name = download_name or entry_file.name
+        content_type = content_type_override or mimetypes.guess_type(entry_file.name)[0]
+        if content_type is None:
+            content_type = "application/octet-stream"
+        source_id = f"src_{uuid.uuid4()}"
+        now = time.perf_counter()
+        source = _RelayAssetTreeSource(
+            source_id=source_id,
+            root_dir=root_dir,
+            entry_path=entry_path,
+            name=name,
+            size_bytes=entry_file.stat().st_size,
+            content_type=content_type,
+            created_at=now,
+            last_accessed_at=now,
+        )
+        with self._relay_sources_lock:
+            self._relay_sources[source_id] = source
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_file",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": source_id,
+            "runtime_instance_id": self.runtime_instance_id,
+            "name": name,
+            "size_bytes": source.size_bytes,
+            "content_type": content_type,
+            "availability": "agent_online_required",
+            "entry_path": entry_path,
+        }
+
+    def register_relay_session(
+        self,
+        value: RelaySessionSource,
+        download_name: str | None,
+        protocol_override: str | None,
+    ) -> JsonDict:
+        """Register a bidirectional text session as a broker relay source."""
+        name = download_name or "relay-session"
+        protocol = protocol_override or "text"
+        source_id = f"src_{uuid.uuid4()}"
+        now = time.perf_counter()
+        source = _RelaySessionRuntimeSource(
+            source_id=source_id,
+            name=name,
+            protocol=protocol,
+            created_at=now,
+            last_accessed_at=now,
+            open_session=value.open_session,
+        )
+        with self._relay_sources_lock:
+            self._relay_sources[source_id] = source
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_session",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": source_id,
+            "runtime_instance_id": self.runtime_instance_id,
+            "name": name,
+            "protocol": protocol,
+            "availability": "agent_online_required",
+        }
+
     def _prune_relay_sources(self) -> None:
         cutoff = time.perf_counter() - self.RELAY_SOURCE_TTL_SECONDS
         with self._relay_sources_lock:
@@ -2359,13 +3082,30 @@ class Agent:
             for source_id in stale_ids:
                 self._relay_sources.pop(source_id, None)
 
-    def _get_relay_source(self, source_id: str) -> _RelayFileSource | None:
+    def _get_relay_source(
+        self, source_id: str
+    ) -> (
+        _RelayFileSource
+        | _RelayLiveSource
+        | _RelayAssetTreeSource
+        | _RelaySessionRuntimeSource
+        | None
+    ):
         with self._relay_sources_lock:
             source = self._relay_sources.get(source_id)
             if source is None:
                 return None
             source.last_accessed_at = time.perf_counter()
             return source
+
+    def _normalize_relay_asset_path(self, asset_path: str) -> str:
+        posix_path = PurePosixPath(asset_path)
+        if asset_path == "" or posix_path.is_absolute():
+            raise ValueError(f"Invalid relay asset path: {asset_path!r}")
+        parts = posix_path.parts
+        if parts == () or any(part in {"", ".", ".."} for part in parts):
+            raise ValueError(f"Invalid relay asset path: {asset_path!r}")
+        return posix_path.as_posix()
 
     def _serve_relay_file(
         self,
@@ -2385,6 +3125,16 @@ class Agent:
                         "stream_id": stream_id,
                         "code": "source_missing",
                         "message": "Relay source is no longer available on the agent.",
+                    }
+                )
+                return
+            if not isinstance(source, _RelayFileSource):
+                self._relay_send_text(
+                    {
+                        "type": "error",
+                        "stream_id": stream_id,
+                        "code": "source_type_mismatch",
+                        "message": "Relay source is not a stored file.",
                     }
                 )
                 return
@@ -2438,6 +3188,266 @@ class Agent:
         finally:
             with self._relay_cancel_events_lock:
                 self._relay_cancel_events.pop(stream_id, None)
+
+    def _serve_relay_live_stream(
+        self,
+        stream_id: str,
+        source_id: str,
+        cancel_event: threading.Event,
+    ) -> None:
+        offset = 0
+        try:
+            source = self._get_relay_source(source_id)
+            if source is None:
+                self._relay_send_text(
+                    {
+                        "type": "error",
+                        "stream_id": stream_id,
+                        "code": "source_missing",
+                        "message": "Relay source is no longer available on the agent.",
+                    }
+                )
+                return
+            if not isinstance(source, _RelayLiveSource):
+                self._relay_send_text(
+                    {
+                        "type": "error",
+                        "stream_id": stream_id,
+                        "code": "source_type_mismatch",
+                        "message": "Relay source is not a live stream.",
+                    }
+                )
+                return
+
+            for chunk in source.open_chunks(cancel_event):
+                if cancel_event.is_set():
+                    break
+                if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                    raise TypeError(
+                        "Relay live stream chunks must be bytes-like values."
+                    )
+                data = bytes(chunk)
+                if data == b"":
+                    continue
+                self._relay_send_binary_chunk(stream_id, offset, data)
+                offset += len(data)
+
+            if not cancel_event.is_set():
+                self._relay_send_text({"type": "eof", "stream_id": stream_id})
+        except Exception as exc:
+            logger.exception(
+                "Relay live stream serving failed; stream_id=%s", stream_id
+            )
+            self._relay_send_text(
+                {
+                    "type": "error",
+                    "stream_id": stream_id,
+                    "code": "relay_failed",
+                    "message": str(exc),
+                }
+            )
+        finally:
+            with self._relay_cancel_events_lock:
+                self._relay_cancel_events.pop(stream_id, None)
+            self._clear_relay_session_runtime(stream_id)
+
+    def _serve_relay_asset(
+        self,
+        stream_id: str,
+        source_id: str,
+        asset_path: str,
+        cancel_event: threading.Event,
+    ) -> None:
+        try:
+            normalized_asset_path = self._normalize_relay_asset_path(asset_path)
+            source = self._get_relay_source(source_id)
+            if source is None:
+                self._relay_send_text(
+                    {
+                        "type": "error",
+                        "stream_id": stream_id,
+                        "code": "source_missing",
+                        "message": "Relay source is no longer available on the agent.",
+                    }
+                )
+                return
+            if not isinstance(source, _RelayAssetTreeSource):
+                self._relay_send_text(
+                    {
+                        "type": "error",
+                        "stream_id": stream_id,
+                        "code": "source_type_mismatch",
+                        "message": "Relay source is not an asset tree.",
+                    }
+                )
+                return
+
+            relative_path = Path(*PurePosixPath(normalized_asset_path).parts)
+            asset_file = (source.root_dir / relative_path).resolve()
+            try:
+                asset_file.relative_to(source.root_dir)
+            except ValueError as exc:
+                raise RuntimeError("Relay asset path escaped the source root.") from exc
+            if not asset_file.is_file():
+                self._relay_send_text(
+                    {
+                        "type": "error",
+                        "stream_id": stream_id,
+                        "code": "asset_missing",
+                        "message": "Relay asset file is not available on the agent.",
+                    }
+                )
+                return
+
+            with asset_file.open("rb") as handle:
+                offset = 0
+                while not cancel_event.is_set():
+                    chunk = handle.read(self.RELAY_CHUNK_SIZE)
+                    if chunk == b"":
+                        break
+                    self._relay_send_binary_chunk(stream_id, offset, chunk)
+                    offset += len(chunk)
+
+            if not cancel_event.is_set():
+                self._relay_send_text({"type": "eof", "stream_id": stream_id})
+        except FileNotFoundError:
+            self._relay_send_text(
+                {
+                    "type": "error",
+                    "stream_id": stream_id,
+                    "code": "asset_missing",
+                    "message": "Relay asset file is not available on the agent.",
+                }
+            )
+        except Exception as exc:
+            logger.exception("Relay asset serving failed; stream_id=%s", stream_id)
+            self._relay_send_text(
+                {
+                    "type": "error",
+                    "stream_id": stream_id,
+                    "code": "relay_failed",
+                    "message": str(exc),
+                }
+            )
+        finally:
+            with self._relay_cancel_events_lock:
+                self._relay_cancel_events.pop(stream_id, None)
+
+    def _serve_relay_text_session(
+        self,
+        stream_id: str,
+        source_id: str,
+        cancel_event: threading.Event,
+    ) -> None:
+        def emit_text(text: str) -> None:
+            if cancel_event.is_set():
+                return
+            self._relay_send_text(
+                {"type": "session_output", "stream_id": stream_id, "text": text}
+            )
+
+        def close_session() -> None:
+            if cancel_event.is_set():
+                return
+            self._relay_send_text({"type": "eof", "stream_id": stream_id})
+            cancel_event.set()
+            self._clear_relay_session_runtime(stream_id)
+            with self._relay_cancel_events_lock:
+                self._relay_cancel_events.pop(stream_id, None)
+
+        try:
+            source = self._get_relay_source(source_id)
+            if source is None:
+                self._relay_send_text(
+                    {
+                        "type": "error",
+                        "stream_id": stream_id,
+                        "code": "source_missing",
+                        "message": "Relay source is no longer available on the agent.",
+                    }
+                )
+                return
+            if not isinstance(source, _RelaySessionRuntimeSource):
+                self._relay_send_text(
+                    {
+                        "type": "error",
+                        "stream_id": stream_id,
+                        "code": "source_type_mismatch",
+                        "message": "Relay source is not a text session.",
+                    }
+                )
+                return
+
+            input_handler = source.open_session(cancel_event, emit_text, close_session)
+            with self._relay_session_runtimes_lock:
+                self._relay_session_runtimes[stream_id] = _RelaySessionRuntime(
+                    stream_id=stream_id,
+                    cancel_event=cancel_event,
+                    handle_input=input_handler,
+                )
+        except Exception as exc:
+            logger.exception(
+                "Relay text session serving failed; stream_id=%s", stream_id
+            )
+            self._relay_send_text(
+                {
+                    "type": "error",
+                    "stream_id": stream_id,
+                    "code": "relay_failed",
+                    "message": str(exc),
+                }
+            )
+            cancel_event.set()
+            self._clear_relay_session_runtime(stream_id)
+            with self._relay_cancel_events_lock:
+                self._relay_cancel_events.pop(stream_id, None)
+
+    def _handle_relay_session_input(self, stream_id: str, text: str) -> None:
+        with self._relay_session_runtimes_lock:
+            runtime = self._relay_session_runtimes.get(stream_id)
+
+        if runtime is None:
+            logger.warning(
+                "Relay session input ignored for unknown stream: %s", stream_id
+            )
+            return
+
+        if runtime.cancel_event.is_set():
+            return
+
+        if runtime.handle_input is None:
+            self._relay_send_text(
+                {
+                    "type": "error",
+                    "stream_id": stream_id,
+                    "code": "input_not_supported",
+                    "message": "This relay session does not accept input.",
+                }
+            )
+            return
+
+        try:
+            runtime.handle_input(text)
+        except Exception as exc:
+            logger.exception(
+                "Relay session input handler failed; stream_id=%s", stream_id
+            )
+            self._relay_send_text(
+                {
+                    "type": "error",
+                    "stream_id": stream_id,
+                    "code": "relay_failed",
+                    "message": str(exc),
+                }
+            )
+            runtime.cancel_event.set()
+            self._clear_relay_session_runtime(stream_id)
+            with self._relay_cancel_events_lock:
+                self._relay_cancel_events.pop(stream_id, None)
+
+    def _clear_relay_session_runtime(self, stream_id: str) -> None:
+        with self._relay_session_runtimes_lock:
+            self._relay_session_runtimes.pop(stream_id, None)
 
     def _relay_send_text(
         self, payload: Mapping[str, Any], *, ws: websocket.WebSocketApp | None = None
@@ -3329,7 +4339,7 @@ class Agent:
 
     @property
     def agent_auth(self):
-        """Credential string `<agent_id>:<agent_secret>` used for `/api/v1/agent/*` requests."""
+        """`agent_auth` credential string used for `/api/v1/agent/*` requests."""
         return self.interface.agent_auth
 
     @agent_auth.setter
@@ -3797,7 +4807,7 @@ class Broker:
     """Client for `/api/v1/client/*`.
 
     `/api/v1/client/board` mirrors `/api/v1/broker/board` payloads but accepts
-    either `agent_auth` (`"<agent_id>:<agent_secret>"`) or user tokens.
+    either `agent_auth` or user tokens.
     """
 
     def __init__(
@@ -3814,7 +4824,7 @@ class Broker:
             auth: Credential string for the client API. Accepted values:
                 - bare user token string
                 - bare ephemeral token string
-                - `"<agent_id>:<agent_secret>"` `agent_auth` string
+                - `agent_auth` string
 
                 Do not prefix token values with `"Token "`.
         """
@@ -4069,15 +5079,66 @@ class Broker:
         """
         return self._request_json("GET", uri)
 
-    def get_file(self, uri: str) -> requests.Response:
-        """Download a file from the client API and return a raw Response.
+    def parse_relay_file(
+        self, value: RelayFileHandle | Mapping[str, object]
+    ) -> RelayFileHandle:
+        """Parse a relay-file value returned by the client API."""
+        if isinstance(value, RelayFileHandle):
+            return value
+        return _parse_relay_file_handle(value, context="relay_file")
 
-        Raises:
-            BrokerConnectionError: If the broker URL cannot be reached.
-            BrokerHTTPError: If the server returns a non-200 response.
-        """
+    def parse_relay_media(
+        self, value: RelayMediaHandle | Mapping[str, object]
+    ) -> RelayMediaHandle:
+        """Parse a relay-media value returned by the client API."""
+        if isinstance(value, RelayMediaHandle):
+            return value
+        return _parse_relay_media_handle(value, context="relay_media")
+
+    def parse_relay_session(
+        self, value: RelaySessionHandle | Mapping[str, object]
+    ) -> RelaySessionHandle:
+        """Parse a relay-session value returned by the client API."""
+        if isinstance(value, RelaySessionHandle):
+            return value
+        return _parse_relay_session_handle(value, context="relay_session")
+
+    def _resolve_client_download_url(self, uri: str) -> str:
+        if uri.startswith("http://") or uri.startswith("https://"):
+            return uri
+        broker_parts = urlsplit(self.broker_url)
+        broker_origin = urlunsplit(
+            (broker_parts.scheme, broker_parts.netloc, "", "", "")
+        )
+        if uri.startswith("/"):
+            return f"{broker_origin}{uri}"
+        return f"{self.broker_url.rstrip('/')}/api/v1/client/{uri.lstrip('/')}"
+
+    def _resolve_client_websocket_url(self, uri: str) -> str:
+        if uri.startswith("ws://") or uri.startswith("wss://"):
+            return uri
+        if uri.startswith("http://") or uri.startswith("https://"):
+            parsed = urlsplit(uri)
+        else:
+            parsed = urlsplit(self._resolve_client_download_url(uri))
+        ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+        return urlunsplit((ws_scheme, parsed.netloc, parsed.path, parsed.query, ""))
+
+    def _open_binary_uri(
+        self,
+        uri: str,
+        *,
+        stream: bool,
+        byte_range: tuple[int, int | None] | None = None,
+    ) -> requests.Response:
         started_at = time.perf_counter()
         attempt = 0
+        url = self._resolve_client_download_url(uri)
+        headers = dict(self.header_auth)
+        if byte_range is not None:
+            start, end = byte_range
+            range_end = "" if end is None else str(end)
+            headers["Range"] = f"bytes={start}-{range_end}"
         while True:
             timeout = _request_timeout_tuple(
                 started_at,
@@ -4087,9 +5148,10 @@ class Broker:
             )
             try:
                 response = requests.get(
-                    f"{self.broker_url}/api/v1/client/{uri}",
-                    headers=self.header_auth,
+                    url,
+                    headers=headers,
                     timeout=timeout,
+                    stream=stream,
                 )
             except requests.exceptions.RequestException as exc:
                 logger.warning(
@@ -4098,7 +5160,7 @@ class Broker:
                     attempt + 1,
                     Agent.REQUEST_RETRY_DEADLINE,
                 )
-                logger.debug("Broker get_file connection error details: %s", exc)
+                logger.debug("Broker binary request connection error details: %s", exc)
                 if _sleep_for_retry(
                     started_at,
                     Agent.REQUEST_RETRY_DEADLINE,
@@ -4131,14 +5193,130 @@ class Broker:
                     attempt += 1
                     continue
 
-            if response.status_code != 200:
+            if response.status_code not in (200, 206):
                 logger.exception(
-                    f"Not 200: {response.status_code=}; {uri=}, {response.content=}"
+                    "Unexpected status on binary get: response.status_code=%s; uri=%s; response.content=%r",
+                    response.status_code,
+                    uri,
+                    response.content,
                 )
                 raise BrokerHTTPError(
                     response.status_code, uri, _coerce_error_content(response.content)
                 )
             return response
+
+    def get_file(self, uri: str) -> requests.Response:
+        """Open a binary file response from the client API.
+
+        Raises:
+            BrokerConnectionError: If the broker URL cannot be reached.
+            BrokerHTTPError: If the server returns a non-200 response.
+        """
+        return self._open_binary_uri(uri, stream=False)
+
+    def open_file(
+        self,
+        relay: RelayFileHandle | Mapping[str, object],
+        *,
+        stream: bool = True,
+        byte_range: tuple[int, int | None] | None = None,
+    ) -> requests.Response:
+        """Open a relay-file download response."""
+        handle = self.parse_relay_file(relay)
+        return self._open_binary_uri(handle.uri, stream=stream, byte_range=byte_range)
+
+    def open_media(
+        self,
+        relay: RelayMediaHandle | Mapping[str, object],
+        *,
+        purpose: Literal["playback", "download"] = "playback",
+        stream: bool = True,
+        byte_range: tuple[int, int | None] | None = None,
+    ) -> requests.Response:
+        """Open a relay-media response for playback or download."""
+        handle = self.parse_relay_media(relay)
+        uri = handle.playback_uri
+        if purpose == "download":
+            if handle.download_uri is None:
+                raise BrokerResponseError(
+                    "relay_media is missing download_uri",
+                    payload=relay,
+                )
+            uri = handle.download_uri
+        return self._open_binary_uri(uri, stream=stream, byte_range=byte_range)
+
+    def download_file(
+        self,
+        relay: RelayFileHandle | Mapping[str, object],
+        destination: PathLike[str] | str,
+    ) -> Path:
+        """Download a relay-file handle to a local path."""
+        target = Path(destination).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        response = self.open_file(relay, stream=True)
+        try:
+            with target.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+        finally:
+            response.close()
+        return target
+
+    def download_media(
+        self,
+        relay: RelayMediaHandle | Mapping[str, object],
+        destination: PathLike[str] | str,
+        *,
+        purpose: Literal["playback", "download"] = "download",
+    ) -> Path:
+        """Download a relay-media handle to a local path."""
+        target = Path(destination).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        response = self.open_media(relay, purpose=purpose, stream=True)
+        try:
+            with target.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+        finally:
+            response.close()
+        return target
+
+    def open_session(
+        self,
+        relay: RelaySessionHandle | Mapping[str, object],
+        *,
+        timeout: float = Agent.REQUEST_READ_TIMEOUT,
+    ) -> RelaySessionConnection:
+        """Open a relay-session websocket and wait until it becomes ready."""
+        handle = self.parse_relay_session(relay)
+        url = self._resolve_client_websocket_url(handle.session_uri)
+        try:
+            ws = websocket.create_connection(
+                url,
+                header=[f"authorization: Basic {self.auth}"],
+                timeout=timeout,
+            )
+        except Exception as exc:
+            raise BrokerConnectionError(
+                f"Connection error while opening relay_session; {url=}"
+            ) from exc
+
+        connection = RelaySessionConnection(ws)
+        first_event = connection.recv_event(timeout=timeout)
+        if first_event.type == "ready":
+            return connection
+        connection.close()
+        if first_event.type == "error":
+            raise BrokerResponseError(
+                f"Failed to open relay_session [{first_event.code or 'relay_error'}]: {first_event.message or 'Unknown error.'}",
+                payload=relay,
+            )
+        raise BrokerResponseError(
+            f"Relay session did not become ready; first event was {first_event.type!r}",
+            payload=relay,
+        )
 
     def upload(
         self,

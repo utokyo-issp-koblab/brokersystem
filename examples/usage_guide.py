@@ -3,7 +3,7 @@
 Configure via env vars:
 - BROKER_URL: base URL used by Agent, Broker, and BrokerAdmin
 - BROKER_TOKEN: bare user token string for Broker/BrokerAdmin
-- AGENT_AUTH: full `agent_auth` string "<agent_id>:<agent_secret>" for Agent/Broker
+- AGENT_AUTH: full `agent_auth` string copied from the broker UI for Agent/Broker
 
 Notes:
 - `/api/v1/client/board` and `/api/v1/broker/board` return the same payload.
@@ -11,7 +11,7 @@ Notes:
 - `BrokerAdmin(token=...)` accepts a bare user token only.
 
 Run examples:
-  BROKER_URL=https://... AGENT_AUTH='<agent_id>:<agent_secret>' \
+  BROKER_URL=https://... AGENT_AUTH='<agent_auth>' \
     python examples/usage_guide.py agent [--enable-upload]
   BROKER_URL=https://... BROKER_TOKEN=... \
     python examples/usage_guide.py client --agent-id <agent_id> [--step-by-step]
@@ -57,12 +57,7 @@ def require_env(key: str) -> str:
 
 
 def require_agent_auth() -> str:
-    agent_auth = os.environ.get("AGENT_AUTH")
-    if agent_auth:
-        return agent_auth
-    agent_id = require_env("AGENT_ID")
-    agent_secret = require_env("AGENT_SECRET")
-    return f"{agent_id}:{agent_secret}"
+    return require_env("AGENT_AUTH")
 
 
 def build_agent(enable_upload: bool) -> Agent:

@@ -6,7 +6,12 @@ from brokersystem.agent import (
     Choice,
     File,
     Number,
+    RelayAssetSource,
     RelayFile,
+    RelayMedia,
+    RelaySession,
+    RelaySessionSource,
+    RelayStreamSource,
     String,
     Table,
     ValueTemplate,
@@ -110,6 +115,144 @@ def test_relay_file_format_for_output_registers_source(tmp_path) -> None:
     assert value["runtime_instance_id"] == "runtime-1"
     assert fmt["@type"] == "relay_file"
     assert fmt["@help"] == "Large archive kept on the producer host."
+
+
+def test_relay_media_format_for_output_registers_source(tmp_path) -> None:
+    relay_path = tmp_path / "preview.webm"
+    relay_path.write_bytes(b"media")
+    calls = []
+
+    def fake_registrar(path, name, content_type):
+        calls.append((path, name, content_type))
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_file",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": "src_media",
+            "runtime_instance_id": "runtime-media",
+            "name": "preview.webm",
+            "size_bytes": 5,
+            "content_type": "video/webm",
+            "availability": "agent_online_required",
+        }
+
+    relay_template = RelayMedia(content_type="video/webm", help="Playable relay media.")
+    value, fmt = relay_template.format_for_output(
+        relay_path, lambda *_: {}, fake_registrar
+    )
+
+    assert calls == [(relay_path, None, "video/webm")]
+    assert value["source_id"] == "src_media"
+    assert value["live"] is False
+    assert value["$brokersystem"]["kind"] == "relay_media"
+    assert fmt["@type"] == "relay_media"
+    assert fmt["@help"] == "Playable relay media."
+
+
+def test_live_relay_media_format_for_output_registers_stream_source() -> None:
+    calls = []
+
+    def fake_registrar(value, name, content_type):
+        calls.append((value, name, content_type))
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_file",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": "src_live",
+            "runtime_instance_id": "runtime-live",
+            "name": "preview.mjpeg",
+            "size_bytes": 0,
+            "content_type": "multipart/x-mixed-replace; boundary=frame",
+            "availability": "agent_online_required",
+        }
+
+    relay_template = RelayMedia(
+        content_type="multipart/x-mixed-replace; boundary=frame",
+        live=True,
+        help="Live relay media.",
+    )
+    source = RelayStreamSource(open_chunks=lambda _cancel: [b"frame"])
+    value, fmt = relay_template.format_for_output(source, lambda *_: {}, fake_registrar)
+
+    assert calls == [(source, None, "multipart/x-mixed-replace; boundary=frame")]
+    assert value["source_id"] == "src_live"
+    assert value["live"] is True
+    assert value["$brokersystem"]["kind"] == "relay_media"
+    assert fmt["@type"] == "relay_media"
+
+
+def test_live_relay_media_format_for_output_registers_asset_source(tmp_path) -> None:
+    calls = []
+
+    def fake_registrar(value, name, content_type):
+        calls.append((value, name, content_type))
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_file",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": "src_hls",
+            "runtime_instance_id": "runtime-hls",
+            "name": "preview.m3u8",
+            "size_bytes": 18,
+            "content_type": "application/vnd.apple.mpegurl",
+            "availability": "agent_online_required",
+            "entry_path": "index.m3u8",
+        }
+
+    asset_dir = tmp_path / "hls"
+    asset_dir.mkdir()
+    (asset_dir / "index.m3u8").write_text("#EXTM3U\nsegment000.ts\n", encoding="utf-8")
+    source = RelayAssetSource(root_dir=asset_dir, entry_path="index.m3u8")
+
+    relay_template = RelayMedia(
+        content_type="application/vnd.apple.mpegurl",
+        live=True,
+        help="Live HLS relay media.",
+    )
+    value, fmt = relay_template.format_for_output(source, lambda *_: {}, fake_registrar)
+
+    assert calls == [(source, None, "application/vnd.apple.mpegurl")]
+    assert value["source_id"] == "src_hls"
+    assert value["entry_path"] == "index.m3u8"
+    assert value["live"] is True
+    assert value["$brokersystem"]["kind"] == "relay_media"
+    assert fmt["@type"] == "relay_media"
+
+
+def test_relay_session_format_for_output_registers_source() -> None:
+    calls = []
+
+    def fake_registrar(value, name, protocol):
+        calls.append((value, name, protocol))
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_session",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": "src_session",
+            "runtime_instance_id": "runtime-session",
+            "name": "python-repl",
+            "protocol": "text",
+            "availability": "agent_online_required",
+        }
+
+    relay_template = RelaySession(name="python-repl", help="Interactive relay session.")
+    source = RelaySessionSource(
+        open_session=lambda _cancel, _emit_text, _close_session: None
+    )
+    value, fmt = relay_template.format_for_output(source, lambda *_: {}, fake_registrar)
+
+    assert calls == [(source, "python-repl", "text")]
+    assert value["source_id"] == "src_session"
+    assert value["$brokersystem"]["kind"] == "relay_session"
+    assert fmt["@type"] == "relay_session"
 
 
 def test_number_cast_preserves_float() -> None:

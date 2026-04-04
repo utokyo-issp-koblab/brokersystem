@@ -10,6 +10,8 @@ from brokersystem.agent import (
     AgentResponseError,
     AgentUploadError,
     Job,
+    RelayAssetSource,
+    RelayStreamSource,
     _relay_socket_url,
 )
 
@@ -310,6 +312,84 @@ def test_serve_relay_file_sends_binary_chunks_and_eof(tmp_path) -> None:
     )
 
 
+def test_serve_relay_live_stream_sends_binary_chunks_and_eof() -> None:
+    agent = build_agent()
+    metadata = agent.register_relay_stream(
+        RelayStreamSource(open_chunks=lambda _cancel: [b"frame-1", b"frame-2"]),
+        "preview.mjpeg",
+        "multipart/x-mixed-replace; boundary=frame",
+    )
+    assert metadata["runtime_instance_id"] == agent.runtime_instance_id
+
+    sent_frames: list[tuple[object, int | None]] = []
+
+    class DummyWebSocket:
+        def send(self, payload: object, opcode: int | None = None) -> None:
+            sent_frames.append((payload, opcode))
+
+    agent._relay_socket = DummyWebSocket()  # type: ignore[assignment]
+
+    agent._serve_relay_live_stream(
+        "12345678-1234-1234-1234-123456789013",
+        str(metadata["source_id"]),
+        threading.Event(),
+    )
+
+    binary_frames = [
+        payload
+        for payload, opcode in sent_frames
+        if opcode is not None and isinstance(payload, bytes)
+    ]
+    text_frames = [payload for payload, opcode in sent_frames if opcode is None]
+
+    assert b"frame-1frame-2" == b"".join(frame[46:] for frame in binary_frames)
+    assert text_frames[-1] == json.dumps(
+        {"type": "eof", "stream_id": "12345678-1234-1234-1234-123456789013"}
+    )
+
+
+def test_serve_relay_asset_sends_binary_chunks_and_eof(tmp_path) -> None:
+    agent = build_agent()
+    asset_dir = tmp_path / "hls"
+    asset_dir.mkdir()
+    (asset_dir / "index.m3u8").write_text("#EXTM3U\nsegment000.ts\n", encoding="utf-8")
+    metadata = agent.register_relay_assets(
+        RelayAssetSource(root_dir=asset_dir, entry_path="index.m3u8"),
+        "preview.m3u8",
+        "application/vnd.apple.mpegurl",
+    )
+    assert metadata["runtime_instance_id"] == agent.runtime_instance_id
+
+    sent_frames: list[tuple[object, int | None]] = []
+
+    class DummyWebSocket:
+        def send(self, payload: object, opcode: int | None = None) -> None:
+            sent_frames.append((payload, opcode))
+
+    agent._relay_socket = DummyWebSocket()  # type: ignore[assignment]
+
+    agent._serve_relay_asset(
+        "12345678-1234-1234-1234-123456789015",
+        str(metadata["source_id"]),
+        "index.m3u8",
+        threading.Event(),
+    )
+
+    binary_frames = [
+        payload
+        for payload, opcode in sent_frames
+        if opcode is not None and isinstance(payload, bytes)
+    ]
+    text_frames = [payload for payload, opcode in sent_frames if opcode is None]
+
+    assert b"#EXTM3U\nsegment000.ts\n" == b"".join(
+        frame[46:] for frame in binary_frames
+    )
+    assert text_frames[-1] == json.dumps(
+        {"type": "eof", "stream_id": "12345678-1234-1234-1234-123456789015"}
+    )
+
+
 def test_handle_relay_cancel_sets_stream_event() -> None:
     agent = build_agent()
     cancel_event = threading.Event()
@@ -351,6 +431,70 @@ def test_handle_relay_control_message_starts_file_server_thread(tmp_path) -> Non
 
     assert done.wait(timeout=1.0)
     assert seen_calls == [("stream-2", metadata["source_id"], 1, 5, 3)]
+
+
+def test_handle_relay_control_message_starts_live_server_thread() -> None:
+    agent = build_agent()
+    metadata = agent.register_relay_stream(
+        RelayStreamSource(open_chunks=lambda _cancel: [b"frame"]),
+        "preview.mjpeg",
+        "multipart/x-mixed-replace; boundary=frame",
+    )
+
+    seen_calls: list[tuple[str, str]] = []
+    done = threading.Event()
+
+    def fake_serve(stream_id, source_id, cancel_event):
+        assert cancel_event.is_set() is False
+        seen_calls.append((stream_id, source_id))
+        done.set()
+
+    agent._serve_relay_live_stream = fake_serve  # type: ignore[method-assign]
+
+    agent._handle_relay_control_message(
+        {
+            "type": "serve_live_stream",
+            "stream_id": "stream-live",
+            "source_id": metadata["source_id"],
+        }
+    )
+
+    assert done.wait(timeout=1.0)
+    assert seen_calls == [("stream-live", metadata["source_id"])]
+
+
+def test_handle_relay_control_message_starts_asset_server_thread(tmp_path) -> None:
+    agent = build_agent()
+    asset_dir = tmp_path / "hls"
+    asset_dir.mkdir()
+    (asset_dir / "index.m3u8").write_text("#EXTM3U\nsegment000.ts\n", encoding="utf-8")
+    metadata = agent.register_relay_assets(
+        RelayAssetSource(root_dir=asset_dir, entry_path="index.m3u8"),
+        "preview.m3u8",
+        "application/vnd.apple.mpegurl",
+    )
+
+    seen_calls: list[tuple[str, str, str]] = []
+    done = threading.Event()
+
+    def fake_serve(stream_id, source_id, asset_path, cancel_event):
+        assert cancel_event.is_set() is False
+        seen_calls.append((stream_id, source_id, asset_path))
+        done.set()
+
+    agent._serve_relay_asset = fake_serve  # type: ignore[method-assign]
+
+    agent._handle_relay_control_message(
+        {
+            "type": "serve_asset",
+            "stream_id": "stream-asset",
+            "source_id": metadata["source_id"],
+            "asset_path": "index.m3u8",
+        }
+    )
+
+    assert done.wait(timeout=1.0)
+    assert seen_calls == [("stream-asset", metadata["source_id"], "index.m3u8")]
 
 
 @responses.activate

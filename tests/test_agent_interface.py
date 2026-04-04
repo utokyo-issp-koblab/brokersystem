@@ -8,7 +8,10 @@ from brokersystem.agent import (
     Bool,
     File,
     Number,
+    RelayAssetSource,
     RelayFile,
+    RelayMedia,
+    RelayStreamSource,
     Table,
     UserInfoField,
     need_revision_response,
@@ -167,6 +170,153 @@ def test_format_for_output_registers_relay_files_without_upload(tmp_path) -> Non
     assert result["archive"]["source_id"] == "src_456"
     assert result["archive"]["runtime_instance_id"] == "runtime-2"
     assert result["@type"]["archive"] == "relay_file"
+
+
+def test_format_for_output_registers_relay_media_without_upload(tmp_path) -> None:
+    interface = AgentInterface()
+    interface.output.preview = RelayMedia(
+        content_type="video/webm", help="Preview video relayed through the broker."
+    )
+
+    relay_path = tmp_path / "preview.webm"
+    relay_path.write_bytes(b"relay-media")
+
+    upload_calls = []
+    relay_calls = []
+
+    def fake_uploader(file_type: str, data: bytes):
+        upload_calls.append((file_type, data))
+        return {"file_id": "unexpected"}
+
+    def fake_relay_registrar(path, name, content_type):
+        relay_calls.append((path, name, content_type))
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_file",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": "src_media",
+            "runtime_instance_id": "runtime-media",
+            "name": "preview.webm",
+            "size_bytes": 11,
+            "content_type": "video/webm",
+            "availability": "agent_online_required",
+        }
+
+    result = interface.format_for_output(
+        {"preview": relay_path},
+        fake_uploader,
+        fake_relay_registrar,
+    )
+
+    assert upload_calls == []
+    assert relay_calls == [(relay_path, None, "video/webm")]
+    assert result["preview"]["source_id"] == "src_media"
+    assert result["preview"]["$brokersystem"]["kind"] == "relay_media"
+    assert result["preview"]["live"] is False
+    assert result["@type"]["preview"] == "relay_media"
+
+
+def test_format_for_output_registers_live_relay_media_without_upload() -> None:
+    interface = AgentInterface()
+    interface.output.preview = RelayMedia(
+        content_type="multipart/x-mixed-replace; boundary=frame",
+        live=True,
+        help="Live preview stream relayed through the broker.",
+    )
+
+    upload_calls = []
+    relay_calls = []
+
+    def fake_uploader(file_type: str, data: bytes):
+        upload_calls.append((file_type, data))
+        return {"file_id": "unexpected"}
+
+    def fake_relay_registrar(source, name, content_type):
+        relay_calls.append((source, name, content_type))
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_file",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": "src_live_media",
+            "runtime_instance_id": "runtime-live-media",
+            "name": "preview.mjpeg",
+            "size_bytes": 0,
+            "content_type": "multipart/x-mixed-replace; boundary=frame",
+            "availability": "agent_online_required",
+        }
+
+    source = RelayStreamSource(open_chunks=lambda _cancel: [b"frame"])
+
+    result = interface.format_for_output(
+        {"preview": source},
+        fake_uploader,
+        fake_relay_registrar,
+    )
+
+    assert upload_calls == []
+    assert relay_calls == [(source, None, "multipart/x-mixed-replace; boundary=frame")]
+    assert result["preview"]["source_id"] == "src_live_media"
+    assert result["preview"]["$brokersystem"]["kind"] == "relay_media"
+    assert result["preview"]["live"] is True
+    assert result["@type"]["preview"] == "relay_media"
+
+
+def test_format_for_output_registers_live_asset_tree_media_without_upload(
+    tmp_path,
+) -> None:
+    interface = AgentInterface()
+    interface.output.preview = RelayMedia(
+        content_type="application/vnd.apple.mpegurl",
+        live=True,
+        help="Live HLS preview relayed through the broker.",
+    )
+
+    asset_dir = tmp_path / "hls"
+    asset_dir.mkdir()
+    (asset_dir / "index.m3u8").write_text("#EXTM3U\nsegment000.ts\n", encoding="utf-8")
+    (asset_dir / "segment000.ts").write_bytes(b"segment")
+
+    upload_calls = []
+    relay_calls = []
+
+    def fake_uploader(file_type: str, data: bytes):
+        upload_calls.append((file_type, data))
+        return {"file_id": "unexpected"}
+
+    def fake_relay_registrar(source, name, content_type):
+        relay_calls.append((source, name, content_type))
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_file",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": "src_live_hls",
+            "runtime_instance_id": "runtime-live-hls",
+            "name": "preview.m3u8",
+            "size_bytes": 0,
+            "content_type": "application/vnd.apple.mpegurl",
+            "availability": "agent_online_required",
+            "entry_path": "index.m3u8",
+        }
+
+    source = RelayAssetSource(root_dir=asset_dir, entry_path="index.m3u8")
+
+    result = interface.format_for_output(
+        {"preview": source},
+        fake_uploader,
+        fake_relay_registrar,
+    )
+
+    assert upload_calls == []
+    assert relay_calls == [(source, None, "application/vnd.apple.mpegurl")]
+    assert result["preview"]["source_id"] == "src_live_hls"
+    assert result["preview"]["entry_path"] == "index.m3u8"
+    assert result["preview"]["live"] is True
 
 
 def test_make_config_includes_user_info_request() -> None:

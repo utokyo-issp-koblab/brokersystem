@@ -4,11 +4,11 @@ This example keeps the artifact on the agent host and lets the broker relay it
 to a client without permanently storing the bytes on the broker.
 
 Run:
-  BROKER_URL=https://... AGENT_AUTH='<agent_id>:<agent_secret>' \
-    python examples/relay_large_file.py agent [--file /path/to/archive.zip]
+  BROKER_URL=https://... AGENT_AUTH='<agent_auth>' \
+    python examples/relay_file.py agent [--file /path/to/archive.zip]
 
   BROKER_URL=https://... BROKER_TOKEN=... \
-    python examples/relay_large_file.py client --agent-id <agent_id> [--dest out.bin]
+    python examples/relay_file.py client --agent-id <agent_id> [--dest out.bin]
 """
 
 from __future__ import annotations
@@ -19,12 +19,9 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, cast
-from urllib.parse import urljoin
+from typing import Mapping
 
-import requests
-
-from brokersystem import Agent, Broker, Number, RelayFile
+from brokersystem import Agent, Broker, Job, Number, RelayFile, RelayFileHandle
 
 
 def require_env(key: str) -> str:
@@ -32,15 +29,6 @@ def require_env(key: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required env var: {key}")
     return value
-
-
-def require_agent_auth() -> str:
-    agent_auth = os.environ.get("AGENT_AUTH")
-    if agent_auth:
-        return agent_auth
-    agent_id = require_env("AGENT_ID")
-    agent_secret = require_env("AGENT_SECRET")
-    return f"{agent_id}:{agent_secret}"
 
 
 def create_demo_large_file(path: Path, size_mib: int) -> Path:
@@ -67,33 +55,25 @@ def sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def require_result_dict(value: object, *, field: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise RuntimeError(f"Expected result field {field!r} to be an object.")
-    return cast(dict[str, Any], value)
-
-
-def require_result_int(value: object, *, field: str) -> int:
-    if not isinstance(value, int):
-        raise RuntimeError(f"Expected result field {field!r} to be an integer.")
-    return value
-
-
-def require_result_str(value: object, *, field: str) -> str:
-    if not isinstance(value, str):
-        raise RuntimeError(f"Expected result field {field!r} to be a string.")
-    return value
+def read_archive_result(
+    broker: Broker, result_payload: Mapping[str, object]
+) -> RelayFileHandle:
+    match result_payload:
+        case {"archive": dict() as archive_obj}:
+            return broker.parse_relay_file(archive_obj)
+        case _:
+            raise RuntimeError("Unexpected broker result payload.")
 
 
 def build_agent(file_path: Path) -> Agent:
     broker_url = require_env("BROKER_URL")
-    agent_auth = require_agent_auth()
+    agent_auth = require_env("AGENT_AUTH")
 
     agent = Agent(broker_url)
 
     @agent.config
     def make_config() -> None:
-        agent.name = "relay-large-file-example"
+        agent.name = "relay-file-example-sdk"
         agent.agent_auth = agent_auth
         agent.description = "Streams a large local file through the broker relay path."
         agent.charge = 1
@@ -105,31 +85,10 @@ def build_agent(file_path: Path) -> Agent:
         agent.output.size_bytes = Number(unit="B")
 
     @agent.job_func
-    def job(_job) -> dict[str, object]:
+    def job(_job: Job) -> dict[str, object]:
         return {"archive": file_path, "size_bytes": file_path.stat().st_size}
 
     return agent
-
-
-def download_relay_file(
-    relay_uri: str, destination: Path, token: str
-) -> tuple[float, str]:
-    broker_url = require_env("BROKER_URL")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    started = time.perf_counter()
-    response = requests.get(
-        urljoin(broker_url, relay_uri),
-        headers={"Authorization": f"Token {token}"},
-        stream=True,
-        timeout=(10, 300),
-    )
-    response.raise_for_status()
-    with destination.open("wb") as handle:
-        for chunk in response.iter_content(chunk_size=64 * 1024):
-            if chunk:
-                handle.write(chunk)
-    elapsed = time.perf_counter() - started
-    return elapsed, sha256_file(destination)
 
 
 def run_agent(file_arg: str | None, size_mib: int) -> None:
@@ -152,22 +111,23 @@ def run_client(agent_id: str, destination: str | None) -> None:
         broker_url=require_env("BROKER_URL"), auth=require_env("BROKER_TOKEN")
     )
     result_payload = broker.ask(agent_id, {})["result"]
-    archive = require_result_dict(result_payload["archive"], field="archive")
-    relay_uri = require_result_str(archive.get("uri"), field="archive.uri")
-    archive_name = require_result_str(archive.get("name"), field="archive.name")
-    size_bytes = require_result_int(result_payload["size_bytes"], field="size_bytes")
+    relay_file = read_archive_result(broker, result_payload)
     destination_path = (
         Path(destination).expanduser().resolve()
         if destination
-        else Path.cwd() / archive_name
+        else Path.cwd() / relay_file.name
     )
-    elapsed, digest = download_relay_file(
-        relay_uri,
-        destination_path,
-        require_env("BROKER_TOKEN"),
+    started = time.perf_counter()
+    broker.download_file(relay_file, destination_path)
+    elapsed = time.perf_counter() - started
+    digest = sha256_file(destination_path)
+    mib_s = (
+        (relay_file.size_bytes / (1024 * 1024)) / elapsed
+        if elapsed > 0
+        else float("inf")
     )
-    mib_s = (size_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else float("inf")
     print("Downloaded to:", destination_path)
+    print("Relay URI:", relay_file.uri)
     print("SHA256:", digest)
     print("Elapsed seconds:", round(elapsed, 3))
     print("Throughput MiB/s:", round(mib_s, 3))

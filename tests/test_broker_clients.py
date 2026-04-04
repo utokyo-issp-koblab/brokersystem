@@ -11,6 +11,9 @@ from brokersystem.agent import (
     BrokerHTTPError,
     BrokerUploadError,
     BrokerResponseError,
+    RelayFileHandle,
+    RelayMediaHandle,
+    RelaySessionHandle,
     UserInfoField,
 )
 
@@ -103,6 +106,60 @@ def _agent_detail(*, name: str = "Agent 1") -> dict[str, object]:
     }
 
 
+def _relay_file_value() -> dict[str, object]:
+    return {
+        "$brokersystem": {
+            "version": 1,
+            "kind": "relay_file",
+            "transport": "broker_relay_v1",
+        },
+        "uri": "/api/v1/client/relay/files/neg-1/archive",
+        "name": "archive.bin",
+        "size_bytes": 1024,
+        "content_type": "application/octet-stream",
+        "availability": "agent_online_required",
+    }
+
+
+def _relay_media_value(
+    *,
+    live: bool = False,
+    playback_uri: str = "/api/v1/client/relay/files/neg-1/preview",
+    download_uri: str | None = "/api/v1/client/relay/files/neg-1/preview",
+    content_type: str = "video/webm",
+) -> dict[str, object]:
+    payload = {
+        "$brokersystem": {
+            "version": 1,
+            "kind": "relay_media",
+            "transport": "broker_relay_v1",
+        },
+        "playback_uri": playback_uri,
+        "name": "preview.webm",
+        "size_bytes": 2048,
+        "content_type": content_type,
+        "availability": "agent_online_required",
+        "live": live,
+    }
+    if download_uri is not None:
+        payload["download_uri"] = download_uri
+    return payload
+
+
+def _relay_session_value() -> dict[str, object]:
+    return {
+        "$brokersystem": {
+            "version": 1,
+            "kind": "relay_session",
+            "transport": "broker_relay_v1",
+        },
+        "session_uri": "/api/v1/client/relay/sessions/neg-1/console/socket",
+        "name": "python-repl",
+        "protocol": "text",
+        "availability": "agent_online_required",
+    }
+
+
 @responses.activate
 def test_broker_begin_negotiation() -> None:
     broker = Broker(broker_url=BROKER_URL, auth="token")
@@ -119,6 +176,70 @@ def test_broker_begin_negotiation() -> None:
 
     response = broker.begin_negotiation("agent-1")
     assert response["negotiation_id"] == "n1"
+
+
+def test_broker_parse_relay_session() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    handle = broker.parse_relay_session(_relay_session_value())
+    assert isinstance(handle, RelaySessionHandle)
+    assert handle.protocol == "text"
+    assert handle.session_uri == "/api/v1/client/relay/sessions/neg-1/console/socket"
+
+
+def test_broker_open_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+
+    class DummySocket:
+        def __init__(self) -> None:
+            self.timeout = None
+            self.sent: list[str] = []
+            self.closed = False
+            self.messages = [
+                json.dumps({"type": "ready", "protocol": "text"}),
+                json.dumps({"type": "output", "text": "hello\n"}),
+                json.dumps({"type": "eof"}),
+            ]
+
+        def gettimeout(self):
+            return self.timeout
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def recv(self):
+            return self.messages.pop(0)
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+        def close(self):
+            self.closed = True
+
+    dummy_socket = DummySocket()
+    captured: dict[str, object] = {}
+
+    def fake_create_connection(url: str, *, header: list[str], timeout: float):
+        captured["url"] = url
+        captured["header"] = header
+        captured["timeout"] = timeout
+        return dummy_socket
+
+    monkeypatch.setattr(
+        "brokersystem.agent.websocket.create_connection", fake_create_connection
+    )
+
+    with broker.open_session(_relay_session_value()) as session:
+        assert (
+            captured["url"]
+            == "wss://example.test/api/v1/client/relay/sessions/neg-1/console/socket"
+        )
+        assert captured["header"] == ["authorization: Basic token"]
+        session.send_text("help")
+        assert json.loads(dummy_socket.sent[0]) == {"type": "input", "text": "help"}
+        assert session.recv_text() == "hello\n"
+        assert session.recv_text() is None
+
+    assert dummy_socket.closed is True
 
 
 @responses.activate
@@ -237,6 +358,110 @@ def test_broker_upload_raises_on_storage_rejection(tmp_path: Path) -> None:
         broker.upload("txt", file_path)
 
     assert exc.value.code == "storage_limit_exceeded"
+
+
+def test_broker_parse_relay_file_returns_handle() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+
+    relay_file = broker.parse_relay_file(_relay_file_value())
+
+    assert isinstance(relay_file, RelayFileHandle)
+    assert relay_file.uri == "/api/v1/client/relay/files/neg-1/archive"
+    assert relay_file.size_bytes == 1024
+
+
+def test_broker_parse_relay_media_returns_handle() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+
+    relay_media = broker.parse_relay_media(_relay_media_value())
+
+    assert isinstance(relay_media, RelayMediaHandle)
+    assert relay_media.playback_uri == "/api/v1/client/relay/files/neg-1/preview"
+    assert relay_media.download_uri == "/api/v1/client/relay/files/neg-1/preview"
+    assert relay_media.live is False
+
+
+def test_broker_parse_relay_media_allows_missing_download_uri() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+
+    relay_media = broker.parse_relay_media(
+        _relay_media_value(
+            live=True,
+            playback_uri="/api/v1/client/relay/assets/neg-1/preview/index.m3u8",
+            download_uri=None,
+            content_type="application/vnd.apple.mpegurl",
+        )
+    )
+
+    assert (
+        relay_media.playback_uri
+        == "/api/v1/client/relay/assets/neg-1/preview/index.m3u8"
+    )
+    assert relay_media.download_uri is None
+    assert relay_media.live is True
+
+
+def test_broker_parse_relay_media_rejects_missing_playback_uri() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    payload = _relay_media_value()
+    del payload["playback_uri"]
+
+    with pytest.raises(BrokerResponseError, match="Malformed broker response"):
+        broker.parse_relay_media(payload)
+
+
+@responses.activate
+def test_broker_open_file_accepts_absolute_relay_path_and_range() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    relay_file = broker.parse_relay_file(_relay_file_value())
+    responses.add(
+        responses.GET,
+        f"{BROKER_URL}/api/v1/client/relay/files/neg-1/archive",
+        body=b"bc",
+        status=206,
+    )
+
+    response = broker.open_file(relay_file, stream=False, byte_range=(1, 2))
+
+    assert response.content == b"bc"
+    request = responses.calls[0].request
+    assert request.headers["authorization"] == "Basic token"
+    assert request.headers["Range"] == "bytes=1-2"
+
+
+@responses.activate
+def test_broker_open_media_uses_download_uri_for_download_purpose() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    relay_media = broker.parse_relay_media(_relay_media_value())
+    responses.add(
+        responses.GET,
+        f"{BROKER_URL}/api/v1/client/relay/files/neg-1/preview",
+        body=b"media-bytes",
+        status=200,
+    )
+
+    response = broker.open_media(relay_media, purpose="download", stream=False)
+
+    assert response.content == b"media-bytes"
+    assert responses.calls[0].request.headers["authorization"] == "Basic token"
+
+
+@responses.activate
+def test_broker_download_file_writes_destination(tmp_path: Path) -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    relay_file = broker.parse_relay_file(_relay_file_value())
+    destination = tmp_path / "archive.bin"
+    responses.add(
+        responses.GET,
+        f"{BROKER_URL}/api/v1/client/relay/files/neg-1/archive",
+        body=b"archive-bytes",
+        status=200,
+    )
+
+    written_path = broker.download_file(relay_file, destination)
+
+    assert written_path == destination.resolve()
+    assert destination.read_bytes() == b"archive-bytes"
 
 
 @responses.activate
