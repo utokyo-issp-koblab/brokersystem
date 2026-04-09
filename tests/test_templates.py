@@ -68,6 +68,31 @@ def test_table_format_for_output_from_list_of_dict() -> None:
     assert fmt["@table"] == ["x", "y"]
 
 
+def test_table_format_for_output_preserves_missing_cells_as_null() -> None:
+    table = Table(unit_dict={"a": None, "b": None})
+    value, _fmt = table.format_for_output(
+        [{"a": 1, "b": None}, {"a": 2}],
+        lambda *_: {},
+    )
+    assert value == {"a": [1, 2], "b": [None, None]}
+
+
+def test_table_format_for_output_normalizes_dataframe_nulls() -> None:
+    table = Table(unit_dict={"a": None, "b": None})
+    frame = pd.DataFrame([{"a": 1, "b": None}, {"a": 2}])
+    value, _fmt = table.format_for_output(frame, lambda *_: {})
+    assert value == {"a": [1, 2], "b": [None, None]}
+
+
+def test_table_format_for_output_normalizes_dict_of_lists_nulls() -> None:
+    table = Table(unit_dict={"a": None, "b": None})
+    value, _fmt = table.format_for_output(
+        {"a": [1, 2], "b": [None, float("nan")]},
+        lambda *_: {},
+    )
+    assert value == {"a": [1, 2], "b": [None, None]}
+
+
 def test_file_format_for_output_uploads_bytes() -> None:
     uploader_calls = []
 

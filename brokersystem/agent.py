@@ -11,7 +11,7 @@ import time
 import traceback
 import uuid
 from urllib.parse import urlsplit, urlunsplit
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
@@ -1895,6 +1895,77 @@ class Table(ValueTemplate):
         """Table inputs are validated by higher-level logic."""
         return value
 
+    @staticmethod
+    def _normalize_cell(value: Any) -> Any:
+        """Normalize transport-facing table cells while preserving null semantics."""
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except TypeError:
+            pass
+        return value
+
+    def _normalize_dataframe(self, value: pd.DataFrame) -> dict[str, list[Any]]:
+        declared_columns = list(self.unit_dict.keys())
+        observed_columns = [str(column) for column in value.columns]
+        columns = declared_columns + [
+            column for column in observed_columns if column not in declared_columns
+        ]
+        rows = value.to_dict(orient="records")
+        return self._normalize_row_dicts(rows, columns=columns)
+
+    def _normalize_row_dicts(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        columns: list[str] | None = None,
+    ) -> dict[str, list[Any]]:
+        declared_columns = list(self.unit_dict.keys())
+        if columns is None:
+            observed_columns: list[str] = []
+            seen_columns = set[str]()
+            for row in rows:
+                for key in row.keys():
+                    if key not in seen_columns:
+                        observed_columns.append(key)
+                        seen_columns.add(key)
+            columns = declared_columns + [
+                column for column in observed_columns if column not in declared_columns
+            ]
+
+        normalized: dict[str, list[Any]] = {column: [] for column in columns}
+        for row in rows:
+            for column in columns:
+                normalized[column].append(self._normalize_cell(row.get(column)))
+        return normalized
+
+    def _normalize_column_mapping(
+        self, value: Mapping[str, list[Any]]
+    ) -> dict[str, list[Any]]:
+        declared_columns = list(self.unit_dict.keys())
+        observed_columns = [str(column) for column in value.keys()]
+        columns = declared_columns + [
+            column for column in observed_columns if column not in declared_columns
+        ]
+        lengths = {len(column_values) for column_values in value.values()}
+        if not lengths:
+            return {column: [] for column in columns}
+        if len(lengths) != 1:
+            raise Exception("Table column lists must all have the same length")
+
+        row_count = next(iter(lengths))
+        normalized: dict[str, list[Any]] = {}
+        for column in columns:
+            if column in value:
+                normalized[column] = [
+                    self._normalize_cell(cell) for cell in value[column]
+                ]
+            else:
+                normalized[column] = [None] * row_count
+        return normalized
+
     @property
     def format_dict(self) -> JsonDict:
         format_dict = super().format_dict
@@ -1917,14 +1988,17 @@ class Table(ValueTemplate):
         """Convert a table value into the broker output schema."""
         format_dict = self.format_dict
         if isinstance(value, pd.DataFrame):
-            value = value.to_dict(orient="list")
+            value = self._normalize_dataframe(value)
         elif (
             isinstance(value, list) and all([isinstance(x, dict) for x in value])
         ) or (
             isinstance(value, dict)
             and all([isinstance(x, list) for x in value.values()])
         ):
-            value = pd.DataFrame(value).to_dict(orient="list")
+            if isinstance(value, list):
+                value = self._normalize_row_dicts(value)
+            else:
+                value = self._normalize_column_mapping(value)
         else:
             raise Exception(
                 "The return value for table should be given by a list of dict, a dict of list or pandas DataFrame"
