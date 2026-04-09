@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlsplit, urlunsplit
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ from . import __version__
 JsonDict = dict[str, Any]
 JsonPayload = dict[str, Any]
 BinaryData = bytes | bytearray | memoryview
+UploadValue = BinaryData | PathLike[str] | str
 AgentFactory = Callable[[Callable[..., JsonDict | None]], Callable[..., "Agent"]]
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -287,6 +289,14 @@ class RelaySessionHandle:
     name: str
     protocol: str
     availability: str
+
+
+@dataclass(frozen=True)
+class UploadedFile:
+    """Uploaded job-result file handle accepted by `File(...)` outputs."""
+
+    file_id: str
+    file_type: str
 
 
 @dataclass
@@ -986,6 +996,45 @@ def _is_local_file_value(value: object) -> bool:
     return isinstance(value, (bytes, bytearray, memoryview, PathLike))
 
 
+def _normalize_file_type(file_type: str) -> str:
+    return file_type.strip().lower().lstrip(".")
+
+
+def _resolve_upload_workers(total_items: int, max_upload_workers: int | None) -> int:
+    if total_items <= 0:
+        return 0
+    if max_upload_workers is None:
+        return min(4, total_items)
+    if max_upload_workers < 1:
+        raise ValueError("max_upload_workers must be >= 1")
+    return min(max_upload_workers, total_items)
+
+
+def _upload_parallel_map(
+    items: Mapping[str, R],
+    *,
+    max_upload_workers: int | None,
+    upload_one: Callable[[str, R], Any],
+) -> dict[str, Any]:
+    ordered_items = list(items.items())
+    if not ordered_items:
+        return {}
+
+    workers = _resolve_upload_workers(len(ordered_items), max_upload_workers)
+    if workers <= 1:
+        return {key: upload_one(key, value) for key, value in ordered_items}
+
+    completed: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(upload_one, key, value): key for key, value in ordered_items
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            completed[key] = future.result()
+    return {key: completed[key] for key, _value in ordered_items}
+
+
 def _backoff_seconds(attempt: int, base: float, cap: float) -> float:
     if base <= 0 or cap <= 0:
         return 0.0
@@ -1640,11 +1689,20 @@ class File(ValueTemplate):
 
     def format_for_output(
         self,
-        value: BinaryData | PathLike[str] | str,
+        value: UploadedFile | UploadValue,
         uploader: Callable[[str, bytes], JsonDict],
         relay_registrar: RelayRegistrar | None = None,
     ) -> tuple[Any, JsonDict]:
         """Upload a file and return the API file id."""
+        if isinstance(value, UploadedFile):
+            expected_type = _normalize_file_type(self.file_type)
+            actual_type = _normalize_file_type(value.file_type)
+            if actual_type != expected_type:
+                raise TypeError(
+                    f"UploadedFile file_type mismatch: expected {self.file_type!r}, got {value.file_type!r}"
+                )
+            return value.file_id, self.format_dict
+
         if isinstance(value, (bytes, bytearray, memoryview)):
             binary_data = value
         else:
@@ -2310,7 +2368,10 @@ class DummyJob(Mapping[str, Any]):
         msg: str | None = None,
         progress: float | None = None,
         result: JsonDict | None = None,
+        *,
+        max_upload_workers: int | None = None,
     ) -> None:
+        _ = max_upload_workers
         logger.info(f"[DUMMY JOB] REPORT: {msg}, {progress}, {result}")
 
     def __getitem__(self, key: str) -> Any:
@@ -2349,6 +2410,8 @@ class Job(Mapping[str, Any]):
         msg: str | None = None,
         progress: float | None = None,
         result: JsonDict | None = None,
+        *,
+        max_upload_workers: int | None = None,
     ) -> None:
         """Post a progress or result update to the broker.
 
@@ -2362,7 +2425,9 @@ class Job(Mapping[str, Any]):
             progress: Optional fractional progress in the range 0..1.
             result: Optional partial result payload. If this includes `File` or
                 image outputs, the SDK uploads the corresponding binary data
-                before sending the report.
+                in parallel before sending the report.
+            max_upload_workers: Maximum number of concurrent file/image uploads
+                for this report. Use `1` to force serial uploads.
 
         Raises:
             AgentConnectionError: If the broker cannot be reached after retries.
@@ -2388,11 +2453,64 @@ class Job(Mapping[str, Any]):
             assert isinstance(
                 result, dict
             ), "Result should be given as a dict: {result_key: result_value}"
+            prepared_result = self._prepare_report_uploads(
+                result,
+                max_upload_workers=max_upload_workers,
+            )
             payload["result"] = self._agent.interface.format_for_output(
-                result, self._agent.upload, self._agent.register_relay_source
+                prepared_result,
+                self._agent.upload,
+                self._agent.register_relay_source,
             )
 
         self._agent.post("report", payload)
+
+    def upload(
+        self,
+        file_type: str,
+        value: UploadValue,
+    ) -> UploadedFile:
+        """Upload a job-result file and return a handle for `report(result=...)`.
+
+        Args:
+            file_type: File extension/type declared by the agent output schema.
+            value: Bytes-like content or a local file path.
+
+        Returns:
+            Uploaded file handle accepted by `File(...)` outputs.
+        """
+        file_id, _format = File(file_type).format_for_output(value, self._agent.upload)
+        if not isinstance(file_id, str):
+            raise AgentResponseError(
+                f"Upload returned malformed payload for {file_type!r}",
+                payload=file_id,
+            )
+        return UploadedFile(file_id=file_id, file_type=file_type)
+
+    def upload_parallel(
+        self,
+        files: Mapping[str, tuple[str, UploadValue]],
+        *,
+        max_upload_workers: int | None = None,
+    ) -> dict[str, UploadedFile]:
+        """Upload multiple job-result files concurrently.
+
+        Returns a key-preserving mapping that can be merged directly into
+        `report(result=...)`.
+        """
+
+        def upload_one(_key: str, item: tuple[str, UploadValue]) -> UploadedFile:
+            file_type, value = item
+            return self.upload(file_type, value)
+
+        return cast(
+            dict[str, UploadedFile],
+            _upload_parallel_map(
+                files,
+                max_upload_workers=max_upload_workers,
+                upload_one=upload_one,
+            ),
+        )
 
     def _report_internal(
         self,
@@ -2412,6 +2530,31 @@ class Job(Mapping[str, Any]):
         if result is not None:
             payload["result"] = result
         self._agent.post("report", payload)
+
+    def _prepare_report_uploads(
+        self,
+        result: JsonDict,
+        *,
+        max_upload_workers: int | None,
+    ) -> JsonDict:
+        pending: dict[str, tuple[str, UploadValue]] = {}
+        for key, value in result.items():
+            if key not in self._agent.interface.output:
+                continue
+            template = self._agent.interface.output[key]
+            if isinstance(template, File) and not isinstance(value, UploadedFile):
+                pending[key] = (template.file_type, cast(UploadValue, value))
+
+        if not pending:
+            return result
+
+        uploaded = self.upload_parallel(
+            pending,
+            max_upload_workers=max_upload_workers,
+        )
+        prepared = dict(result)
+        prepared.update(uploaded)
+        return prepared
 
     def msg(self, msg: str) -> None:
         """Send a message-only update.
@@ -5395,7 +5538,7 @@ class Broker:
     def upload(
         self,
         file_type: str,
-        value: BinaryData | PathLike[str] | str,
+        value: UploadValue,
     ) -> str:
         """Upload a client-side input file and return the broker file id.
 
@@ -5414,6 +5557,7 @@ class Broker:
             TypeError: If `value` is neither bytes-like nor a path-like object.
             OSError: If the local file path cannot be read.
         """
+
         file_id, _format = File(file_type).format_for_output(
             value, self._upload_binary_data
         )
@@ -5423,6 +5567,27 @@ class Broker:
                 payload=file_id,
             )
         return file_id
+
+    def upload_parallel(
+        self,
+        files: Mapping[str, tuple[str, UploadValue]],
+        *,
+        max_upload_workers: int | None = None,
+    ) -> dict[str, str]:
+        """Upload multiple client-side input files concurrently."""
+
+        def upload_one(_key: str, item: tuple[str, UploadValue]) -> str:
+            file_type, value = item
+            return self.upload(file_type, value)
+
+        return cast(
+            dict[str, str],
+            _upload_parallel_map(
+                files,
+                max_upload_workers=max_upload_workers,
+                upload_one=upload_one,
+            ),
+        )
 
     def _request_json(
         self, method: str, uri: str, payload: JsonDict | None = None

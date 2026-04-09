@@ -14,6 +14,7 @@ from brokersystem.agent import (
     RelayStreamSource,
     String,
     Table,
+    UploadedFile,
     ValueTemplate,
 )
 
@@ -107,6 +108,15 @@ def test_file_format_for_output_uploads_bytes() -> None:
     assert value == "file-123.png"
     assert fmt["@type"] == "image"
     assert fmt["@help"] == "Rendered preview image."
+
+
+def test_file_format_for_output_accepts_uploaded_file() -> None:
+    file_template = File("png")
+    value, _fmt = file_template.format_for_output(
+        UploadedFile(file_id="file-123.png", file_type="png"),
+        lambda *_: {"file_id": "unexpected"},
+    )
+    assert value == "file-123.png"
 
 
 def test_relay_file_format_for_output_registers_source(tmp_path) -> None:

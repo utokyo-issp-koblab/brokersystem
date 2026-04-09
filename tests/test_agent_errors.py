@@ -9,9 +9,11 @@ from brokersystem.agent import (
     AgentHTTPError,
     AgentResponseError,
     AgentUploadError,
+    File,
     Job,
     RelayAssetSource,
     RelayStreamSource,
+    UploadedFile,
     _relay_socket_url,
 )
 
@@ -144,6 +146,102 @@ def test_agent_upload_re_registers_after_401() -> None:
 
     assert response["file_id"] == "file-1"
     assert agent.access_token == "fresh-token"
+
+
+def test_job_upload_returns_uploaded_file() -> None:
+    agent = build_agent()
+
+    def fake_upload(file_type: str, binary_data: bytes) -> dict[str, str]:
+        assert file_type == "png"
+        assert binary_data == b"preview"
+        return {"file_id": "file-1"}
+
+    agent.upload = fake_upload  # type: ignore[method-assign]
+
+    job = Job(agent, "neg-upload", {})
+    uploaded = job.upload("png", b"preview")
+
+    assert uploaded == UploadedFile(file_id="file-1", file_type="png")
+
+
+def test_job_upload_parallel_returns_report_ready_mapping() -> None:
+    agent = build_agent()
+    job = Job(agent, "neg-upload-parallel", {})
+    calls: list[tuple[str, object]] = []
+
+    def fake_upload(file_type: str, value: object) -> UploadedFile:
+        calls.append((file_type, value))
+        return UploadedFile(file_id=f"{file_type}-id", file_type=file_type)
+
+    job.upload = fake_upload  # type: ignore[method-assign]
+
+    uploaded = job.upload_parallel(
+        {
+            "preview": ("png", b"preview"),
+            "archive": ("zip", b"archive"),
+        },
+        max_upload_workers=1,
+    )
+
+    assert uploaded == {
+        "preview": UploadedFile(file_id="png-id", file_type="png"),
+        "archive": UploadedFile(file_id="zip-id", file_type="zip"),
+    }
+    assert calls == [
+        ("png", b"preview"),
+        ("zip", b"archive"),
+    ]
+
+
+def test_job_report_preuploads_file_outputs_in_parallel_path() -> None:
+    agent = build_agent()
+    agent.interface.output.preview = File("png")
+    agent.interface.output.archive = File("zip")
+    job = Job(agent, "neg-report-uploads", {})
+
+    captured_uploads: dict[str, object] = {}
+    captured_payload: dict[str, object] = {}
+
+    def fake_upload_parallel(
+        files: dict[str, tuple[str, object]],
+        *,
+        max_upload_workers: int | None = None,
+    ) -> dict[str, UploadedFile]:
+        captured_uploads["files"] = files
+        captured_uploads["max_upload_workers"] = max_upload_workers
+        return {
+            "preview": UploadedFile(file_id="preview-file", file_type="png"),
+            "archive": UploadedFile(file_id="archive-file", file_type="zip"),
+        }
+
+    def fake_post(
+        uri: str, payload: dict[str, object], **_kwargs: object
+    ) -> dict[str, str]:
+        captured_payload["uri"] = uri
+        captured_payload["payload"] = payload
+        return {"status": "ok"}
+
+    job.upload_parallel = fake_upload_parallel  # type: ignore[method-assign]
+    agent.post = fake_post  # type: ignore[method-assign]
+
+    job.report(
+        result={"preview": b"preview", "archive": b"archive"},
+        max_upload_workers=5,
+    )
+
+    assert captured_uploads == {
+        "files": {
+            "preview": ("png", b"preview"),
+            "archive": ("zip", b"archive"),
+        },
+        "max_upload_workers": 5,
+    }
+    payload = captured_payload["payload"]
+    assert isinstance(payload, dict)
+    result_payload = payload["result"]
+    assert isinstance(result_payload, dict)
+    assert result_payload["preview"] == "preview-file"
+    assert result_payload["archive"] == "archive-file"
 
 
 @responses.activate

@@ -242,6 +242,31 @@ def test_broker_open_session(monkeypatch: pytest.MonkeyPatch) -> None:
     assert dummy_socket.closed is True
 
 
+def test_broker_upload_parallel_returns_key_preserving_mapping() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    calls: list[tuple[str, object]] = []
+
+    def fake_upload(file_type: str, value: object) -> str:
+        calls.append((file_type, value))
+        return f"{file_type}-id"
+
+    broker.upload = fake_upload  # type: ignore[method-assign]
+
+    uploaded = broker.upload_parallel(
+        {
+            "preview": ("png", b"preview"),
+            "archive": ("zip", Path("/tmp/archive.zip")),
+        },
+        max_upload_workers=1,
+    )
+
+    assert uploaded == {"preview": "png-id", "archive": "zip-id"}
+    assert calls == [
+        ("png", b"preview"),
+        ("zip", Path("/tmp/archive.zip")),
+    ]
+
+
 @responses.activate
 def test_broker_begin_negotiation_returns_required_feedback_shape() -> None:
     broker = Broker(broker_url=BROKER_URL, auth="token")

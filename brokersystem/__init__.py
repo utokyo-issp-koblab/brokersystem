@@ -57,5 +57,6 @@ from brokersystem.agent import (
     UserInfoFieldValue,
     UiPreview,
     UiPreviewVega,
+    UploadedFile,
     revision_response,
 )
