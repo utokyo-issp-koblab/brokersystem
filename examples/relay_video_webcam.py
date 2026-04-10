@@ -5,28 +5,33 @@ live `RelayMedia` handle that works in both the UI and SDK clients.
 
 Run on a Windows host with OBS Virtual Camera:
   BROKER_URL=https://... AGENT_AUTH='<agent_auth>' \
+    AGENT_NAME='relay-video-webcam-desktop-a' \
     VIDEO_SOURCE_KIND=dshow VIDEO_DEVICE='OBS Virtual Camera' \
     python examples/relay_video_webcam.py agent
 
 Run on a Windows host with OBS Virtual Camera using NVIDIA NVENC:
   BROKER_URL=https://... AGENT_AUTH='<agent_auth>' \
+    AGENT_NAME='relay-video-webcam-desktop-a' \
     VIDEO_SOURCE_KIND=dshow VIDEO_DEVICE='OBS Virtual Camera' \
     VIDEO_ENCODER=h264_nvenc VIDEO_NVENC_PRESET=p5 VIDEO_NVENC_CQ=28 \
     python examples/relay_video_webcam.py agent
 
 Run on a Windows host with a physical webcam and its microphone:
   BROKER_URL=https://... AGENT_AUTH='<agent_auth>' \
+    AGENT_NAME='relay-video-webcam-desktop-a' \
     VIDEO_SOURCE_KIND=dshow VIDEO_DEVICE='ELECOM 2MP Webcam' \
     AUDIO_DEVICE='マイク (2- Webcam internal mic)' \
     python examples/relay_video_webcam.py agent
 
 Run on a Linux host with a V4L2 device:
   BROKER_URL=https://... AGENT_AUTH='<agent_auth>' \
+    AGENT_NAME='relay-video-webcam-linux-a' \
     VIDEO_SOURCE_KIND=v4l2 VIDEO_DEVICE=/dev/video2 \
     python examples/relay_video_webcam.py agent
 
 Run with a generated test pattern when no camera is available:
   BROKER_URL=https://... AGENT_AUTH='<agent_auth>' \
+    AGENT_NAME='relay-video-webcam-testsrc' \
     VIDEO_SOURCE_KIND=testsrc python examples/relay_video_webcam.py agent
 
 Inspect from the SDK client:
@@ -476,13 +481,14 @@ def read_playlist_snapshot(broker: Broker, relay_media: RelayMediaHandle) -> str
 def build_agent() -> Agent:
     broker_url = require_env("BROKER_URL")
     agent_auth = require_env("AGENT_AUTH")
+    agent_name = os.environ.get("AGENT_NAME", "relay-video-webcam-example-sdk")
     capture = build_capture()
 
     agent = Agent(broker_url)
 
     @agent.config
     def make_config() -> None:
-        agent.name = "relay-video-webcam-example-sdk"
+        agent.name = agent_name
         agent.agent_auth = agent_auth
         agent.description = (
             "Captures a live camera feed, packages it as HLS, and relays it "
