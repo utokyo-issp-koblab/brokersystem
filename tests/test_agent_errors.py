@@ -15,6 +15,7 @@ from brokersystem.agent import (
     RelayAssetSource,
     RelayStreamSource,
     UploadedFile,
+    _RelayBinaryRuntime,
     _get_thread_session,
     _relay_socket_url,
 )
@@ -31,6 +32,15 @@ def build_agent() -> Agent:
     agent.REQUEST_RETRY_MAX = 0.0
     agent.CONTRACT_LEASE_RETRY_DEADLINE = 0.0
     return agent
+
+
+def build_binary_runtime(credit_bytes: int = 1024) -> _RelayBinaryRuntime:
+    return _RelayBinaryRuntime(
+        stream_id="stream-test",
+        cancel_event=threading.Event(),
+        credit_condition=threading.Condition(),
+        available_credit=credit_bytes,
+    )
 
 
 def test_get_thread_session_reuses_current_thread_and_separates_threads() -> None:
@@ -413,7 +423,7 @@ def test_serve_relay_file_sends_binary_chunks_and_eof(tmp_path) -> None:
         0,
         relay_path.stat().st_size - 1,
         4,
-        threading.Event(),
+        build_binary_runtime(),
     )
 
     binary_frames = [
@@ -450,7 +460,7 @@ def test_serve_relay_live_stream_sends_binary_chunks_and_eof() -> None:
     agent._serve_relay_live_stream(
         "12345678-1234-1234-1234-123456789013",
         str(metadata["source_id"]),
-        threading.Event(),
+        build_binary_runtime(),
     )
 
     binary_frames = [
@@ -490,7 +500,7 @@ def test_serve_relay_asset_sends_binary_chunks_and_eof(tmp_path) -> None:
         "12345678-1234-1234-1234-123456789015",
         str(metadata["source_id"]),
         "index.m3u8",
-        threading.Event(),
+        build_binary_runtime(),
     )
 
     binary_frames = [
@@ -528,9 +538,8 @@ def test_handle_relay_control_message_starts_file_server_thread(tmp_path) -> Non
     seen_calls: list[tuple[str, str, int, int, int]] = []
     done = threading.Event()
 
-    def fake_serve(
-        stream_id, source_id, start_byte, end_byte, chunk_size, cancel_event
-    ):
+    def fake_serve(stream_id, source_id, start_byte, end_byte, chunk_size, runtime):
+        assert runtime.available_credit == 128
         seen_calls.append((stream_id, source_id, start_byte, end_byte, chunk_size))
         done.set()
 
@@ -544,6 +553,7 @@ def test_handle_relay_control_message_starts_file_server_thread(tmp_path) -> Non
             "start_byte": 1,
             "end_byte": 5,
             "chunk_size": 3,
+            "credit_bytes": 128,
         }
     )
 
@@ -562,8 +572,9 @@ def test_handle_relay_control_message_starts_live_server_thread() -> None:
     seen_calls: list[tuple[str, str]] = []
     done = threading.Event()
 
-    def fake_serve(stream_id, source_id, cancel_event):
-        assert cancel_event.is_set() is False
+    def fake_serve(stream_id, source_id, runtime):
+        assert runtime.cancel_event.is_set() is False
+        assert runtime.available_credit == 256
         seen_calls.append((stream_id, source_id))
         done.set()
 
@@ -574,6 +585,7 @@ def test_handle_relay_control_message_starts_live_server_thread() -> None:
             "type": "serve_live_stream",
             "stream_id": "stream-live",
             "source_id": metadata["source_id"],
+            "credit_bytes": 256,
         }
     )
 
@@ -595,8 +607,9 @@ def test_handle_relay_control_message_starts_asset_server_thread(tmp_path) -> No
     seen_calls: list[tuple[str, str, str]] = []
     done = threading.Event()
 
-    def fake_serve(stream_id, source_id, asset_path, cancel_event):
-        assert cancel_event.is_set() is False
+    def fake_serve(stream_id, source_id, asset_path, runtime):
+        assert runtime.cancel_event.is_set() is False
+        assert runtime.available_credit == 512
         seen_calls.append((stream_id, source_id, asset_path))
         done.set()
 
@@ -608,11 +621,26 @@ def test_handle_relay_control_message_starts_asset_server_thread(tmp_path) -> No
             "stream_id": "stream-asset",
             "source_id": metadata["source_id"],
             "asset_path": "index.m3u8",
+            "credit_bytes": 512,
         }
     )
 
     assert done.wait(timeout=1.0)
     assert seen_calls == [("stream-asset", metadata["source_id"], "index.m3u8")]
+
+
+def test_handle_relay_credit_increases_available_credit() -> None:
+    agent = build_agent()
+    runtime = build_binary_runtime(credit_bytes=0)
+
+    with agent._relay_binary_runtimes_lock:
+        agent._relay_binary_runtimes["stream-credit"] = runtime
+
+    agent._handle_relay_control_message(
+        {"type": "credit", "stream_id": "stream-credit", "bytes": 123}
+    )
+
+    assert runtime.available_credit == 123
 
 
 @responses.activate

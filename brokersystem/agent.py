@@ -2719,6 +2719,14 @@ class _RelaySessionRuntime:
 
 
 @dataclass
+class _RelayBinaryRuntime:
+    stream_id: str
+    cancel_event: threading.Event
+    credit_condition: threading.Condition
+    available_credit: int
+
+
+@dataclass
 class _RelaySessionRuntimeSource:
     source_id: str
     name: str
@@ -2787,6 +2795,8 @@ class Agent:
         self._relay_sources_lock = threading.Lock()
         self._relay_cancel_events: dict[str, threading.Event] = {}
         self._relay_cancel_events_lock = threading.Lock()
+        self._relay_binary_runtimes: dict[str, _RelayBinaryRuntime] = {}
+        self._relay_binary_runtimes_lock = threading.Lock()
         self._relay_session_runtimes: dict[str, _RelaySessionRuntime] = {}
         self._relay_session_runtimes_lock = threading.Lock()
 
@@ -2989,6 +2999,7 @@ class Agent:
         status_code: int | None,
         close_msg: str | None,
     ) -> None:
+        self._cancel_all_relay_streams()
         if self.running:
             logger.warning(
                 "Relay socket closed: status_code=%r close_msg=%r",
@@ -3004,6 +3015,7 @@ class Agent:
             start_byte = payload.get("start_byte")
             end_byte = payload.get("end_byte")
             chunk_size = payload.get("chunk_size")
+            credit_bytes = payload.get("credit_bytes")
 
             if not (
                 isinstance(stream_id, str)
@@ -3011,6 +3023,7 @@ class Agent:
                 and isinstance(start_byte, int)
                 and isinstance(end_byte, int)
                 and isinstance(chunk_size, int)
+                and isinstance(credit_bytes, int)
             ):
                 logger.warning(
                     "Ignoring malformed serve_file relay command: %r", payload
@@ -3018,8 +3031,16 @@ class Agent:
                 return
 
             cancel_event = threading.Event()
+            runtime = _RelayBinaryRuntime(
+                stream_id=stream_id,
+                cancel_event=cancel_event,
+                credit_condition=threading.Condition(),
+                available_credit=max(credit_bytes, 0),
+            )
             with self._relay_cancel_events_lock:
                 self._relay_cancel_events[stream_id] = cancel_event
+            with self._relay_binary_runtimes_lock:
+                self._relay_binary_runtimes[stream_id] = runtime
 
             threading.Thread(
                 target=self._serve_relay_file,
@@ -3029,7 +3050,7 @@ class Agent:
                     start_byte,
                     end_byte,
                     chunk_size,
-                    cancel_event,
+                    runtime,
                 ),
                 daemon=True,
                 name=f"relay-{stream_id[:8]}",
@@ -3039,20 +3060,33 @@ class Agent:
         if msg_type == "serve_live_stream":
             stream_id = payload.get("stream_id")
             source_id = payload.get("source_id")
+            credit_bytes = payload.get("credit_bytes")
 
-            if not (isinstance(stream_id, str) and isinstance(source_id, str)):
+            if not (
+                isinstance(stream_id, str)
+                and isinstance(source_id, str)
+                and isinstance(credit_bytes, int)
+            ):
                 logger.warning(
                     "Ignoring malformed serve_live_stream relay command: %r", payload
                 )
                 return
 
             cancel_event = threading.Event()
+            runtime = _RelayBinaryRuntime(
+                stream_id=stream_id,
+                cancel_event=cancel_event,
+                credit_condition=threading.Condition(),
+                available_credit=max(credit_bytes, 0),
+            )
             with self._relay_cancel_events_lock:
                 self._relay_cancel_events[stream_id] = cancel_event
+            with self._relay_binary_runtimes_lock:
+                self._relay_binary_runtimes[stream_id] = runtime
 
             threading.Thread(
                 target=self._serve_relay_live_stream,
-                args=(stream_id, source_id, cancel_event),
+                args=(stream_id, source_id, runtime),
                 daemon=True,
                 name=f"relay-live-{stream_id[:8]}",
             ).start()
@@ -3062,11 +3096,13 @@ class Agent:
             stream_id = payload.get("stream_id")
             source_id = payload.get("source_id")
             asset_path = payload.get("asset_path")
+            credit_bytes = payload.get("credit_bytes")
 
             if not (
                 isinstance(stream_id, str)
                 and isinstance(source_id, str)
                 and isinstance(asset_path, str)
+                and isinstance(credit_bytes, int)
             ):
                 logger.warning(
                     "Ignoring malformed serve_asset relay command: %r", payload
@@ -3074,12 +3110,20 @@ class Agent:
                 return
 
             cancel_event = threading.Event()
+            runtime = _RelayBinaryRuntime(
+                stream_id=stream_id,
+                cancel_event=cancel_event,
+                credit_condition=threading.Condition(),
+                available_credit=max(credit_bytes, 0),
+            )
             with self._relay_cancel_events_lock:
                 self._relay_cancel_events[stream_id] = cancel_event
+            with self._relay_binary_runtimes_lock:
+                self._relay_binary_runtimes[stream_id] = runtime
 
             threading.Thread(
                 target=self._serve_relay_asset,
-                args=(stream_id, source_id, asset_path, cancel_event),
+                args=(stream_id, source_id, asset_path, runtime),
                 daemon=True,
                 name=f"relay-asset-{stream_id[:8]}",
             ).start()
@@ -3125,7 +3169,17 @@ class Agent:
                     event = self._relay_cancel_events.get(stream_id)
                 if event is not None:
                     event.set()
+                self._notify_relay_binary_runtime(stream_id)
                 self._clear_relay_session_runtime(stream_id)
+            return
+
+        if msg_type == "credit":
+            stream_id = payload.get("stream_id")
+            bytes_credit = payload.get("bytes")
+            if isinstance(stream_id, str) and isinstance(bytes_credit, int):
+                self._add_relay_credit(stream_id, bytes_credit)
+            else:
+                logger.warning("Ignoring malformed relay credit command: %r", payload)
             return
 
         logger.warning("Unknown relay control message: %r", payload)
@@ -3347,6 +3401,56 @@ class Agent:
             source.last_accessed_at = time.perf_counter()
             return source
 
+    def _claim_relay_credit(self, runtime: _RelayBinaryRuntime, max_bytes: int) -> int:
+        with runtime.credit_condition:
+            while runtime.available_credit <= 0 and not runtime.cancel_event.is_set():
+                runtime.credit_condition.wait(timeout=1.0)
+            if runtime.cancel_event.is_set():
+                return 0
+            granted = min(max_bytes, runtime.available_credit)
+            runtime.available_credit -= granted
+            return granted
+
+    def _add_relay_credit(self, stream_id: str, bytes_credit: int) -> None:
+        with self._relay_binary_runtimes_lock:
+            runtime = self._relay_binary_runtimes.get(stream_id)
+
+        if runtime is None:
+            return
+
+        with runtime.credit_condition:
+            runtime.available_credit += max(bytes_credit, 0)
+            runtime.credit_condition.notify_all()
+
+    def _notify_relay_binary_runtime(self, stream_id: str) -> None:
+        with self._relay_binary_runtimes_lock:
+            runtime = self._relay_binary_runtimes.get(stream_id)
+
+        if runtime is None:
+            return
+
+        with runtime.credit_condition:
+            runtime.credit_condition.notify_all()
+
+    def _clear_relay_binary_runtime(self, stream_id: str) -> None:
+        with self._relay_binary_runtimes_lock:
+            self._relay_binary_runtimes.pop(stream_id, None)
+
+    def _cancel_all_relay_streams(self) -> None:
+        with self._relay_cancel_events_lock:
+            events = list(self._relay_cancel_events.items())
+            self._relay_cancel_events.clear()
+
+        for stream_id, event in events:
+            event.set()
+            self._notify_relay_binary_runtime(stream_id)
+
+        with self._relay_session_runtimes_lock:
+            self._relay_session_runtimes.clear()
+
+        with self._relay_binary_runtimes_lock:
+            self._relay_binary_runtimes.clear()
+
     def _normalize_relay_asset_path(self, asset_path: str) -> str:
         posix_path = PurePosixPath(asset_path)
         if asset_path == "" or posix_path.is_absolute():
@@ -3363,7 +3467,7 @@ class Agent:
         start_byte: int,
         end_byte: int,
         chunk_size: int,
-        cancel_event: threading.Event,
+        runtime: _RelayBinaryRuntime,
     ) -> None:
         try:
             source = self._get_relay_source(source_id)
@@ -3405,15 +3509,20 @@ class Agent:
                 offset = start_byte
                 remaining = end_byte - start_byte + 1
                 read_size = max(1, min(chunk_size, self.RELAY_CHUNK_SIZE))
-                while remaining > 0 and not cancel_event.is_set():
-                    chunk = handle.read(min(read_size, remaining))
+                while remaining > 0 and not runtime.cancel_event.is_set():
+                    allowed = self._claim_relay_credit(
+                        runtime, min(read_size, remaining)
+                    )
+                    if allowed <= 0:
+                        break
+                    chunk = handle.read(allowed)
                     if chunk == b"":
                         break
                     self._relay_send_binary_chunk(stream_id, offset, chunk)
                     offset += len(chunk)
                     remaining -= len(chunk)
 
-            if not cancel_event.is_set():
+            if not runtime.cancel_event.is_set():
                 self._relay_send_text({"type": "eof", "stream_id": stream_id})
         except FileNotFoundError:
             self._relay_send_text(
@@ -3437,12 +3546,13 @@ class Agent:
         finally:
             with self._relay_cancel_events_lock:
                 self._relay_cancel_events.pop(stream_id, None)
+            self._clear_relay_binary_runtime(stream_id)
 
     def _serve_relay_live_stream(
         self,
         stream_id: str,
         source_id: str,
-        cancel_event: threading.Event,
+        runtime: _RelayBinaryRuntime,
     ) -> None:
         offset = 0
         try:
@@ -3468,20 +3578,26 @@ class Agent:
                 )
                 return
 
-            for chunk in source.open_chunks(cancel_event):
-                if cancel_event.is_set():
+            for chunk in source.open_chunks(runtime.cancel_event):
+                if runtime.cancel_event.is_set():
                     break
                 if not isinstance(chunk, (bytes, bytearray, memoryview)):
                     raise TypeError(
                         "Relay live stream chunks must be bytes-like values."
                     )
                 data = bytes(chunk)
-                if data == b"":
-                    continue
-                self._relay_send_binary_chunk(stream_id, offset, data)
-                offset += len(data)
+                while data != b"" and not runtime.cancel_event.is_set():
+                    allowed = self._claim_relay_credit(
+                        runtime, min(len(data), self.RELAY_CHUNK_SIZE)
+                    )
+                    if allowed <= 0:
+                        break
+                    chunk = data[:allowed]
+                    data = data[allowed:]
+                    self._relay_send_binary_chunk(stream_id, offset, chunk)
+                    offset += len(chunk)
 
-            if not cancel_event.is_set():
+            if not runtime.cancel_event.is_set():
                 self._relay_send_text({"type": "eof", "stream_id": stream_id})
         except Exception as exc:
             logger.exception(
@@ -3498,6 +3614,7 @@ class Agent:
         finally:
             with self._relay_cancel_events_lock:
                 self._relay_cancel_events.pop(stream_id, None)
+            self._clear_relay_binary_runtime(stream_id)
             self._clear_relay_session_runtime(stream_id)
 
     def _serve_relay_asset(
@@ -3505,7 +3622,7 @@ class Agent:
         stream_id: str,
         source_id: str,
         asset_path: str,
-        cancel_event: threading.Event,
+        runtime: _RelayBinaryRuntime,
     ) -> None:
         try:
             normalized_asset_path = self._normalize_relay_asset_path(asset_path)
@@ -3550,14 +3667,21 @@ class Agent:
 
             with asset_file.open("rb") as handle:
                 offset = 0
-                while not cancel_event.is_set():
-                    chunk = handle.read(self.RELAY_CHUNK_SIZE)
+                remaining = asset_file.stat().st_size
+                while remaining > 0 and not runtime.cancel_event.is_set():
+                    allowed = self._claim_relay_credit(
+                        runtime, min(self.RELAY_CHUNK_SIZE, remaining)
+                    )
+                    if allowed <= 0:
+                        break
+                    chunk = handle.read(allowed)
                     if chunk == b"":
                         break
                     self._relay_send_binary_chunk(stream_id, offset, chunk)
                     offset += len(chunk)
+                    remaining -= len(chunk)
 
-            if not cancel_event.is_set():
+            if not runtime.cancel_event.is_set():
                 self._relay_send_text({"type": "eof", "stream_id": stream_id})
         except FileNotFoundError:
             self._relay_send_text(
@@ -3581,6 +3705,7 @@ class Agent:
         finally:
             with self._relay_cancel_events_lock:
                 self._relay_cancel_events.pop(stream_id, None)
+            self._clear_relay_binary_runtime(stream_id)
 
     def _serve_relay_text_session(
         self,
