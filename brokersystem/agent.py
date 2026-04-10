@@ -35,6 +35,7 @@ import PIL.Image
 import requests
 import websocket
 from logzero import logger
+from requests.adapters import HTTPAdapter
 
 from . import __version__
 
@@ -42,6 +43,7 @@ JsonDict = dict[str, Any]
 JsonPayload = dict[str, Any]
 BinaryData = bytes | bytearray | memoryview
 UploadValue = BinaryData | PathLike[str] | str
+DEFAULT_HTTP_POOL_MAXSIZE = 8
 AgentFactory = Callable[[Callable[..., JsonDict | None]], Callable[..., "Agent"]]
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -1047,6 +1049,32 @@ def _retryable_http_status(status_code: int) -> bool:
 
 def _retry_deadline_remaining(started_at: float, deadline_seconds: float) -> float:
     return deadline_seconds - (time.perf_counter() - started_at)
+
+
+def _create_http_session(
+    *, pool_maxsize: int = DEFAULT_HTTP_POOL_MAXSIZE
+) -> requests.Session:
+    session = requests.Session()
+    adapter = HTTPAdapter(
+        pool_connections=pool_maxsize,
+        pool_maxsize=pool_maxsize,
+        max_retries=0,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def _get_thread_session(
+    storage: threading.local,
+    *,
+    pool_maxsize: int = DEFAULT_HTTP_POOL_MAXSIZE,
+) -> requests.Session:
+    session = getattr(storage, "session", None)
+    if session is None:
+        session = _create_http_session(pool_maxsize=pool_maxsize)
+        storage.session = session
+    return cast(requests.Session, session)
 
 
 def _sleep_for_retry(
@@ -2729,6 +2757,7 @@ class Agent:
     def __init__(self, broker_url: str) -> None:
         self._to_show_i_am_agent_instance = True
         self.broker_url: str = broker_url
+        self._http_session_local = threading.local()
         self.access_token: str | None = None
         self.agent_funcs: dict[str, Callable[..., Any]] = {}
         self.running: bool = False
@@ -2760,6 +2789,9 @@ class Agent:
         self._relay_cancel_events_lock = threading.Lock()
         self._relay_session_runtimes: dict[str, _RelaySessionRuntime] = {}
         self._relay_session_runtimes_lock = threading.Lock()
+
+    def _http_session(self) -> requests.Session:
+        return _get_thread_session(self._http_session_local)
 
     def _increase_polling_interval(self) -> None:
         if self.polling_interval <= 0:
@@ -4107,7 +4139,7 @@ class Agent:
                 read_timeout_cap=self.REQUEST_READ_TIMEOUT,
             )
             try:
-                response = requests.request(
+                response = self._http_session().request(
                     method,
                     url,
                     json=payload,
@@ -4276,7 +4308,7 @@ class Agent:
                 read_timeout_cap=self.UPLOAD_READ_TIMEOUT,
             )
             try:
-                response = requests.post(
+                response = self._http_session().post(
                     f"{self.broker_url}/api/v1/agent/upload",
                     headers=self.header(upload=True),
                     files=files,
@@ -5054,6 +5086,10 @@ class Broker:
             self.auth = job._agent.interface.agent_auth
         else:
             raise TypeError
+        self._http_session_local = threading.local()
+
+    def _http_session(self) -> requests.Session:
+        return _get_thread_session(self._http_session_local)
 
     def ask(
         self,
@@ -5364,7 +5400,7 @@ class Broker:
                 read_timeout_cap=Agent.UPLOAD_READ_TIMEOUT,
             )
             try:
-                response = requests.get(
+                response = self._http_session().get(
                     url,
                     headers=headers,
                     timeout=timeout,
@@ -5603,7 +5639,7 @@ class Broker:
                 read_timeout_cap=Agent.REQUEST_READ_TIMEOUT,
             )
             try:
-                response = requests.request(
+                response = self._http_session().request(
                     method,
                     url,
                     json=payload,
@@ -5752,7 +5788,7 @@ class Broker:
                 read_timeout_cap=Agent.UPLOAD_READ_TIMEOUT,
             )
             try:
-                response = requests.post(
+                response = self._http_session().post(
                     f"{self.broker_url}/api/v1/client/{uri}",
                     headers=self.header_auth,
                     files=files,
@@ -5861,6 +5897,10 @@ class BrokerAdmin:
         """
         self.broker_url = broker_url
         self.token = token
+        self._http_session_local = threading.local()
+
+    def _http_session(self) -> requests.Session:
+        return _get_thread_session(self._http_session_local)
 
     @property
     def header(self) -> dict[str, str]:
@@ -5887,7 +5927,7 @@ class BrokerAdmin:
                 read_timeout_cap=Agent.REQUEST_READ_TIMEOUT,
             )
             try:
-                response = requests.request(
+                response = self._http_session().request(
                     method,
                     f"{self.broker_url}/api/v1/broker/{uri}",
                     json=payload,
@@ -5969,7 +6009,7 @@ class BrokerAdmin:
                 read_timeout_cap=Agent.UPLOAD_READ_TIMEOUT,
             )
             try:
-                response = requests.get(
+                response = self._http_session().get(
                     f"{self.broker_url}/api/v1/broker/{uri}",
                     headers=self.header_auth,
                     timeout=timeout,

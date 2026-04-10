@@ -1,5 +1,6 @@
 import json
 import threading
+from queue import Queue
 
 import pytest
 import responses
@@ -14,6 +15,7 @@ from brokersystem.agent import (
     RelayAssetSource,
     RelayStreamSource,
     UploadedFile,
+    _get_thread_session,
     _relay_socket_url,
 )
 
@@ -29,6 +31,24 @@ def build_agent() -> Agent:
     agent.REQUEST_RETRY_MAX = 0.0
     agent.CONTRACT_LEASE_RETRY_DEADLINE = 0.0
     return agent
+
+
+def test_get_thread_session_reuses_current_thread_and_separates_threads() -> None:
+    storage = threading.local()
+    main_session = _get_thread_session(storage)
+    assert _get_thread_session(storage) is main_session
+
+    queue: Queue[object] = Queue()
+
+    def worker() -> None:
+        queue.put(_get_thread_session(storage))
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+
+    worker_session = queue.get_nowait()
+    assert worker_session is not main_session
 
 
 @responses.activate
