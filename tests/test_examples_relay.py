@@ -170,6 +170,46 @@ def test_relay_video_webcam_adaptive_entry_path_points_to_media_playlist() -> No
     assert template.profiles["hls"].entry_path == module.ADAPTIVE_HLS_MEDIA_PLAYLIST_PATH
 
 
+def test_relay_video_webcam_starts_ffmpeg_in_output_dir(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module = _load_module(
+        "relay_video_webcam_example_cwd",
+        EXAMPLES_DIR / "relay_video_webcam.py",
+    )
+    popen_kwargs: dict[str, object] = {}
+
+    class FakeProcess:
+        def poll(self) -> None:
+            return None
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        popen_kwargs.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        module.WebcamRelayCapture,
+        "_wait_until_ready_locked",
+        lambda self: None,
+    )
+
+    capture = module.WebcamRelayCapture(
+        source_kind="testsrc",
+        source="testsrc2",
+        audio_source=None,
+        video_encoder="libx264",
+        output_format="adaptive",
+        width=320,
+        height=180,
+        fps=5,
+        output_dir=tmp_path,
+    )
+    capture.ensure_running()
+
+    assert popen_kwargs["cwd"] == tmp_path
+
+
 def test_relay_video_examples_print_ffmpeg_header_with_real_crlf_shell_syntax() -> None:
     webcam = _load_module(
         "relay_video_webcam_example_ffmpeg_header",

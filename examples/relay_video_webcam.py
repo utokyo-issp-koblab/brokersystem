@@ -532,6 +532,7 @@ class WebcamRelayCapture:
                 command,
                 stdout=subprocess.DEVNULL,
                 stderr=log_handle,
+                cwd=self.output_dir,
             )
         finally:
             log_handle.close()
