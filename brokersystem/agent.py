@@ -11,10 +11,10 @@ import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlsplit, urlunsplit
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from os import PathLike
 from pathlib import Path, PurePosixPath
@@ -29,6 +29,7 @@ from typing import (
     TypeVar,
     cast,
 )
+from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
 import PIL.Image
@@ -44,6 +45,8 @@ JsonPayload = dict[str, Any]
 BinaryData = bytes | bytearray | memoryview
 UploadValue = BinaryData | PathLike[str] | str
 DEFAULT_HTTP_POOL_MAXSIZE = 8
+DEFAULT_429_RETRY_BASE_SECONDS = 2.0
+DEFAULT_429_RETRY_MAX_SECONDS = 15.0
 AgentFactory = Callable[[Callable[..., JsonDict | None]], Callable[..., "Agent"]]
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -1133,6 +1136,49 @@ def _retry_deadline_remaining(started_at: float, deadline_seconds: float) -> flo
     return deadline_seconds - (time.perf_counter() - started_at)
 
 
+def _retry_after_seconds(
+    headers: Mapping[str, str],
+    *,
+    now: datetime | None = None,
+) -> float | None:
+    raw_value = headers.get("Retry-After")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    if not value:
+        return None
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    reference_time = datetime.now(timezone.utc) if now is None else now
+    return max((retry_at - reference_time).total_seconds(), 0.0)
+
+
+def _retry_delay_seconds(
+    attempt: int,
+    base: float,
+    cap: float,
+    *,
+    status_code: int | None = None,
+    retry_after: float | None = None,
+) -> float:
+    if retry_after is not None:
+        return max(retry_after, 0.0)
+    effective_base = base
+    effective_cap = cap
+    if status_code == 429:
+        effective_base = max(base, DEFAULT_429_RETRY_BASE_SECONDS)
+        effective_cap = max(cap, DEFAULT_429_RETRY_MAX_SECONDS)
+    return _backoff_seconds(attempt, effective_base, effective_cap)
+
+
 def _create_http_session(
     *, pool_maxsize: int = DEFAULT_HTTP_POOL_MAXSIZE
 ) -> requests.Session:
@@ -1165,11 +1211,23 @@ def _sleep_for_retry(
     attempt: int,
     base: float,
     cap: float,
+    *,
+    status_code: int | None = None,
+    retry_after: float | None = None,
 ) -> bool:
     remaining = _retry_deadline_remaining(started_at, deadline_seconds)
     if remaining <= 0:
         return False
-    delay = min(remaining, _backoff_seconds(attempt, base, cap))
+    delay = min(
+        remaining,
+        _retry_delay_seconds(
+            attempt,
+            base,
+            cap,
+            status_code=status_code,
+            retry_after=retry_after,
+        ),
+    )
     if delay <= 0:
         return False
     time.sleep(delay)
@@ -4501,6 +4559,8 @@ class Agent:
                     attempt,
                     self.REQUEST_RETRY_BASE,
                     self.REQUEST_RETRY_MAX,
+                    status_code=response.status_code,
+                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue
@@ -4656,6 +4716,8 @@ class Agent:
                     attempt,
                     self.REQUEST_RETRY_BASE,
                     self.REQUEST_RETRY_MAX,
+                    status_code=response.status_code,
+                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue
@@ -5718,6 +5780,8 @@ class Broker:
                     attempt,
                     Agent.REQUEST_RETRY_BASE,
                     Agent.REQUEST_RETRY_MAX,
+                    status_code=response.status_code,
+                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue
@@ -5740,6 +5804,8 @@ class Broker:
                     attempt,
                     Agent.REQUEST_RETRY_BASE,
                     Agent.REQUEST_RETRY_MAX,
+                    status_code=response.status_code,
+                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue
@@ -5978,6 +6044,8 @@ class Broker:
                     attempt,
                     Agent.REQUEST_RETRY_BASE,
                     Agent.REQUEST_RETRY_MAX,
+                    status_code=response.status_code,
+                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue
@@ -6007,6 +6075,8 @@ class Broker:
                     attempt,
                     Agent.REQUEST_RETRY_BASE,
                     Agent.REQUEST_RETRY_MAX,
+                    status_code=response.status_code,
+                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue
@@ -6125,6 +6195,8 @@ class Broker:
                     attempt,
                     Agent.REQUEST_RETRY_BASE,
                     Agent.REQUEST_RETRY_MAX,
+                    status_code=response.status_code,
+                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue
@@ -6150,6 +6222,8 @@ class Broker:
                     attempt,
                     Agent.REQUEST_RETRY_BASE,
                     Agent.REQUEST_RETRY_MAX,
+                    status_code=response.status_code,
+                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue
@@ -6267,6 +6341,8 @@ class BrokerAdmin:
                     attempt,
                     Agent.REQUEST_RETRY_BASE,
                     Agent.REQUEST_RETRY_MAX,
+                    status_code=response.status_code,
+                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue
@@ -6290,6 +6366,8 @@ class BrokerAdmin:
                     attempt,
                     Agent.REQUEST_RETRY_BASE,
                     Agent.REQUEST_RETRY_MAX,
+                    status_code=response.status_code,
+                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue
@@ -6370,6 +6448,8 @@ class BrokerAdmin:
                     attempt,
                     Agent.REQUEST_RETRY_BASE,
                     Agent.REQUEST_RETRY_MAX,
+                    status_code=response.status_code,
+                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue

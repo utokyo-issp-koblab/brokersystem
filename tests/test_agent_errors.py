@@ -1,5 +1,7 @@
 import json
 import threading
+import time
+from datetime import datetime, timezone
 from queue import Queue
 
 import pytest
@@ -17,7 +19,9 @@ from brokersystem.agent import (
     UploadedFile,
     _RelayBinaryRuntime,
     _get_thread_session,
+    _retry_after_seconds,
     _relay_socket_url,
+    _sleep_for_retry,
 )
 
 BROKER_URL = "https://example.test"
@@ -61,6 +65,37 @@ def test_get_thread_session_reuses_current_thread_and_separates_threads() -> Non
     assert worker_session is not main_session
 
 
+def test_retry_after_seconds_parses_delta_seconds() -> None:
+    assert _retry_after_seconds({"Retry-After": "3"}) == 3.0
+
+
+def test_retry_after_seconds_parses_http_date() -> None:
+    now = datetime(2026, 4, 12, 12, 0, 0, tzinfo=timezone.utc)
+    assert (
+        _retry_after_seconds(
+            {"Retry-After": "Sun, 12 Apr 2026 12:00:07 GMT"},
+            now=now,
+        )
+        == 7.0
+    )
+
+
+def test_sleep_for_retry_uses_429_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays: list[float] = []
+
+    monkeypatch.setattr("brokersystem.agent.time.sleep", delays.append)
+
+    assert _sleep_for_retry(
+        time.perf_counter(),
+        deadline_seconds=30.0,
+        attempt=0,
+        base=0.5,
+        cap=5.0,
+        status_code=429,
+    )
+    assert delays == [2.0]
+
+
 @responses.activate
 def test_agent_get_raises_on_http_error() -> None:
     agent = build_agent()
@@ -73,6 +108,37 @@ def test_agent_get_raises_on_http_error() -> None:
 
     with pytest.raises(AgentHTTPError):
         agent.get("msgbox", basic_auth=True)
+
+
+@responses.activate
+def test_agent_get_retries_retry_after_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = build_agent()
+    agent.REQUEST_RETRY_DEADLINE = 10.0
+    agent.REQUEST_RETRY_BASE = 0.5
+    agent.REQUEST_RETRY_MAX = 5.0
+    delays: list[float] = []
+    monkeypatch.setattr("brokersystem.agent.time.sleep", delays.append)
+
+    responses.add(
+        responses.GET,
+        f"{BROKER_URL}/api/v1/agent/msgbox",
+        status=429,
+        body="Too Many Requests",
+        headers={"Retry-After": "7"},
+    )
+    responses.add(
+        responses.GET,
+        f"{BROKER_URL}/api/v1/agent/msgbox",
+        status=200,
+        json={"messages": []},
+    )
+
+    payload = agent.get("msgbox", basic_auth=True)
+
+    assert payload == {"messages": []}
+    assert delays == [7.0]
 
 
 def test_relay_socket_url_normalizes_http_and_https() -> None:
