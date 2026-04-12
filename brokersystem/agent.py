@@ -94,6 +94,14 @@ class RelayAssetSource:
     entry_path: str
 
 
+@dataclass(frozen=True)
+class RelayMediaProfile:
+    """One playback profile exposed from a relay-backed media asset tree."""
+
+    entry_path: str
+    content_type: str
+
+
 RelaySourceValue = (
     PathLike[str] | str | RelayStreamSource | RelaySessionSource | RelayAssetSource
 )
@@ -240,9 +248,21 @@ RelayMediaValue = TypedDict(
         "live": bool,
         "playback_uri": str,
         "download_uri": str,
+        "default_profile": str,
+        "profiles": dict[str, dict[str, str]],
     },
     total=False,
 )
+
+
+class RelayMediaProfileMetadata(TypedDict):
+    entry_path: str
+    content_type: str
+
+
+class RelayMediaProfilesMetadata(TypedDict):
+    default_profile: str
+    profiles: dict[str, RelayMediaProfileMetadata]
 
 
 RelaySessionValue = TypedDict(
@@ -271,6 +291,15 @@ class RelayFileHandle:
 
 
 @dataclass(frozen=True)
+class RelayMediaProfileHandle:
+    """One parsed playback profile available on a relay-media handle."""
+
+    name: str
+    playback_uri: str
+    content_type: str
+
+
+@dataclass(frozen=True)
 class RelayMediaHandle:
     """Parsed relay-media handle returned by the client API."""
 
@@ -281,6 +310,15 @@ class RelayMediaHandle:
     content_type: str
     availability: str
     live: bool
+    default_profile: str | None = None
+    profiles: tuple[RelayMediaProfileHandle, ...] = ()
+
+    def get_profile(self, name: str) -> RelayMediaProfileHandle | None:
+        """Return the named playback profile when present."""
+        for profile in self.profiles:
+            if profile.name == name:
+                return profile
+        return None
 
 
 @dataclass(frozen=True)
@@ -963,6 +1001,16 @@ def _parse_relay_media_handle(
             f"expected relay_media metadata but got kind={relay_kind!r}",
             relay_value,
         )
+    profiles = _parse_relay_media_profiles(relay_value, context=context)
+    default_profile = _get_optional_str(relay_value, "default_profile", context)
+    if default_profile is not None and all(
+        profile.name != default_profile for profile in profiles
+    ):
+        _raise_malformed_response(
+            context,
+            f"default_profile={default_profile!r} is missing from relay_media profiles",
+            relay_value,
+        )
     return RelayMediaHandle(
         playback_uri=_require_str(relay_value, "playback_uri", context),
         download_uri=_get_optional_str(relay_value, "download_uri", context),
@@ -971,7 +1019,41 @@ def _parse_relay_media_handle(
         content_type=_require_str(relay_value, "content_type", context),
         availability=_require_str(relay_value, "availability", context),
         live=_require_bool(relay_value, "live", context),
+        default_profile=default_profile,
+        profiles=profiles,
     )
+
+
+def _parse_relay_media_profiles(
+    value: Mapping[str, object], *, context: str
+) -> tuple[RelayMediaProfileHandle, ...]:
+    raw_profiles_obj = value.get("profiles")
+    if raw_profiles_obj is None:
+        return ()
+    if not isinstance(raw_profiles_obj, Mapping):
+        _raise_malformed_response(context, "field 'profiles' is not an object", value)
+    profiles = cast(Mapping[object, object], raw_profiles_obj)
+    parsed: list[RelayMediaProfileHandle] = []
+    for name, profile_obj in profiles.items():
+        if not isinstance(name, str) or name == "":
+            _raise_malformed_response(
+                context,
+                "relay_media profiles must use non-empty string names",
+                value,
+            )
+        profile = _require_object_mapping(profile_obj, f"{context}.profiles.{name}")
+        parsed.append(
+            RelayMediaProfileHandle(
+                name=name,
+                playback_uri=_require_str(
+                    profile, "playback_uri", f"{context}.profiles.{name}"
+                ),
+                content_type=_require_str(
+                    profile, "content_type", f"{context}.profiles.{name}"
+                ),
+            )
+        )
+    return tuple(parsed)
 
 
 def _parse_relay_session_handle(
@@ -1817,13 +1899,20 @@ class RelayFile(ValueTemplate):
 
 
 class RelayMedia(ValueTemplate):
-    """Relay-backed media template for playable stored or live media."""
+    """Relay-backed media template for playable stored or live media.
+
+    Use plain `content_type` for single-format media such as a standalone file or
+    a simple HLS relay. Use `profiles` when one relay-backed asset tree exposes
+    multiple playback manifests, for example DASH plus HLS on CMAF.
+    """
 
     def __init__(
         self,
         name: str | None = None,
         content_type: str | None = None,
         live: bool = False,
+        profiles: Mapping[str, RelayMediaProfile] | None = None,
+        default_profile: str | None = None,
         help: str | None = None,
     ) -> None:
         super().__init__(help=help)
@@ -1831,6 +1920,10 @@ class RelayMedia(ValueTemplate):
         self.name = name
         self.content_type = content_type
         self.live = live
+        self.profiles = dict(profiles or {})
+        """Named playback manifests exposed from one relay asset tree."""
+        self.default_profile = default_profile
+        """Profile name used for the top-level playback URI/content type."""
 
     def format_for_output(
         self,
@@ -1838,12 +1931,24 @@ class RelayMedia(ValueTemplate):
         uploader: Callable[[str, bytes], JsonDict],
         relay_registrar: RelayRegistrar | None = None,
     ) -> tuple[Any, JsonDict]:
-        """Register a relay media source and return tagged media metadata."""
+        """Register a relay media source and return tagged media metadata.
+
+        When `profiles` is configured, `value` must be a `RelayAssetSource` so
+        each profile can point at one manifest under the same rooted asset tree.
+        """
         if relay_registrar is None:
             raise RuntimeError("Relay registrar is required for RelayMedia outputs")
 
+        effective_content_type = self.content_type
+        profile_metadata = self._build_profile_metadata(value)
+        if effective_content_type is None and profile_metadata is not None:
+            default_profile = profile_metadata["default_profile"]
+            effective_content_type = profile_metadata["profiles"][default_profile][
+                "content_type"
+            ]
+
         if self.live and isinstance(value, (RelayStreamSource, RelayAssetSource)):
-            metadata = relay_registrar(value, self.name, self.content_type)
+            metadata = relay_registrar(value, self.name, effective_content_type)
         else:
             try:
                 path_value = cast(PathLike[str] | str, value)
@@ -1855,7 +1960,7 @@ class RelayMedia(ValueTemplate):
                     f" but got: {value} (type: {type(value)}); {exc}"
                 ) from exc
 
-            metadata = relay_registrar(path, self.name, self.content_type)
+            metadata = relay_registrar(path, self.name, effective_content_type)
         if not isinstance(metadata, dict):
             raise RuntimeError(
                 f"Relay registration returned invalid metadata: {metadata!r}"
@@ -1868,7 +1973,75 @@ class RelayMedia(ValueTemplate):
             relay_tag["kind"] = "relay_media"
             tagged_metadata["$brokersystem"] = relay_tag
         tagged_metadata["live"] = self.live
+        if profile_metadata is not None:
+            tagged_metadata["profiles"] = profile_metadata["profiles"]
+            tagged_metadata["default_profile"] = profile_metadata["default_profile"]
+            tagged_metadata["entry_path"] = profile_metadata["profiles"][
+                profile_metadata["default_profile"]
+            ]["entry_path"]
+            tagged_metadata["content_type"] = profile_metadata["profiles"][
+                profile_metadata["default_profile"]
+            ]["content_type"]
         return tagged_metadata, self.format_dict
+
+    def _build_profile_metadata(
+        self, value: PathLike[str] | str | RelayStreamSource | RelayAssetSource
+    ) -> RelayMediaProfilesMetadata | None:
+        if not self.profiles:
+            return None
+        if not isinstance(value, RelayAssetSource):
+            raise TypeError(
+                "RelayMedia profiles require a RelayAssetSource value so that each"
+                " playback profile can point at a file under one rooted asset tree."
+            )
+
+        raw_profiles: dict[str, RelayMediaProfileMetadata] = {
+            name: {
+                "entry_path": self._normalize_profile_entry_path(profile.entry_path),
+                "content_type": profile.content_type,
+            }
+            for name, profile in self.profiles.items()
+        }
+        default_profile = self._resolve_default_profile(value, raw_profiles)
+        return {
+            "default_profile": default_profile,
+            "profiles": raw_profiles,
+        }
+
+    def _resolve_default_profile(
+        self,
+        value: RelayAssetSource,
+        profiles: Mapping[str, RelayMediaProfileMetadata],
+    ) -> str:
+        if self.default_profile is not None:
+            if self.default_profile not in profiles:
+                raise ValueError(
+                    "RelayMedia default_profile must match one of the declared"
+                    f" profiles but got: {self.default_profile!r}"
+                )
+            return self.default_profile
+
+        for name, profile in profiles.items():
+            if profile["entry_path"] == value.entry_path:
+                return name
+
+        if len(profiles) == 1:
+            return next(iter(profiles))
+
+        raise ValueError(
+            "RelayMedia with multiple profiles needs default_profile or a"
+            " RelayAssetSource entry_path that matches one declared profile."
+        )
+
+    def _normalize_profile_entry_path(self, entry_path: str) -> str:
+        normalized = str(PurePosixPath(entry_path))
+        if (
+            normalized in {"", ".", ".."}
+            or normalized.startswith("../")
+            or normalized.startswith("/")
+        ):
+            raise ValueError(f"Invalid RelayMedia profile entry_path: {entry_path!r}")
+        return normalized
 
 
 class RelaySession(ValueTemplate):
@@ -5608,19 +5781,38 @@ class Broker:
         relay: RelayMediaHandle | Mapping[str, object],
         *,
         purpose: Literal["playback", "download"] = "playback",
+        profile: str | None = None,
         stream: bool = True,
         byte_range: tuple[int, int | None] | None = None,
     ) -> requests.Response:
-        """Open a relay-media response for playback or download."""
+        """Open a relay-media response for playback or download.
+
+        `profile` selects one named playback manifest exposed by
+        `RelayMediaHandle.profiles`. It is available only for playback because
+        download uses the media handle's dedicated `download_uri`.
+        """
         handle = self.parse_relay_media(relay)
         uri = handle.playback_uri
         if purpose == "download":
+            if profile is not None:
+                raise BrokerResponseError(
+                    "profile selection is only available for playback",
+                    payload=relay,
+                )
             if handle.download_uri is None:
                 raise BrokerResponseError(
                     "relay_media is missing download_uri",
                     payload=relay,
                 )
             uri = handle.download_uri
+        elif profile is not None:
+            selected_profile = handle.get_profile(profile)
+            if selected_profile is None:
+                raise BrokerResponseError(
+                    f"relay_media is missing playback profile {profile!r}",
+                    payload=relay,
+                )
+            uri = selected_profile.playback_uri
         return self._open_binary_uri(uri, stream=stream, byte_range=byte_range)
 
     def download_file(

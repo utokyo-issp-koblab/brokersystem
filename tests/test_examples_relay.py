@@ -107,7 +107,87 @@ def test_relay_video_webcam_builds_dshow_command() -> None:
     assert "-vf" in command
     assert "libx264" in command
     assert "fps=5,scale=1280:720" in command
+    assert "-hls_segment_type" in command
+    assert "fmp4" in command
+    assert "-hls_fmp4_init_filename" in command
+    assert module.HLS_INIT_FILENAME in command
+    assert "temp_file+delete_segments+omit_endlist+independent_segments" in command
+    assert str(Path("/tmp/webcam-hls") / "segment%06d.m4s") in command
     assert str(Path("/tmp/webcam-hls") / "index.m3u8") in command
+
+
+def test_relay_video_webcam_builds_adaptive_command() -> None:
+    module = _load_module(
+        "relay_video_webcam_example_adaptive",
+        EXAMPLES_DIR / "relay_video_webcam.py",
+    )
+    command = module.build_ffmpeg_adaptive_command(
+        ffmpeg_bin="ffmpeg",
+        source_kind="dshow",
+        source="OBS Virtual Camera",
+        audio_source=None,
+        video_encoder="libx264",
+        output_dir=Path("/tmp/webcam-adaptive"),
+        width=1280,
+        height=720,
+        fps=5,
+    )
+    assert command[:3] == ["ffmpeg", "-hide_banner", "-loglevel"]
+    assert "-f" in command
+    assert "dash" in command
+    assert "-ldash" in command
+    assert "-streaming" in command
+    assert "-dash_segment_type" in command
+    assert "mp4" in command
+    assert "-hls_playlist" in command
+    assert "-hls_master_name" in command
+    assert module.ADAPTIVE_HLS_MASTER_PLAYLIST_PATH in command
+    assert "-format_options" in command
+    assert "movflags=cmaf" in command
+    assert "-media_seg_name" in command
+    assert "chunk-$RepresentationID$-$Number%05d$.$ext$" in command
+    assert str(Path("/tmp/webcam-adaptive") / module.DASH_ENTRY_PATH) in command
+
+
+def test_relay_video_webcam_adaptive_entry_path_points_to_media_playlist() -> None:
+    module = _load_module(
+        "relay_video_webcam_example_entry_path",
+        EXAMPLES_DIR / "relay_video_webcam.py",
+    )
+    capture = module.WebcamRelayCapture(
+        source_kind="testsrc",
+        source="testsrc2",
+        audio_source=None,
+        video_encoder="libx264",
+        output_format="adaptive",
+        width=320,
+        height=180,
+        fps=5,
+        output_dir=Path("/tmp/webcam-adaptive-entry-path"),
+    )
+    assert capture.entry_path == module.ADAPTIVE_HLS_MEDIA_PLAYLIST_PATH
+    template = capture.preview_template()
+    assert template.profiles["hls"].entry_path == module.ADAPTIVE_HLS_MEDIA_PLAYLIST_PATH
+
+
+def test_relay_video_examples_print_ffmpeg_header_with_real_crlf_shell_syntax() -> None:
+    webcam = _load_module(
+        "relay_video_webcam_example_ffmpeg_header",
+        EXAMPLES_DIR / "relay_video_webcam.py",
+    )
+    live = _load_module(
+        "relay_video_live_example_ffmpeg_header",
+        EXAMPLES_DIR / "relay_video_live.py",
+    )
+    stored = _load_module(
+        "relay_video_stored_example_ffmpeg_header",
+        EXAMPLES_DIR / "relay_video_stored.py",
+    )
+
+    expected = "$'authorization: Token demo-token\\r\\n'"
+    assert webcam.ffmpeg_auth_header_arg("demo-token") == expected
+    assert live.ffmpeg_auth_header_arg("demo-token") == expected
+    assert stored.ffmpeg_auth_header_arg("demo-token") == expected
 
 
 def test_relay_video_webcam_builds_dshow_command_with_audio() -> None:
@@ -157,6 +237,27 @@ def test_relay_video_webcam_builds_nvenc_command() -> None:
     assert "fps=5,scale=1280:720" in command
 
 
+def test_relay_video_webcam_builds_testsrc_realtime_command() -> None:
+    module = _load_module(
+        "relay_video_webcam_example_testsrc",
+        EXAMPLES_DIR / "relay_video_webcam.py",
+    )
+    command = module.build_ffmpeg_hls_command(
+        ffmpeg_bin="ffmpeg",
+        source_kind="testsrc",
+        source="testsrc2",
+        audio_source=None,
+        video_encoder="libx264",
+        output_dir=Path("/tmp/webcam-hls"),
+        width=640,
+        height=360,
+        fps=5,
+    )
+    assert command[:3] == ["ffmpeg", "-hide_banner", "-loglevel"]
+    assert "-re" in command
+    assert command[command.index("-re") + 1 : command.index("-i")] == ["-f", "lavfi"]
+
+
 def test_relay_video_webcam_testsrc_detection(monkeypatch) -> None:
     module = _load_module(
         "relay_video_webcam_example_detect",
@@ -194,3 +295,12 @@ def test_relay_video_webcam_default_windows_source(monkeypatch) -> None:
     )
     monkeypatch.delenv("VIDEO_DEVICE", raising=False)
     assert module.default_source_for("dshow") == "OBS Virtual Camera"
+
+
+def test_relay_video_webcam_default_output_format(monkeypatch) -> None:
+    module = _load_module(
+        "relay_video_webcam_example_output_format",
+        EXAMPLES_DIR / "relay_video_webcam.py",
+    )
+    monkeypatch.delenv("VIDEO_OUTPUT_FORMAT", raising=False)
+    assert module.resolve_output_format() == "adaptive"

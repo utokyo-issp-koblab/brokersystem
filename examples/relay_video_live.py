@@ -45,6 +45,10 @@ def require_env(key: str) -> str:
     return value
 
 
+def ffmpeg_auth_header_arg(token: str) -> str:
+    return f"$'authorization: Token {token}\\r\\n'"
+
+
 def parse_media_result(
     broker: Broker, result_payload: Mapping[str, object]
 ) -> RelayMediaHandle:
@@ -257,7 +261,7 @@ def run_client(agent_id: str) -> None:
     print("Example ffmpeg usage:")
     print(
         "  "
-        f'ffmpeg -headers "authorization: Basic {require_env("BROKER_TOKEN")}\\r\\n" '
+        f'-headers {ffmpeg_auth_header_arg(require_env("BROKER_TOKEN"))} '
         f'-i "{broker.broker_url}{relay_media.playback_uri}" -t 5 -c copy relay_live_capture.ts'
     )
 

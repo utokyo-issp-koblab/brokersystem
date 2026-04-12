@@ -127,6 +127,8 @@ def _relay_media_value(
     playback_uri: str = "/api/v1/client/relay/files/neg-1/preview",
     download_uri: str | None = "/api/v1/client/relay/files/neg-1/preview",
     content_type: str = "video/webm",
+    profiles: dict[str, dict[str, str]] | None = None,
+    default_profile: str | None = None,
 ) -> dict[str, object]:
     payload = {
         "$brokersystem": {
@@ -143,6 +145,10 @@ def _relay_media_value(
     }
     if download_uri is not None:
         payload["download_uri"] = download_uri
+    if profiles is not None:
+        payload["profiles"] = profiles
+    if default_profile is not None:
+        payload["default_profile"] = default_profile
     return payload
 
 
@@ -406,6 +412,39 @@ def test_broker_parse_relay_media_returns_handle() -> None:
     assert relay_media.live is False
 
 
+def test_broker_parse_relay_media_profiles_returns_named_handles() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+
+    relay_media = broker.parse_relay_media(
+        _relay_media_value(
+            live=True,
+            playback_uri="/api/v1/client/relay/assets/neg-1/preview/stream.m3u8",
+            download_uri=None,
+            content_type="application/vnd.apple.mpegurl",
+            default_profile="hls",
+            profiles={
+                "dash": {
+                    "playback_uri": "/api/v1/client/relay/assets/neg-1/preview/stream.mpd",
+                    "content_type": "application/dash+xml",
+                },
+                "hls": {
+                    "playback_uri": "/api/v1/client/relay/assets/neg-1/preview/stream.m3u8",
+                    "content_type": "application/vnd.apple.mpegurl",
+                },
+            },
+        )
+    )
+
+    assert relay_media.default_profile == "hls"
+    dash_profile = relay_media.get_profile("dash")
+    assert dash_profile is not None
+    assert (
+        dash_profile.playback_uri
+        == "/api/v1/client/relay/assets/neg-1/preview/stream.mpd"
+    )
+    assert relay_media.get_profile("missing") is None
+
+
 def test_broker_parse_relay_media_allows_missing_download_uri() -> None:
     broker = Broker(broker_url=BROKER_URL, auth="token")
 
@@ -433,6 +472,23 @@ def test_broker_parse_relay_media_rejects_missing_playback_uri() -> None:
 
     with pytest.raises(BrokerResponseError, match="Malformed broker response"):
         broker.parse_relay_media(payload)
+
+
+def test_broker_parse_relay_media_rejects_unknown_default_profile() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+
+    with pytest.raises(BrokerResponseError, match="default_profile"):
+        broker.parse_relay_media(
+            _relay_media_value(
+                default_profile="dash",
+                profiles={
+                    "hls": {
+                        "playback_uri": "/api/v1/client/relay/assets/neg-1/preview/stream.m3u8",
+                        "content_type": "application/vnd.apple.mpegurl",
+                    }
+                },
+            )
+        )
 
 
 @responses.activate
@@ -468,6 +524,46 @@ def test_broker_open_media_uses_download_uri_for_download_purpose() -> None:
     response = broker.open_media(relay_media, purpose="download", stream=False)
 
     assert response.content == b"media-bytes"
+    assert responses.calls[0].request.headers["authorization"] == "Basic token"
+
+
+@responses.activate
+def test_broker_open_media_uses_selected_profile_for_playback() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    relay_media = broker.parse_relay_media(
+        _relay_media_value(
+            live=True,
+            playback_uri="/api/v1/client/relay/assets/neg-1/preview/stream.m3u8",
+            download_uri=None,
+            content_type="application/vnd.apple.mpegurl",
+            default_profile="hls",
+            profiles={
+                "dash": {
+                    "playback_uri": "/api/v1/client/relay/assets/neg-1/preview/stream.mpd",
+                    "content_type": "application/dash+xml",
+                },
+                "hls": {
+                    "playback_uri": "/api/v1/client/relay/assets/neg-1/preview/stream.m3u8",
+                    "content_type": "application/vnd.apple.mpegurl",
+                },
+            },
+        )
+    )
+    responses.add(
+        responses.GET,
+        f"{BROKER_URL}/api/v1/client/relay/assets/neg-1/preview/stream.mpd",
+        body=b"<MPD />",
+        status=200,
+    )
+
+    response = broker.open_media(
+        relay_media,
+        purpose="playback",
+        profile="dash",
+        stream=False,
+    )
+
+    assert response.content == b"<MPD />"
     assert responses.calls[0].request.headers["authorization"] == "Basic token"
 
 

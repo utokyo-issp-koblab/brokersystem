@@ -9,6 +9,7 @@ from brokersystem.agent import (
     RelayAssetSource,
     RelayFile,
     RelayMedia,
+    RelayMediaProfile,
     RelaySession,
     RelaySessionSource,
     RelayStreamSource,
@@ -217,6 +218,65 @@ def test_live_relay_media_format_for_output_registers_stream_source() -> None:
     assert value["source_id"] == "src_live"
     assert value["live"] is True
     assert value["$brokersystem"]["kind"] == "relay_media"
+    assert fmt["@type"] == "relay_media"
+
+
+def test_relay_media_format_for_output_includes_profiles(tmp_path) -> None:
+    asset_dir = tmp_path / "adaptive"
+    asset_dir.mkdir()
+    (asset_dir / "stream.mpd").write_text("<MPD />", encoding="utf-8")
+    (asset_dir / "stream.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+    calls = []
+
+    def fake_registrar(source, name, content_type):
+        calls.append((source, name, content_type))
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_file",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": "src_adaptive",
+            "runtime_instance_id": "runtime-adaptive",
+            "name": "webcam-live",
+            "size_bytes": 0,
+            "content_type": "application/vnd.apple.mpegurl",
+            "availability": "agent_online_required",
+            "entry_path": "stream.m3u8",
+        }
+
+    relay_template = RelayMedia(
+        live=True,
+        profiles={
+            "dash": RelayMediaProfile(
+                entry_path="stream.mpd",
+                content_type="application/dash+xml",
+            ),
+            "hls": RelayMediaProfile(
+                entry_path="stream.m3u8",
+                content_type="application/vnd.apple.mpegurl",
+            ),
+        },
+        default_profile="hls",
+        help="Adaptive relay media.",
+    )
+    source = RelayAssetSource(root_dir=asset_dir, entry_path="stream.m3u8")
+    value, fmt = relay_template.format_for_output(source, lambda *_: {}, fake_registrar)
+
+    assert calls == [(source, None, "application/vnd.apple.mpegurl")]
+    assert value["entry_path"] == "stream.m3u8"
+    assert value["content_type"] == "application/vnd.apple.mpegurl"
+    assert value["default_profile"] == "hls"
+    assert value["profiles"] == {
+        "dash": {
+            "entry_path": "stream.mpd",
+            "content_type": "application/dash+xml",
+        },
+        "hls": {
+            "entry_path": "stream.m3u8",
+            "content_type": "application/vnd.apple.mpegurl",
+        },
+    }
     assert fmt["@type"] == "relay_media"
 
 

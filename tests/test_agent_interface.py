@@ -11,6 +11,7 @@ from brokersystem.agent import (
     RelayAssetSource,
     RelayFile,
     RelayMedia,
+    RelayMediaProfile,
     RelayStreamSource,
     Table,
     UserInfoField,
@@ -317,6 +318,71 @@ def test_format_for_output_registers_live_asset_tree_media_without_upload(
     assert result["preview"]["source_id"] == "src_live_hls"
     assert result["preview"]["entry_path"] == "index.m3u8"
     assert result["preview"]["live"] is True
+
+
+def test_format_for_output_registers_live_adaptive_media_profiles(tmp_path) -> None:
+    interface = AgentInterface()
+    interface.output.preview = RelayMedia(
+        live=True,
+        profiles={
+            "dash": RelayMediaProfile(
+                entry_path="stream.mpd",
+                content_type="application/dash+xml",
+            ),
+            "hls": RelayMediaProfile(
+                entry_path="stream.m3u8",
+                content_type="application/vnd.apple.mpegurl",
+            ),
+        },
+        default_profile="hls",
+        help="Adaptive live preview relayed through the broker.",
+    )
+
+    asset_dir = tmp_path / "adaptive"
+    asset_dir.mkdir()
+    (asset_dir / "stream.mpd").write_text("<MPD />", encoding="utf-8")
+    (asset_dir / "stream.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+
+    upload_calls = []
+    relay_calls = []
+
+    def fake_uploader(file_type: str, data: bytes):
+        upload_calls.append((file_type, data))
+        return {"file_id": "unexpected"}
+
+    def fake_relay_registrar(source, name, content_type):
+        relay_calls.append((source, name, content_type))
+        return {
+            "$brokersystem": {
+                "version": 1,
+                "kind": "relay_file",
+                "transport": "broker_relay_v1",
+            },
+            "source_id": "src_live_adaptive",
+            "runtime_instance_id": "runtime-live-adaptive",
+            "name": "preview",
+            "size_bytes": 0,
+            "content_type": "application/vnd.apple.mpegurl",
+            "availability": "agent_online_required",
+            "entry_path": "stream.m3u8",
+        }
+
+    source = RelayAssetSource(root_dir=asset_dir, entry_path="stream.m3u8")
+
+    result = interface.format_for_output(
+        {"preview": source},
+        fake_uploader,
+        fake_relay_registrar,
+    )
+
+    assert upload_calls == []
+    assert relay_calls == [(source, None, "application/vnd.apple.mpegurl")]
+    assert result["preview"]["default_profile"] == "hls"
+    assert result["preview"]["profiles"]["dash"]["entry_path"] == "stream.mpd"
+    assert (
+        result["preview"]["profiles"]["hls"]["content_type"]
+        == "application/vnd.apple.mpegurl"
+    )
 
 
 def test_make_config_includes_user_info_request() -> None:

@@ -41,6 +41,10 @@ def require_env(key: str) -> str:
     return value
 
 
+def ffmpeg_auth_header_arg(token: str) -> str:
+    return f"$'authorization: Token {token}\\r\\n'"
+
+
 def create_demo_video(path: Path) -> Path:
     """Copy the bundled demo video for relay-media examples."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -153,7 +157,11 @@ def run_client(agent_id: str, destination: str | None) -> None:
     print("Elapsed seconds:", round(elapsed, 3))
     print("Throughput MiB/s:", round(mib_s, 3))
     print("Example ffmpeg usage:")
-    print(f'  ffmpeg -i "{relay_media.playback_uri}" -c copy relay_preview_copy.webm')
+    print(
+        "  "
+        f'-headers {ffmpeg_auth_header_arg(require_env("BROKER_TOKEN"))} '
+        f'-i "{broker.broker_url}{relay_media.playback_uri}" -c copy relay_preview_copy.webm'
+    )
 
 
 def main() -> None:
