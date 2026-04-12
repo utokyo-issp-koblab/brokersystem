@@ -5,6 +5,8 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES_DIR = REPO_ROOT / "examples"
 
@@ -149,11 +151,14 @@ def test_relay_video_webcam_builds_adaptive_command() -> None:
     assert str(Path("/tmp/webcam-adaptive") / module.DASH_ENTRY_PATH) in command
 
 
-def test_relay_video_webcam_adaptive_entry_path_points_to_media_playlist() -> None:
+def test_relay_video_webcam_adaptive_entry_path_points_to_media_playlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = _load_module(
         "relay_video_webcam_example_entry_path",
         EXAMPLES_DIR / "relay_video_webcam.py",
     )
+    monkeypatch.setattr(module, "resolve_ffmpeg_bin", lambda: "ffmpeg")
     capture = module.WebcamRelayCapture(
         source_kind="testsrc",
         source="testsrc2",
@@ -167,11 +172,13 @@ def test_relay_video_webcam_adaptive_entry_path_points_to_media_playlist() -> No
     )
     assert capture.entry_path == module.ADAPTIVE_HLS_MEDIA_PLAYLIST_PATH
     template = capture.preview_template()
-    assert template.profiles["hls"].entry_path == module.ADAPTIVE_HLS_MEDIA_PLAYLIST_PATH
+    assert (
+        template.profiles["hls"].entry_path == module.ADAPTIVE_HLS_MEDIA_PLAYLIST_PATH
+    )
 
 
 def test_relay_video_webcam_starts_ffmpeg_in_output_dir(
-    monkeypatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     module = _load_module(
         "relay_video_webcam_example_cwd",
@@ -187,6 +194,7 @@ def test_relay_video_webcam_starts_ffmpeg_in_output_dir(
         popen_kwargs.update(kwargs)
         return FakeProcess()
 
+    monkeypatch.setattr(module, "resolve_ffmpeg_bin", lambda: "ffmpeg")
     monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(
         module.WebcamRelayCapture,

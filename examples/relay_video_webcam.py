@@ -567,7 +567,9 @@ class WebcamRelayCapture:
 
             dash_text = dash_path.read_text(encoding="utf-8", errors="ignore")
             hls_text = hls_path.read_text(encoding="utf-8", errors="ignore")
-            return "<MPD" in dash_text and "#EXTM3U" in hls_text and "chunk-" in hls_text
+            return (
+                "<MPD" in dash_text and "#EXTM3U" in hls_text and "chunk-" in hls_text
+            )
 
         playlist_path = self.output_dir / HLS_ENTRY_PATH
         if not playlist_path.exists():

@@ -5780,8 +5780,6 @@ class Broker:
                     attempt,
                     Agent.REQUEST_RETRY_BASE,
                     Agent.REQUEST_RETRY_MAX,
-                    status_code=response.status_code,
-                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue
@@ -6044,8 +6042,6 @@ class Broker:
                     attempt,
                     Agent.REQUEST_RETRY_BASE,
                     Agent.REQUEST_RETRY_MAX,
-                    status_code=response.status_code,
-                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue
@@ -6195,8 +6191,6 @@ class Broker:
                     attempt,
                     Agent.REQUEST_RETRY_BASE,
                     Agent.REQUEST_RETRY_MAX,
-                    status_code=response.status_code,
-                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue
@@ -6341,8 +6335,6 @@ class BrokerAdmin:
                     attempt,
                     Agent.REQUEST_RETRY_BASE,
                     Agent.REQUEST_RETRY_MAX,
-                    status_code=response.status_code,
-                    retry_after=_retry_after_seconds(response.headers),
                 ):
                     attempt += 1
                     continue
