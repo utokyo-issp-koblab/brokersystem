@@ -14,6 +14,7 @@ from brokersystem.agent import (
     AgentUploadError,
     File,
     Job,
+    JobCancelledError,
     RelayAssetSource,
     RelayStreamSource,
     UploadedFile,
@@ -41,6 +42,7 @@ def build_agent() -> Agent:
 def build_binary_runtime(credit_bytes: int = 1024) -> _RelayBinaryRuntime:
     return _RelayBinaryRuntime(
         stream_id="stream-test",
+        source_id="source-test",
         cancel_event=threading.Event(),
         credit_condition=threading.Condition(),
         available_credit=credit_bytes,
@@ -289,6 +291,31 @@ def test_job_upload_parallel_returns_report_ready_mapping() -> None:
     ]
 
 
+def test_job_exposes_broker_metadata_and_cancellation_flag() -> None:
+    agent = build_agent()
+    job = Job(
+        agent,
+        "neg-cancel",
+        {"_broker": {"max_duration_minutes": 5, "client_tag": "demo"}},
+    )
+
+    assert job.job_id == "neg-cancel"
+    assert job.id == "neg-cancel"
+    assert job.max_duration_minutes == 5
+    assert job.broker_metadata == {
+        "max_duration_minutes": 5,
+        "client_tag": "demo",
+    }
+    assert job.cancel_requested is False
+
+    job._request_cancel("client_requested")
+
+    assert job.cancel_requested is True
+    assert job.termination_reason == "client_requested"
+    with pytest.raises(JobCancelledError, match="client_requested"):
+        job.raise_if_cancelled()
+
+
 def test_job_report_preuploads_file_outputs_in_parallel_path() -> None:
     agent = build_agent()
     agent.interface.output.preview = File("png")
@@ -396,6 +423,28 @@ def test_agent_renew_contract_lease_returns_cleanly_after_success() -> None:
     agent.renew_contract_lease("neg-1")
 
     assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_agent_terminate_job_posts_agent_route() -> None:
+    agent = build_agent()
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/agent/contract/terminate",
+        status=200,
+        json={"status": "ok"},
+    )
+
+    response = agent.terminate_job("neg-1", reason="agent_requested")
+
+    assert response["status"] == "ok"
+    body = responses.calls[0].request.body
+    assert body is not None
+    payload = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
+    assert payload == {
+        "job_id": "neg-1",
+        "reason": "agent_requested",
+    }
 
 
 @responses.activate
@@ -593,6 +642,44 @@ def test_handle_relay_cancel_sets_stream_event() -> None:
     agent._handle_relay_control_message({"type": "cancel", "stream_id": "stream-1"})
 
     assert cancel_event.is_set() is True
+
+
+def test_contract_terminate_message_requests_job_cancellation() -> None:
+    agent = build_agent()
+    job = Job(agent, "neg-terminate", {})
+    worker = threading.Thread(target=lambda: None)
+    agent._register_contract_run("neg-terminate", job, worker)
+
+    agent.process_contract_terminate(
+        {"job_id": "neg-terminate", "reason": "client_requested"}
+    )
+
+    assert job.cancel_requested is True
+    assert job.termination_reason == "client_requested"
+
+
+def test_contract_terminate_cancels_relay_stream_for_job(tmp_path) -> None:
+    agent = build_agent()
+    job = Job(agent, "neg-relay-cancel", {})
+    worker = threading.Thread(target=lambda: None)
+    agent._register_contract_run("neg-relay-cancel", job, worker)
+
+    relay_path = tmp_path / "archive.bin"
+    relay_path.write_bytes(b"relay")
+    agent._set_current_relay_job_id(job.job_id)
+    try:
+        metadata = agent.register_relay_file(relay_path, None, None)
+    finally:
+        agent._clear_current_relay_job_id()
+
+    runtime = build_binary_runtime()
+    runtime.source_id = str(metadata["source_id"])
+    with agent._relay_binary_runtimes_lock:
+        agent._relay_binary_runtimes["stream-cancel"] = runtime
+
+    agent.process_contract_terminate({"job_id": "neg-relay-cancel"})
+
+    assert runtime.cancel_event.is_set() is True
 
 
 def test_handle_relay_control_message_starts_file_server_thread(tmp_path) -> None:

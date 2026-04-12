@@ -221,6 +221,7 @@ def build_agent() -> Agent:
             " the media bytes permanently."
         )
         agent.charge = 1
+        agent.relay_points_per_minute = 2
         agent.output.preview = RelayMedia(
             name="live-preview.m3u8",
             content_type=HLS_CONTENT_TYPE,
@@ -249,7 +250,7 @@ def run_client(agent_id: str) -> None:
     broker = Broker(
         broker_url=require_env("BROKER_URL"), auth=require_env("BROKER_TOKEN")
     )
-    result_payload = broker.ask(agent_id, {})["result"]
+    result_payload = broker.ask(agent_id, {}, max_duration_minutes=10)["result"]
     relay_media = parse_media_result(broker, result_payload)
     playlist_text = read_playlist_snapshot(broker, relay_media)
 

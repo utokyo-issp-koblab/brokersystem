@@ -102,6 +102,7 @@ def build_agent() -> Agent:
         agent.agent_auth = agent_auth
         agent.description = "Returns a broker-relayed interactive text session."
         agent.charge = 1
+        agent.relay_points_per_minute = 2
         agent.output.console = RelaySession(
             name="python-repl",
             help="Interactive text session relayed through the broker.",
@@ -131,7 +132,7 @@ def run_client(agent_id: str, commands: list[str]) -> None:
     broker = Broker(
         broker_url=require_env("BROKER_URL"), auth=require_env("BROKER_TOKEN")
     )
-    result_payload = broker.ask(agent_id, {})["result"]
+    result_payload = broker.ask(agent_id, {}, max_duration_minutes=15)["result"]
     relay_session = parse_session_result(broker, result_payload)
 
     print("Session URI:", relay_session.session_uri)

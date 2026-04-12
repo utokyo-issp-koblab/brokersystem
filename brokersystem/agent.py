@@ -114,7 +114,9 @@ ResultValue = str | int | float | bool | None | list[Any] | dict[str, Any]
 NegotiationStatus = Literal["ok", "need_revision", "ng"]
 NegotiationFeedbackKind = Literal["agent", "validation"]
 JobErrorDetailLevel = Literal["summary", "traceback"]
-ContractRunPhase = Literal["starting", "running", "done", "error"]
+ContractRunPhase = Literal["starting", "running", "done", "error", "terminated"]
+BillingMode = Literal["relay_time"]
+BillingUnit = Literal["points/min"]
 NegotiationState = Literal[
     "begin",
     "request",
@@ -197,6 +199,15 @@ class NegotiationFeedback(TypedDict):
 NegotiationDecision = tuple[NegotiationStatus, NegotiationFeedback]
 
 
+class NegotiationBilling(TypedDict):
+    mode: BillingMode
+    points_per_minute: int | float
+    max_duration_required: bool
+    max_duration_minutes: int | float | None
+    estimated_charge: int | float | None
+    unit: BillingUnit
+
+
 class NegotiationContent(TypedDict):
     user_info_request: list[UserInfoField]
     input: TemplateSchema
@@ -205,10 +216,12 @@ class NegotiationContent(TypedDict):
     charge: int
     ui_preview: NotRequired[UiPreview]
     feedback: NegotiationFeedback
+    billing: NotRequired[NegotiationBilling]
 
 
 class NegotiationResponse(TypedDict):
     negotiation_id: str
+    job_id: str
     state: NegotiationState
     content: NegotiationContent
 
@@ -218,10 +231,16 @@ class ContractResponse(TypedDict):
 
 
 class ResultResponse(TypedDict):
+    negotiation_id: str
+    job_id: str
     status: Literal["done"]
     msg: str
     progress: float
     result: ResultPayload
+    agent_id: NotRequired[str | None]
+    request: NotRequired[JsonDict]
+    input: NotRequired[TemplateSchema]
+    billing: NotRequired[dict[str, Any]]
 
 
 RelayFileValue = TypedDict(
@@ -488,6 +507,7 @@ class AgentInfo(TypedDict):
     description: str
     module_version: str
     user_info_request: list[UserInfoFieldValue]
+    billing: NotRequired[NegotiationBilling]
 
 
 class BoardAgent(TypedDict):
@@ -639,6 +659,18 @@ class AgentError(RuntimeError):
     """Base class for agent runtime errors."""
 
 
+class JobCancelledError(AgentError):
+    """Raised by `Job.raise_if_cancelled()` after cooperative termination."""
+
+    def __init__(self, job_id: str, reason: str | None = None) -> None:
+        self.job_id = job_id
+        self.reason = reason
+        message = f"Job {job_id} was cancelled"
+        if reason:
+            message = f"{message}: {reason}"
+        super().__init__(message)
+
+
 class AgentConnectionError(AgentError):
     """Raised when an Agent request cannot reach the broker URL."""
 
@@ -766,12 +798,48 @@ def _normalize_negotiation_content_feedback(
         _require_mapping(normalized, "feedback", context),
         context=f"{context}.feedback",
     )
+    if "billing" in normalized:
+        normalized["billing"] = _normalize_negotiation_billing(
+            _require_mapping(normalized, "billing", context),
+            context=f"{context}.billing",
+        )
     return cast(NegotiationContent, normalized)
+
+
+def _normalize_negotiation_billing(
+    payload: Mapping[str, object],
+    *,
+    context: str,
+) -> NegotiationBilling:
+    mode = _require_str(payload, "mode", context)
+    if mode != "relay_time":
+        _raise_malformed_response(
+            context, f"field 'mode' is not 'relay_time': {mode!r}", payload
+        )
+    unit = _require_str(payload, "unit", context)
+    if unit != "points/min":
+        _raise_malformed_response(
+            context, f"field 'unit' is not 'points/min': {unit!r}", payload
+        )
+    return {
+        "mode": "relay_time",
+        "points_per_minute": _require_number(payload, "points_per_minute", context),
+        "max_duration_required": _require_bool(
+            payload, "max_duration_required", context
+        ),
+        "max_duration_minutes": _require_optional_number(
+            payload, "max_duration_minutes", context
+        ),
+        "estimated_charge": _require_optional_number(
+            payload, "estimated_charge", context
+        ),
+        "unit": "points/min",
+    }
 
 
 def _normalize_agent_info_payload(value: object, *, context: str) -> AgentInfo:
     info = _require_object_mapping(value, context)
-    return {
+    normalized: AgentInfo = {
         "input": cast(TemplateSchema, _require_mapping(info, "input", context)),
         "condition": cast(TemplateSchema, _require_mapping(info, "condition", context)),
         "output": cast(TemplateSchema, _require_mapping(info, "output", context)),
@@ -787,6 +855,12 @@ def _normalize_agent_info_payload(value: object, *, context: str) -> AgentInfo:
             )
         ],
     }
+    if "billing" in info:
+        normalized["billing"] = _normalize_negotiation_billing(
+            _require_mapping(info, "billing", context),
+            context=f"{context}.billing",
+        )
+    return normalized
 
 
 def _normalize_agent_summary_payload(payload: object, *, context: str) -> AgentSummary:
@@ -928,6 +1002,30 @@ def _require_int(payload: Mapping[str, object], key: str, context: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         _raise_malformed_response(
             context, f"field '{key}' is not an int: {value!r}", payload
+        )
+    return value
+
+
+def _require_number(
+    payload: Mapping[str, object], key: str, context: str
+) -> int | float:
+    value = _require_key(payload, key, context)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        _raise_malformed_response(
+            context, f"field '{key}' is not a number: {value!r}", payload
+        )
+    return value
+
+
+def _require_optional_number(
+    payload: Mapping[str, object], key: str, context: str
+) -> int | float | None:
+    value = _require_key(payload, key, context)
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        _raise_malformed_response(
+            context, f"field '{key}' is not a number or null: {value!r}", payload
         )
     return value
 
@@ -2441,6 +2539,8 @@ class AgentInterface:
         """Display name shown in broker listings."""
         self.charge: int = 10000
         """Default charge in points before any charge_func override."""
+        self.relay_points_per_minute: int | float | None = None
+        """Interactive relay price in points/minute; batch `charge` remains separate."""
         self.job_error_detail_level: JobErrorDetailLevel = "traceback"
         """How much structured error detail to expose when a job fails."""
         self.convention: str = ""
@@ -2486,7 +2586,21 @@ class AgentInterface:
                 getattr(self, item_type), "_get_template"
             )()
 
-        config_dict["charge"] = self.charge
+        relay_points_per_minute = self._active_relay_points_per_minute(config_dict)
+        config_dict["charge"] = (
+            relay_points_per_minute
+            if relay_points_per_minute is not None
+            else self.charge
+        )
+        if relay_points_per_minute is not None:
+            config_dict["billing"] = {
+                "mode": "relay_time",
+                "points_per_minute": relay_points_per_minute,
+                "max_duration_required": True,
+                "max_duration_minutes": None,
+                "estimated_charge": None,
+                "unit": "points/min",
+            }
         config_dict["user_info_request"] = [
             field.value for field in self.user_info_request
         ]
@@ -2504,6 +2618,24 @@ class AgentInterface:
             config_dict["description"] = self.description
 
         return config_dict
+
+    def _active_relay_points_per_minute(
+        self, config_dict: Mapping[str, Any]
+    ) -> int | float | None:
+        if self.relay_points_per_minute is None:
+            return None
+        output = config_dict.get("output")
+        if not isinstance(output, Mapping):
+            return None
+        output_types = output.get("@type")
+        if not isinstance(output_types, Mapping):
+            return None
+        if any(
+            value in ("relay_file", "relay_media", "relay_session")
+            for value in output_types.values()
+        ):
+            return self.relay_points_per_minute
+        return None
 
     def has_func(self, func_name: str) -> bool:
         return func_name in self.func_dict
@@ -2621,6 +2753,10 @@ class DummyJob(Mapping[str, Any]):
 
         self._agent = DummyAgent()
         self._request = dict(request_params)
+        self.id: str = "dummy-job"
+        self.job_id: str = self.id
+        self._cancel_event = threading.Event()
+        self.termination_reason: str | None = None
 
     def report(
         self,
@@ -2645,6 +2781,30 @@ class DummyJob(Mapping[str, Any]):
     def __len__(self) -> int:
         return len(self._request)
 
+    @property
+    def broker_metadata(self) -> JsonDict:
+        metadata = self._request.get("_broker")
+        return dict(metadata) if isinstance(metadata, Mapping) else {}
+
+    @property
+    def max_duration_minutes(self) -> int | float | None:
+        value = self.broker_metadata.get("max_duration_minutes")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+        return None
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self._cancel_event.is_set()
+
+    @property
+    def cancel_event(self) -> threading.Event:
+        return self._cancel_event
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancel_requested:
+            raise JobCancelledError(self.job_id, self.termination_reason)
+
 
 class Job(Mapping[str, Any]):
     """Runtime job wrapper used by agent job functions.
@@ -2661,8 +2821,33 @@ class Job(Mapping[str, Any]):
         self._request["_user_info"] = _normalize_user_info_payload(
             self._request.get("_user_info")
         )
+        self._broker_metadata: JsonDict = self._normalize_broker_metadata(
+            self._request.get("_broker")
+        )
+        self._request["_broker"] = self._broker_metadata
         self._status: str = "init"
         self.id: str = negotiation_id
+        self.job_id: str = negotiation_id
+        self._cancel_event = threading.Event()
+        self.termination_reason: str | None = None
+
+    def _normalize_broker_metadata(self, metadata: object) -> JsonDict:
+        if not isinstance(metadata, Mapping):
+            return {}
+        normalized: JsonDict = {
+            key: value for key, value in metadata.items() if isinstance(key, str)
+        }
+        value = normalized.get("max_duration_minutes")
+        if value is not None and (
+            not isinstance(value, (int, float)) or isinstance(value, bool)
+        ):
+            logger.warning(
+                "Ignoring malformed _broker.max_duration_minutes for %s: %r",
+                self._negotiation_id,
+                value,
+            )
+            normalized.pop("max_duration_minutes", None)
+        return normalized
 
     def report(
         self,
@@ -2716,11 +2901,15 @@ class Job(Mapping[str, Any]):
                 result,
                 max_upload_workers=max_upload_workers,
             )
-            payload["result"] = self._agent.interface.format_for_output(
-                prepared_result,
-                self._agent.upload,
-                self._agent.register_relay_source,
-            )
+            self._agent._set_current_relay_job_id(self.job_id)
+            try:
+                payload["result"] = self._agent.interface.format_for_output(
+                    prepared_result,
+                    self._agent.upload,
+                    self._agent.register_relay_source,
+                )
+            finally:
+                self._agent._clear_current_relay_job_id()
 
         self._agent.post("report", payload)
 
@@ -2887,6 +3076,34 @@ class Job(Mapping[str, Any]):
         """
         return cast(UserInfo, self._request["_user_info"])
 
+    @property
+    def broker_metadata(self) -> JsonDict:
+        """Reserved broker metadata supplied under request `_broker`."""
+        return dict(self._broker_metadata)
+
+    @property
+    def max_duration_minutes(self) -> int | float | None:
+        """Requested maximum interactive relay duration, when supplied."""
+        value = self._broker_metadata.get("max_duration_minutes")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+        return None
+
+    @property
+    def cancel_requested(self) -> bool:
+        """Whether broker/client termination has been requested."""
+        return self._cancel_event.is_set()
+
+    @property
+    def cancel_event(self) -> threading.Event:
+        """Event set when broker/client termination has been requested."""
+        return self._cancel_event
+
+    def raise_if_cancelled(self) -> None:
+        """Raise `JobCancelledError` if cooperative cancellation was requested."""
+        if self.cancel_requested:
+            raise JobCancelledError(self.job_id, self.termination_reason)
+
     def __iter__(self):
         return iter(self._request)
 
@@ -2895,6 +3112,11 @@ class Job(Mapping[str, Any]):
 
     def _set_status(self, status: str) -> None:
         self._status = status
+
+    def _request_cancel(self, reason: str | None = None) -> None:
+        self.termination_reason = reason
+        self._cancel_event.set()
+        self._set_status("error")
 
 
 @dataclass
@@ -2912,6 +3134,7 @@ class _ContractRunState:
 @dataclass
 class _RelayFileSource:
     source_id: str
+    job_id: str | None
     path: Path
     name: str
     size_bytes: int
@@ -2923,6 +3146,7 @@ class _RelayFileSource:
 @dataclass
 class _RelayLiveSource:
     source_id: str
+    job_id: str | None
     name: str
     content_type: str
     created_at: float
@@ -2933,6 +3157,7 @@ class _RelayLiveSource:
 @dataclass
 class _RelayAssetTreeSource:
     source_id: str
+    job_id: str | None
     root_dir: Path
     entry_path: str
     name: str
@@ -2945,6 +3170,7 @@ class _RelayAssetTreeSource:
 @dataclass
 class _RelaySessionRuntime:
     stream_id: str
+    source_id: str
     cancel_event: threading.Event
     handle_input: Callable[[str], None] | None
 
@@ -2952,6 +3178,7 @@ class _RelaySessionRuntime:
 @dataclass
 class _RelayBinaryRuntime:
     stream_id: str
+    source_id: str
     cancel_event: threading.Event
     credit_condition: threading.Condition
     available_credit: int
@@ -2960,6 +3187,7 @@ class _RelayBinaryRuntime:
 @dataclass
 class _RelaySessionRuntimeSource:
     source_id: str
+    job_id: str | None
     name: str
     protocol: str
     created_at: float
@@ -3030,9 +3258,21 @@ class Agent:
         self._relay_binary_runtimes_lock = threading.Lock()
         self._relay_session_runtimes: dict[str, _RelaySessionRuntime] = {}
         self._relay_session_runtimes_lock = threading.Lock()
+        self._relay_job_local = threading.local()
 
     def _http_session(self) -> requests.Session:
         return _get_thread_session(self._http_session_local)
+
+    def _set_current_relay_job_id(self, job_id: str) -> None:
+        self._relay_job_local.job_id = job_id
+
+    def _clear_current_relay_job_id(self) -> None:
+        if hasattr(self._relay_job_local, "job_id"):
+            delattr(self._relay_job_local, "job_id")
+
+    def _current_relay_job_id(self) -> str | None:
+        job_id = getattr(self._relay_job_local, "job_id", None)
+        return job_id if isinstance(job_id, str) else None
 
     def _increase_polling_interval(self) -> None:
         if self.polling_interval <= 0:
@@ -3264,6 +3504,7 @@ class Agent:
             cancel_event = threading.Event()
             runtime = _RelayBinaryRuntime(
                 stream_id=stream_id,
+                source_id=source_id,
                 cancel_event=cancel_event,
                 credit_condition=threading.Condition(),
                 available_credit=max(credit_bytes, 0),
@@ -3306,6 +3547,7 @@ class Agent:
             cancel_event = threading.Event()
             runtime = _RelayBinaryRuntime(
                 stream_id=stream_id,
+                source_id=source_id,
                 cancel_event=cancel_event,
                 credit_condition=threading.Condition(),
                 available_credit=max(credit_bytes, 0),
@@ -3343,6 +3585,7 @@ class Agent:
             cancel_event = threading.Event()
             runtime = _RelayBinaryRuntime(
                 stream_id=stream_id,
+                source_id=source_id,
                 cancel_event=cancel_event,
                 credit_condition=threading.Condition(),
                 available_credit=max(credit_bytes, 0),
@@ -3459,6 +3702,7 @@ class Agent:
         now = time.perf_counter()
         source = _RelayFileSource(
             source_id=source_id,
+            job_id=self._current_relay_job_id(),
             path=path,
             name=name,
             size_bytes=stat.st_size,
@@ -3495,6 +3739,7 @@ class Agent:
         now = time.perf_counter()
         source = _RelayLiveSource(
             source_id=source_id,
+            job_id=self._current_relay_job_id(),
             name=name,
             content_type=content_type,
             created_at=now,
@@ -3546,6 +3791,7 @@ class Agent:
         now = time.perf_counter()
         source = _RelayAssetTreeSource(
             source_id=source_id,
+            job_id=self._current_relay_job_id(),
             root_dir=root_dir,
             entry_path=entry_path,
             name=name,
@@ -3584,6 +3830,7 @@ class Agent:
         now = time.perf_counter()
         source = _RelaySessionRuntimeSource(
             source_id=source_id,
+            job_id=self._current_relay_job_id(),
             name=name,
             protocol=protocol,
             created_at=now,
@@ -3987,6 +4234,7 @@ class Agent:
             with self._relay_session_runtimes_lock:
                 self._relay_session_runtimes[stream_id] = _RelaySessionRuntime(
                     stream_id=stream_id,
+                    source_id=source_id,
                     cancel_event=cancel_event,
                     handle_input=input_handler,
                 )
@@ -4248,6 +4496,49 @@ class Agent:
             if state is not None:
                 state.finished = True
 
+    def request_job_cancellation(
+        self, job_id: str, *, reason: str | None = None
+    ) -> bool:
+        """Set cooperative cancellation state for a running job."""
+        with self._contract_runs_lock:
+            state = self._contract_runs.get(job_id)
+            if state is None:
+                return False
+            state.phase = "terminated"
+            state.job._request_cancel(reason)
+        self._cancel_relay_streams_for_job(job_id)
+        return True
+
+    def _cancel_relay_streams_for_job(self, job_id: str) -> None:
+        with self._relay_sources_lock:
+            source_ids = {
+                source_id
+                for source_id, source in self._relay_sources.items()
+                if source.job_id == job_id
+            }
+        if not source_ids:
+            return
+
+        with self._relay_binary_runtimes_lock:
+            binary_runtimes = [
+                runtime
+                for runtime in self._relay_binary_runtimes.values()
+                if runtime.source_id in source_ids
+            ]
+        with self._relay_session_runtimes_lock:
+            session_runtimes = [
+                runtime
+                for runtime in self._relay_session_runtimes.values()
+                if runtime.source_id in source_ids
+            ]
+
+        for runtime in binary_runtimes:
+            runtime.cancel_event.set()
+            self._notify_relay_binary_runtime(runtime.stream_id)
+        for runtime in session_runtimes:
+            runtime.cancel_event.set()
+            self._clear_relay_session_runtime(runtime.stream_id)
+
     def connect(self) -> None:
         """Poll the agent message box and dispatch handlers."""
         while self.running:
@@ -4310,6 +4601,8 @@ class Agent:
                 self.process_negotiation(message["body"])
             if message["msg_type"] == "contract":
                 self.process_contract(message["body"])
+            if message["msg_type"] == "contract_terminate":
+                self.process_contract_terminate(message["body"])
             return True
         except Exception:
             logger.exception(f"Error occured during process_message; {message=}")
@@ -4350,7 +4643,14 @@ class Agent:
         else:
             response = _attach_feedback(response, msg, None)
 
-        if msg == "ok" and self.interface.has_func("charge_func"):
+        if (
+            msg == "ok"
+            and self.interface.has_func("charge_func")
+            and (
+                not isinstance(response.get("billing"), Mapping)
+                or response["billing"].get("mode") != "relay_time"
+            )
+        ):
             response["charge"] = round(
                 self.interface.func_dict["charge_func"](input_response)
             )
@@ -4383,6 +4683,18 @@ class Agent:
         self._mark_contract_phase(negotiation_id, "running")
         worker.start()
 
+    def process_contract_terminate(self, msg: Mapping[str, Any]) -> None:
+        """Mark a running job for cooperative broker-requested termination."""
+        raw_job_id = msg.get("job_id")
+        if not isinstance(raw_job_id, str):
+            logger.warning("Ignoring malformed contract_terminate message: %r", msg)
+            return
+        reason = msg.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            reason = None
+        if not self.request_job_cancellation(raw_job_id, reason=reason):
+            logger.warning("Termination requested for unknown job: %s", raw_job_id)
+
     def _run_contract_job(self, msg: Mapping[str, Any], job: Job) -> None:
         """Backward-compatible wrapper for tests and direct callers."""
         negotiation_id = cast(str, msg["negotiation_id"])
@@ -4399,9 +4711,11 @@ class Agent:
     def _run_running_contract_job(self, negotiation_id: str, job: Job) -> None:
         st = time.perf_counter()
         try:
+            job.raise_if_cancelled()
             job.msg(f"{self.interface.name} starts running...")
 
             result = self.interface.func_dict["job_func"](job)
+            job.raise_if_cancelled()
             logger.debug(f"JOB RETURN VALUE: {result}")
             if result is None:
                 result = {}
@@ -4783,6 +5097,20 @@ class Agent:
             allow_empty=True,
         )
 
+    def terminate_job(
+        self, job_id: str, reason: str = "agent_requested"
+    ) -> StatusResponse:
+        """Request broker-side termination of a job using agent auth.
+
+        Relay jobs are keyed by `negotiation_id`; pass that value as `job_id`.
+        """
+        response = self.post(
+            "contract/terminate",
+            {"job_id": job_id, "reason": reason},
+        )
+        _require_key(response, "status", "terminate_job")
+        return cast(StatusResponse, response)
+
     def register_func(self, func_name: str, func: Callable[..., Any]) -> None:
         """Register a handler function on the agent."""
         self.agent_funcs[func_name] = func
@@ -5003,6 +5331,39 @@ class Agent:
     @charge.setter
     def charge(self, charge: int):
         self.interface.charge = charge
+
+    @property
+    def relay_points_per_minute(self) -> int | float | None:
+        """Interactive relay price in points/minute.
+
+        This is used for relay_file, relay_media, and relay_session outputs and
+        leaves `charge` available for ordinary batch jobs.
+        """
+        return self.interface.relay_points_per_minute
+
+    @relay_points_per_minute.setter
+    def relay_points_per_minute(self, points_per_minute: int | float | None) -> None:
+        if points_per_minute is None:
+            self.interface.relay_points_per_minute = None
+            return
+        if not isinstance(points_per_minute, (int, float)) or isinstance(
+            points_per_minute, bool
+        ):
+            raise TypeError("relay_points_per_minute must be a number or None")
+        if points_per_minute <= 0:
+            raise ValueError("relay_points_per_minute must be > 0")
+        self.interface.relay_points_per_minute = points_per_minute
+
+    @property
+    def interactive_points_per_minute(self) -> int | float | None:
+        """Alias for `relay_points_per_minute`."""
+        return self.relay_points_per_minute
+
+    @interactive_points_per_minute.setter
+    def interactive_points_per_minute(
+        self, points_per_minute: int | float | None
+    ) -> None:
+        self.relay_points_per_minute = points_per_minute
 
     @property
     def job_error_detail_level(self) -> JobErrorDetailLevel:
@@ -5457,6 +5818,7 @@ class Broker:
         request: JsonDict,
         *,
         user_info_consent: Iterable[UserInfoField] | None = None,
+        max_duration_minutes: int | float | None = None,
     ) -> ResultResponse:
         """Execute negotiate -> contract -> wait for result.
 
@@ -5467,6 +5829,8 @@ class Broker:
                 Local file values are uploaded automatically before negotiation.
             user_info_consent: Optional consent fields (`user_id`, `email`,
                 `name_affiliation`) to include in the request.
+            max_duration_minutes: Optional maximum relay interactive duration;
+                sent as `_broker.max_duration_minutes`.
 
         Returns:
             Result payload once the job finishes.
@@ -5481,7 +5845,10 @@ class Broker:
             OSError: If a local file input path cannot be read.
         """
         negotiation = self.negotiate(
-            agent_id, request, user_info_consent=user_info_consent
+            agent_id,
+            request,
+            user_info_consent=user_info_consent,
+            max_duration_minutes=max_duration_minutes,
         )
         state = _require_key(negotiation, "state", "negotiate")
         if state != "ok":
@@ -5495,12 +5862,29 @@ class Broker:
         self.contract(cast(str, negotiation_id))
         return self.get_result(cast(str, negotiation_id))
 
+    def execute(
+        self,
+        agent_id: str,
+        request: JsonDict,
+        *,
+        user_info_consent: Iterable[UserInfoField] | None = None,
+        max_duration_minutes: int | float | None = None,
+    ) -> ResultResponse:
+        """Alias for `ask(...)`."""
+        return self.ask(
+            agent_id,
+            request,
+            user_info_consent=user_info_consent,
+            max_duration_minutes=max_duration_minutes,
+        )
+
     def negotiate(
         self,
         agent_id: str,
         request: JsonDict,
         *,
         user_info_consent: Iterable[UserInfoField] | None = None,
+        max_duration_minutes: int | float | None = None,
     ) -> NegotiationResponse:
         """Start negotiation and send the first request.
 
@@ -5513,6 +5897,8 @@ class Broker:
                 pass a broker file id string or a local `Path` / bytes value.
                 Local file values are uploaded automatically before negotiation.
             user_info_consent: Optional consent fields to include in the request.
+            max_duration_minutes: Optional maximum relay interactive duration;
+                sent as `_broker.max_duration_minutes`.
 
         Returns:
             Negotiation response payload including `negotiation_id`.
@@ -5525,7 +5911,10 @@ class Broker:
             TypeError: If a local file input value is not bytes or a valid path-like.
             OSError: If a local file input path cannot be read.
         """
-        request_payload = self._with_user_info_consent(request, user_info_consent)
+        request_payload = self._with_broker_request_metadata(
+            self._with_user_info_consent(request, user_info_consent),
+            max_duration_minutes=max_duration_minutes,
+        )
         if self._request_contains_local_files(request_payload):
             begin = self.begin_negotiation(agent_id)
             prepared_request = self._prepare_request_uploads(
@@ -5546,6 +5935,7 @@ class Broker:
                 {"agent_id": agent_id, "request": request_payload},
             )
         _require_key(response, "negotiation_id", "negotiate")
+        response["job_id"] = _require_str(response, "negotiation_id", "negotiate")
         content = _require_mapping(response, "content", "negotiate")
         response["content"] = _normalize_negotiation_content_feedback(
             content, context="negotiate"
@@ -5571,6 +5961,9 @@ class Broker:
         """
         response = self.post("negotiation/begin", {"agent_id": agent_id})
         _require_key(response, "negotiation_id", "begin_negotiation")
+        response["job_id"] = _require_str(
+            response, "negotiation_id", "begin_negotiation"
+        )
         content = _require_mapping(response, "content", "begin_negotiation")
         response["content"] = _normalize_negotiation_content_feedback(
             content, context="begin_negotiation"
@@ -5595,6 +5988,20 @@ class Broker:
         _require_key(response, "status", "contract")
         return cast(ContractResponse, response)
 
+    def terminate_job(
+        self, job_id: str, reason: str = "client_requested"
+    ) -> StatusResponse:
+        """Request broker-side termination of a job using client auth.
+
+        Relay jobs are keyed by `negotiation_id`; pass that value as `job_id`.
+        """
+        response = self.post(
+            "contract/terminate",
+            {"job_id": job_id, "reason": reason},
+        )
+        _require_key(response, "status", "terminate_job")
+        return cast(StatusResponse, response)
+
     def get_result(self, negotiation_id: str) -> ResultResponse:
         """Poll the broker for results until done/error.
 
@@ -5616,6 +6023,7 @@ class Broker:
             _require_key(response, "msg", "get_result")
             _require_key(response, "progress", "get_result")
             _require_key(response, "result", "get_result")
+            response["job_id"] = _require_str(response, "negotiation_id", "get_result")
             if response["msg"] != msg:
                 msg = response["msg"]
                 logger.debug(msg)
@@ -5670,6 +6078,29 @@ class Broker:
         payload["_user_info_consent"] = [
             field.value for field in _normalize_user_info_fields(consent)
         ]
+        return payload
+
+    def _with_broker_request_metadata(
+        self,
+        request: JsonDict,
+        *,
+        max_duration_minutes: int | float | None = None,
+    ) -> JsonDict:
+        """Attach reserved `_broker` request metadata."""
+        if max_duration_minutes is None:
+            return request
+        if not isinstance(max_duration_minutes, (int, float)) or isinstance(
+            max_duration_minutes, bool
+        ):
+            raise TypeError("max_duration_minutes must be a number or None")
+        if max_duration_minutes <= 0:
+            raise ValueError("max_duration_minutes must be > 0")
+
+        payload = dict(request)
+        raw_metadata = payload.get("_broker")
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+        metadata["max_duration_minutes"] = max_duration_minutes
+        payload["_broker"] = metadata
         return payload
 
     def post(self, uri: str, payload: JsonDict) -> JsonDict:
@@ -6100,7 +6531,7 @@ class Broker:
 
     def _request_contains_local_files(self, request: Mapping[str, object]) -> bool:
         return any(
-            key != "_user_info_consent" and _is_local_file_value(value)
+            key not in ("_user_info_consent", "_broker") and _is_local_file_value(value)
             for key, value in request.items()
         )
 
@@ -6122,7 +6553,9 @@ class Broker:
 
         prepared = dict(request)
         for key, value in request.items():
-            if key == "_user_info_consent" or not _is_local_file_value(value):
+            if key in ("_user_info_consent", "_broker") or not _is_local_file_value(
+                value
+            ):
                 continue
 
             declared_type = types.get(key)
@@ -6496,6 +6929,21 @@ class BrokerAdmin:
         response = self._request_json("GET", "results")
         _require_list(response, "contracts", "list_results")
         return cast(ResultsResponse, response)
+
+    def terminate_job(
+        self, job_id: str, reason: str = "client_requested"
+    ) -> StatusResponse:
+        """Request broker-side termination of a job using a user token.
+
+        Relay jobs are keyed by `negotiation_id`; pass that value as `job_id`.
+        """
+        response = self._request_json(
+            "POST",
+            f"jobs/{job_id}/terminate",
+            {"reason": reason},
+        )
+        _require_key(response, "status", "terminate_job")
+        return cast(StatusResponse, response)
 
     # Agents
     def list_agents(self) -> AgentsResponse:

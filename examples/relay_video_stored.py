@@ -95,6 +95,7 @@ def build_agent(file_path: Path) -> Agent:
             " storing the media bytes permanently."
         )
         agent.charge = 1
+        agent.relay_points_per_minute = 1
         agent.output.preview = RelayMedia(
             name=file_path.name,
             content_type=content_type,
@@ -133,7 +134,7 @@ def run_client(agent_id: str, destination: str | None) -> None:
     broker = Broker(
         broker_url=require_env("BROKER_URL"), auth=require_env("BROKER_TOKEN")
     )
-    result_payload = broker.ask(agent_id, {})["result"]
+    result_payload = broker.ask(agent_id, {}, max_duration_minutes=10)["result"]
     relay_media = read_media_result(broker, result_payload)
     destination_path = (
         Path(destination).expanduser().resolve()

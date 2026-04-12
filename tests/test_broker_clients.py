@@ -46,6 +46,19 @@ def _negotiation_content(**extra: object) -> dict[str, object]:
     return content
 
 
+def _relay_time_billing(**extra: object) -> dict[str, object]:
+    billing: dict[str, object] = {
+        "mode": "relay_time",
+        "points_per_minute": 7,
+        "max_duration_required": True,
+        "max_duration_minutes": 5,
+        "estimated_charge": 35,
+        "unit": "points/min",
+    }
+    billing.update(extra)
+    return billing
+
+
 def _agent_info() -> dict[str, object]:
     return {
         "input": {},
@@ -182,6 +195,83 @@ def test_broker_begin_negotiation() -> None:
 
     response = broker.begin_negotiation("agent-1")
     assert response["negotiation_id"] == "n1"
+    assert response["job_id"] == "n1"
+
+
+@responses.activate
+def test_broker_negotiate_parses_relay_time_billing() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/negotiate",
+        json={
+            "negotiation_id": "n1",
+            "state": "ok",
+            "content": _negotiation_content(billing=_relay_time_billing()),
+        },
+        status=200,
+    )
+
+    response = broker.negotiate("agent-1", {"x": 1})
+
+    assert response["job_id"] == "n1"
+    content = response["content"]
+    assert "billing" in content
+    billing = content["billing"]
+    assert billing["mode"] == "relay_time"
+    assert billing["points_per_minute"] == 7
+    assert billing["unit"] == "points/min"
+
+
+@responses.activate
+def test_broker_negotiate_injects_max_duration_metadata() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/negotiate",
+        json={
+            "negotiation_id": "n1",
+            "state": "ok",
+            "content": _negotiation_content(),
+        },
+        status=200,
+    )
+
+    broker.negotiate("agent-1", {"x": 1}, max_duration_minutes=3)
+
+    body = responses.calls[0].request.body
+    assert body is not None
+    payload = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
+    assert payload["request"]["_broker"] == {"max_duration_minutes": 3}
+
+
+@responses.activate
+def test_broker_negotiate_merges_existing_broker_metadata() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/negotiate",
+        json={
+            "negotiation_id": "n1",
+            "state": "ok",
+            "content": _negotiation_content(),
+        },
+        status=200,
+    )
+
+    broker.negotiate(
+        "agent-1",
+        {"x": 1, "_broker": {"client_tag": "demo"}},
+        max_duration_minutes=4,
+    )
+
+    body = responses.calls[0].request.body
+    assert body is not None
+    payload = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
+    assert payload["request"]["_broker"] == {
+        "client_tag": "demo",
+        "max_duration_minutes": 4,
+    }
 
 
 def test_broker_parse_relay_session() -> None:
@@ -770,13 +860,27 @@ def test_broker_contract_flow_get_result() -> None:
     responses.add(
         responses.GET,
         f"{BROKER_URL}/api/v1/client/result/n1",
-        json={"status": "running", "msg": "running", "progress": 0.2, "result": {}},
+        json={
+            "negotiation_id": "n1",
+            "job_id": "n1",
+            "status": "running",
+            "msg": "running",
+            "progress": 0.2,
+            "result": {},
+        },
         status=200,
     )
     responses.add(
         responses.GET,
         f"{BROKER_URL}/api/v1/client/result/n1",
-        json={"status": "done", "msg": "done", "progress": 1, "result": {"x": 1}},
+        json={
+            "negotiation_id": "n1",
+            "job_id": "n1",
+            "status": "done",
+            "msg": "done",
+            "progress": 1,
+            "result": {"x": 1},
+        },
         status=200,
     )
 
@@ -788,7 +892,30 @@ def test_broker_contract_flow_get_result() -> None:
 
     result = broker.get_result("n1")
     assert result["status"] == "done"
+    assert result["job_id"] == "n1"
     assert result["result"]["x"] == 1
+
+
+@responses.activate
+def test_broker_terminate_job_posts_client_route() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/contract/terminate",
+        json={"status": "ok"},
+        status=200,
+    )
+
+    response = broker.terminate_job("n1", reason="client_requested")
+
+    assert response["status"] == "ok"
+    body = responses.calls[0].request.body
+    assert body is not None
+    payload = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
+    assert payload == {
+        "job_id": "n1",
+        "reason": "client_requested",
+    }
 
 
 @responses.activate
@@ -1020,6 +1147,25 @@ def test_broker_admin_user_and_results() -> None:
     assert results["contracts"][0]["client"]["affiliation"] == "Owner Lab"
     assert results["contracts"][0]["mine"] is False
     assert admin.board() == {"agents": []}
+
+
+@responses.activate
+def test_broker_admin_terminate_job_posts_user_token_route() -> None:
+    admin = BrokerAdmin(BROKER_URL, token="user-token")
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/broker/jobs/n1/terminate",
+        json={"status": "ok"},
+        status=200,
+    )
+
+    response = admin.terminate_job("n1", reason="client_requested")
+
+    assert response["status"] == "ok"
+    body = responses.calls[0].request.body
+    assert body is not None
+    payload = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
+    assert payload == {"reason": "client_requested"}
 
 
 @responses.activate

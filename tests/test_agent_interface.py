@@ -12,6 +12,7 @@ from brokersystem.agent import (
     RelayFile,
     RelayMedia,
     RelayMediaProfile,
+    RelaySession,
     RelayStreamSource,
     Table,
     UserInfoField,
@@ -101,6 +102,41 @@ def test_user_info_request_rejects_invalid_fields() -> None:
             UserInfoField.USER_ID,
             cast(UserInfoField, "unknown"),
         ]
+
+
+def test_make_config_uses_relay_points_per_minute_for_relay_outputs() -> None:
+    agent = Agent("https://example.test")
+    agent.name = "Relay priced"
+    agent.agent_auth = "agent-auth"
+    agent.charge = 100
+    agent.relay_points_per_minute = 7
+    agent.output.console = RelaySession()
+
+    config = agent.interface.make_config()
+
+    assert config["charge"] == 7
+    assert config["billing"] == {
+        "mode": "relay_time",
+        "points_per_minute": 7,
+        "max_duration_required": True,
+        "max_duration_minutes": None,
+        "estimated_charge": None,
+        "unit": "points/min",
+    }
+
+
+def test_make_config_keeps_batch_charge_without_relay_outputs() -> None:
+    agent = Agent("https://example.test")
+    agent.name = "Batch priced"
+    agent.agent_auth = "agent-auth"
+    agent.charge = 100
+    agent.relay_points_per_minute = 7
+    agent.output.score = Number(unit="pt")
+
+    config = agent.interface.make_config()
+
+    assert config["charge"] == 100
+    assert "billing" not in config
 
 
 def test_format_for_output_includes_tables_and_files() -> None:
