@@ -730,7 +730,9 @@ def _raise_malformed_response(
     )
 
 
-def _ensure_response_dict(payload: object, context: str) -> JsonDict:
+def _ensure_response_dict(
+    payload: object, context: str, *, allow_status_error: bool = False
+) -> JsonDict:
     """Validate a generic broker JSON envelope.
 
     Generic broker transport errors must use the canonical envelope:
@@ -747,7 +749,7 @@ def _ensure_response_dict(payload: object, context: str) -> JsonDict:
         )
     if not payload:
         _raise_malformed_response(context, "returned an empty payload", payload)
-    if payload.get("status") == "error":
+    if payload.get("status") == "error" and not allow_status_error:
         code = payload.get("error")
         detail = payload.get("error_msg") or code
         if detail is None:
@@ -6018,7 +6020,9 @@ class Broker:
         """
         msg = ""
         while True:
-            response = self.get(f"result/{negotiation_id}")
+            response = self._request_json(
+                "GET", f"result/{negotiation_id}", allow_status_error=True
+            )
             status = _require_key(response, "status", "get_result")
             _require_key(response, "msg", "get_result")
             _require_key(response, "progress", "get_result")
@@ -6438,7 +6442,12 @@ class Broker:
         )
 
     def _request_json(
-        self, method: str, uri: str, payload: JsonDict | None = None
+        self,
+        method: str,
+        uri: str,
+        payload: JsonDict | None = None,
+        *,
+        allow_status_error: bool = False,
     ) -> JsonDict:
         url = f"{self.broker_url}/api/v1/client/{uri}"
         started_at = time.perf_counter()
@@ -6523,7 +6532,9 @@ class Broker:
             raise BrokerResponseError(
                 f"{method} {uri} returned non-JSON response"
             ) from exc
-        obj = _ensure_response_dict(obj, f"{method} {uri}")
+        obj = _ensure_response_dict(
+            obj, f"{method} {uri}", allow_status_error=allow_status_error
+        )
         assert all(
             isinstance(k, str) for k in obj.keys()
         ), f"Some of response keys were not str: {obj.keys()}"

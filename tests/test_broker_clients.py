@@ -897,6 +897,37 @@ def test_broker_contract_flow_get_result() -> None:
 
 
 @responses.activate
+def test_broker_get_result_raises_agent_error_payload() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    responses.add(
+        responses.GET,
+        f"{BROKER_URL}/api/v1/client/result/n1",
+        json={
+            "negotiation_id": "n1",
+            "job_id": "n1",
+            "status": "error",
+            "msg": "Maximum duration exceeded.",
+            "error_msg": "Maximum duration exceeded.",
+            "error": "MaxDurationExceeded",
+            "error_type": "MaxDurationExceeded",
+            "progress": 0.2,
+            "result": {
+                "error_msg": "Maximum duration exceeded.",
+                "error_type": "MaxDurationExceeded",
+            },
+        },
+        status=200,
+    )
+
+    with pytest.raises(BrokerResponseError, match="Maximum duration exceeded") as exc:
+        broker.get_result("n1")
+
+    payload = exc.value.payload
+    assert isinstance(payload, dict)
+    assert payload["error_type"] == "MaxDurationExceeded"
+
+
+@responses.activate
 def test_broker_terminate_job_posts_client_route() -> None:
     broker = Broker(broker_url=BROKER_URL, auth="token")
     responses.add(
