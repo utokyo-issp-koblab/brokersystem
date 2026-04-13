@@ -109,6 +109,8 @@ def test_relay_video_webcam_builds_dshow_command() -> None:
     assert "-vf" in command
     assert "libx264" in command
     assert "fps=5,scale=1280:720" in command
+    assert command[command.index("-g") + 1] == "3"
+    assert command[command.index("-keyint_min") + 1] == "3"
     assert "-hls_segment_type" in command
     assert "fmp4" in command
     assert "-hls_fmp4_init_filename" in command
@@ -133,12 +135,25 @@ def test_relay_video_webcam_builds_adaptive_command() -> None:
         width=1280,
         height=720,
         fps=5,
+        dash_utc_timing_url="http://broker.test/api/v1/relay/utc_time",
     )
     assert command[:3] == ["ffmpeg", "-hide_banner", "-loglevel"]
     assert "-f" in command
     assert "dash" in command
     assert "-ldash" in command
     assert "-streaming" in command
+    assert "-update_period" in command
+    assert command[command.index("-update_period") + 1] == "1"
+    assert "-index_correction" not in command
+    assert "-utc_timing_url" in command
+    assert (
+        command[command.index("-utc_timing_url") + 1]
+        == "http://broker.test/api/v1/relay/utc_time"
+    )
+    assert "-write_prft" in command
+    assert command[command.index("-write_prft") + 1] == "1"
+    assert command[command.index("-g") + 1] == "3"
+    assert command[command.index("-keyint_min") + 1] == "3"
     assert "-dash_segment_type" in command
     assert "mp4" in command
     assert "-hls_playlist" in command
@@ -151,7 +166,31 @@ def test_relay_video_webcam_builds_adaptive_command() -> None:
     assert str(Path("/tmp/webcam-adaptive") / module.DASH_ENTRY_PATH) in command
 
 
-def test_relay_video_webcam_adaptive_entry_path_points_to_media_playlist(
+def test_relay_video_webcam_resolves_dash_utc_timing_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(
+        "relay_video_webcam_example_dash_utc_timing",
+        EXAMPLES_DIR / "relay_video_webcam.py",
+    )
+
+    monkeypatch.delenv("VIDEO_DASH_UTC_TIMING_URL", raising=False)
+    assert (
+        module.resolve_dash_utc_timing_url("http://broker.test/")
+        == "http://broker.test/api/v1/relay/utc_time"
+    )
+
+    monkeypatch.setenv("VIDEO_DASH_UTC_TIMING_URL", "http://clock.test/iso")
+    assert (
+        module.resolve_dash_utc_timing_url("http://broker.test/")
+        == "http://clock.test/iso"
+    )
+
+    monkeypatch.setenv("VIDEO_DASH_UTC_TIMING_URL", "")
+    assert module.resolve_dash_utc_timing_url("http://broker.test/") is None
+
+
+def test_relay_video_webcam_adaptive_entry_path_points_to_dash_manifest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_module(
@@ -170,10 +209,34 @@ def test_relay_video_webcam_adaptive_entry_path_points_to_media_playlist(
         fps=5,
         output_dir=Path("/tmp/webcam-adaptive-entry-path"),
     )
-    assert capture.entry_path == module.ADAPTIVE_HLS_MEDIA_PLAYLIST_PATH
+    assert capture.entry_path == module.DASH_ENTRY_PATH
     template = capture.preview_template()
+    assert template.default_profile == "dash"
+    assert template.profiles["dash"].entry_path == module.DASH_ENTRY_PATH
     assert (
         template.profiles["hls"].entry_path == module.ADAPTIVE_HLS_MEDIA_PLAYLIST_PATH
+    )
+
+
+def test_relay_video_webcam_ready_window_requires_multiple_segments() -> None:
+    module = _load_module(
+        "relay_video_webcam_example_ready_window",
+        EXAMPLES_DIR / "relay_video_webcam.py",
+    )
+    capture = module.WebcamRelayCapture.__new__(module.WebcamRelayCapture)
+    capture.window_size = 12
+
+    assert not capture._playlist_has_playback_window(
+        "#EXTM3U\n#EXTINF:0.5,\nchunk-0-00001.m4s\n"
+    )
+    assert capture._playlist_has_playback_window(
+        "\n".join(
+            ["#EXTM3U"]
+            + [
+                f"#EXTINF:0.5,\nchunk-0-{index:05d}.m4s"
+                for index in range(module.MIN_READY_SEGMENTS)
+            ]
+        )
     )
 
 

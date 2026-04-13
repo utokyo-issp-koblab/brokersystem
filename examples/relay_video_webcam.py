@@ -45,6 +45,7 @@ Inspect from the SDK client:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import platform
 import shutil
@@ -75,7 +76,8 @@ ADAPTIVE_HLS_MEDIA_PLAYLIST_PATH = "media_0.m3u8"
 ADAPTIVE_HLS_MASTER_PLAYLIST_PATH = "stream.m3u8"
 DASH_ENTRY_PATH = "stream.mpd"
 HLS_INIT_FILENAME = "init.mp4"
-HLS_WINDOW_SIZE = 3
+HLS_WINDOW_SIZE = 12
+MIN_READY_SEGMENTS = 6
 DEFAULT_SEGMENT_SECONDS = 0.5
 DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 720
@@ -157,8 +159,17 @@ def resolve_output_format() -> VideoOutputFormat:
     raise RuntimeError("VIDEO_OUTPUT_FORMAT must be either 'adaptive' or 'hls'.")
 
 
-def build_video_codec_args(*, encoder: VideoEncoder, fps: int) -> list[str]:
-    gop = str(max(fps, 1))
+def resolve_dash_utc_timing_url(broker_url: str) -> str | None:
+    configured = os.environ.get("VIDEO_DASH_UTC_TIMING_URL")
+    if configured is not None:
+        return configured or None
+    return f"{broker_url.rstrip('/')}/api/v1/relay/utc_time"
+
+
+def build_video_codec_args(
+    *, encoder: VideoEncoder, fps: int, segment_seconds: float
+) -> list[str]:
+    gop = str(max(1, math.ceil(max(fps, 1) * segment_seconds)))
     if encoder == "libx264":
         return [
             "-c:v",
@@ -281,7 +292,11 @@ def build_ffmpeg_hls_command(
         *input_args,
         *output_filter_args,
         *audio_args,
-        *build_video_codec_args(encoder=video_encoder, fps=fps),
+        *build_video_codec_args(
+            encoder=video_encoder,
+            fps=fps,
+            segment_seconds=segment_seconds,
+        ),
         "-f",
         "hls",
         "-hls_time",
@@ -313,6 +328,7 @@ def build_ffmpeg_adaptive_command(
     fps: int,
     window_size: int = HLS_WINDOW_SIZE,
     segment_seconds: float = DEFAULT_SEGMENT_SECONDS,
+    dash_utc_timing_url: str | None = None,
 ) -> list[str]:
     input_args: list[str]
     output_filter_args: list[str] = []
@@ -376,7 +392,11 @@ def build_ffmpeg_adaptive_command(
         *input_args,
         *output_filter_args,
         *audio_args,
-        *build_video_codec_args(encoder=video_encoder, fps=fps),
+        *build_video_codec_args(
+            encoder=video_encoder,
+            fps=fps,
+            segment_seconds=segment_seconds,
+        ),
         "-f",
         "dash",
         "-ldash",
@@ -391,6 +411,13 @@ def build_ffmpeg_adaptive_command(
         str(window_size),
         "-extra_window_size",
         str(window_size),
+        "-update_period",
+        "1",
+        *(
+            ["-utc_timing_url", dash_utc_timing_url, "-write_prft", "1"]
+            if dash_utc_timing_url
+            else []
+        ),
         "-seg_duration",
         str(segment_seconds),
         "-target_latency",
@@ -426,6 +453,7 @@ class WebcamRelayCapture:
         height: int,
         fps: int,
         output_dir: Path,
+        dash_utc_timing_url: str | None = None,
     ) -> None:
         self.source_kind: VideoSourceKind = source_kind
         self.source = source
@@ -437,6 +465,7 @@ class WebcamRelayCapture:
         self.fps = fps
         self.window_size = HLS_WINDOW_SIZE
         self.segment_seconds = DEFAULT_SEGMENT_SECONDS
+        self.dash_utc_timing_url = dash_utc_timing_url
         self.output_dir = output_dir
         self.ffmpeg_bin = resolve_ffmpeg_bin()
         self._lock = threading.Lock()
@@ -458,7 +487,7 @@ class WebcamRelayCapture:
     @property
     def entry_path(self) -> str:
         if self.output_format == ADAPTIVE_OUTPUT_FORMAT:
-            return ADAPTIVE_HLS_MEDIA_PLAYLIST_PATH
+            return DASH_ENTRY_PATH
         return HLS_ENTRY_PATH
 
     def preview_template(self) -> RelayMedia:
@@ -476,7 +505,7 @@ class WebcamRelayCapture:
                         content_type=HLS_CONTENT_TYPE,
                     ),
                 },
-                default_profile="hls",
+                default_profile="dash",
                 help="Adaptive live camera preview relayed from the agent host.",
             )
 
@@ -510,6 +539,7 @@ class WebcamRelayCapture:
                 fps=self.fps,
                 window_size=self.window_size,
                 segment_seconds=self.segment_seconds,
+                dash_utc_timing_url=self.dash_utc_timing_url,
             )
         else:
             command = build_ffmpeg_hls_command(
@@ -568,14 +598,27 @@ class WebcamRelayCapture:
             dash_text = dash_path.read_text(encoding="utf-8", errors="ignore")
             hls_text = hls_path.read_text(encoding="utf-8", errors="ignore")
             return (
-                "<MPD" in dash_text and "#EXTM3U" in hls_text and "chunk-" in hls_text
+                "<MPD" in dash_text
+                and "#EXTM3U" in hls_text
+                and "chunk-" in hls_text
+                and self._playlist_has_playback_window(hls_text)
             )
 
         playlist_path = self.output_dir / HLS_ENTRY_PATH
         if not playlist_path.exists():
             return False
         playlist_text = playlist_path.read_text(encoding="utf-8", errors="ignore")
-        return "#EXTM3U" in playlist_text and "segment" in playlist_text
+        return (
+            "#EXTM3U" in playlist_text
+            and "segment" in playlist_text
+            and self._playlist_has_playback_window(playlist_text)
+        )
+
+    def _playlist_has_playback_window(self, playlist_text: str) -> bool:
+        segment_count = sum(
+            1 for line in playlist_text.splitlines() if line.startswith("#EXTINF:")
+        )
+        return segment_count >= min(self.window_size, MIN_READY_SEGMENTS)
 
     def _startup_error_message(self, exit_code: int) -> str:
         log_tail = ""
@@ -649,6 +692,7 @@ def default_audio_source_for(kind: VideoSourceKind) -> str | None:
 
 
 def build_capture() -> WebcamRelayCapture:
+    broker_url = require_env("BROKER_URL")
     source_kind = detect_source_kind()
     source = default_source_for(source_kind)
     audio_source = default_audio_source_for(source_kind)
@@ -676,6 +720,7 @@ def build_capture() -> WebcamRelayCapture:
         height=height,
         fps=fps,
         output_dir=output_dir,
+        dash_utc_timing_url=resolve_dash_utc_timing_url(broker_url),
     )
     capture.segment_seconds = segment_seconds
     capture.window_size = list_size
@@ -683,11 +728,9 @@ def build_capture() -> WebcamRelayCapture:
 
 
 def read_playlist_snapshot(broker: Broker, relay_media: RelayMediaHandle) -> str:
-    profile = "hls" if relay_media.get_profile("hls") is not None else None
     response = broker.open_media(
         relay_media,
         purpose="playback",
-        profile=profile,
         stream=False,
     )
     try:
