@@ -104,12 +104,12 @@ def test_user_info_request_rejects_invalid_fields() -> None:
         ]
 
 
-def test_make_config_uses_relay_points_per_minute_for_relay_outputs() -> None:
+def test_make_config_uses_charge_per_hour_for_interactive_outputs() -> None:
     agent = Agent("https://example.test")
-    agent.name = "Relay priced"
+    agent.name = "Interactive priced"
     agent.agent_auth = "agent-auth"
-    agent.charge = 100
-    agent.relay_points_per_minute = 7
+    agent.interactive = True
+    agent.charge = 7
     agent.output.console = RelaySession()
 
     config = agent.interface.make_config()
@@ -117,11 +117,9 @@ def test_make_config_uses_relay_points_per_minute_for_relay_outputs() -> None:
     assert config["charge"] == 7
     assert config["billing"] == {
         "mode": "relay_time",
-        "points_per_minute": 7,
+        "points_per_hour": 7,
         "max_duration_required": True,
-        "max_duration_minutes": None,
-        "estimated_charge": None,
-        "unit": "points/min",
+        "unit": "points/h",
     }
 
 
@@ -130,13 +128,63 @@ def test_make_config_keeps_batch_charge_without_relay_outputs() -> None:
     agent.name = "Batch priced"
     agent.agent_auth = "agent-auth"
     agent.charge = 100
-    agent.relay_points_per_minute = 7
     agent.output.score = Number(unit="pt")
 
     config = agent.interface.make_config()
 
     assert config["charge"] == 100
     assert "billing" not in config
+
+
+def test_make_config_keeps_batch_charge_for_noninteractive_relay_outputs() -> None:
+    agent = Agent("https://example.test")
+    agent.name = "Batch relay"
+    agent.agent_auth = "agent-auth"
+    agent.charge = 20
+    agent.output.file = RelayFile()
+
+    config = agent.interface.make_config()
+
+    assert config["charge"] == 20
+    assert "billing" not in config
+
+
+def test_charge_rejects_float() -> None:
+    agent = Agent("https://example.test")
+
+    with pytest.raises(TypeError, match="charge must be int"):
+        agent.charge = 0.5  # type: ignore[assignment]
+
+
+def test_make_config_allows_free_interactive_relay_outputs() -> None:
+    agent = Agent("https://example.test")
+    agent.name = "Free relay"
+    agent.agent_auth = "agent-auth"
+    agent.interactive = True
+    agent.charge = 0
+    agent.output.console = RelaySession()
+
+    config = agent.interface.make_config()
+
+    assert config["charge"] == 0
+    assert config["billing"] == {
+        "mode": "relay_time",
+        "points_per_hour": 0,
+        "max_duration_required": False,
+        "unit": "points/h",
+    }
+
+
+def test_interactive_config_requires_relay_output() -> None:
+    agent = Agent("https://example.test")
+    agent.name = "Bad interactive"
+    agent.agent_auth = "agent-auth"
+    agent.interactive = True
+    agent.charge = 1
+    agent.output.score = Number(unit="pt")
+
+    with pytest.raises(RuntimeError, match="interactive jobs require a relay output"):
+        agent.interface.make_config()
 
 
 def test_format_for_output_includes_tables_and_files() -> None:

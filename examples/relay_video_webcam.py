@@ -756,8 +756,8 @@ def build_agent(capture: WebcamRelayCapture) -> Agent:
             "media, and relays it through the broker without permanently "
             "storing the media bytes."
         )
-        agent.charge = 1
-        agent.relay_points_per_minute = 3
+        agent.interactive = True
+        agent.charge = 180
         agent.output.preview = capture.preview_template()
         agent.output.source = String(help="Capture source descriptor.")
         agent.output.content_type = String(help="Media content type.")

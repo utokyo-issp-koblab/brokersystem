@@ -220,8 +220,8 @@ def build_agent() -> Agent:
             "Returns a live HLS preview that the broker relays without storing"
             " the media bytes permanently."
         )
-        agent.charge = 1
-        agent.relay_points_per_minute = 2
+        agent.interactive = True
+        agent.charge = 120
         agent.output.preview = RelayMedia(
             name="live-preview.m3u8",
             content_type=HLS_CONTENT_TYPE,

@@ -101,8 +101,8 @@ def build_agent() -> Agent:
         agent.name = "relay-repl-example-sdk"
         agent.agent_auth = agent_auth
         agent.description = "Returns a broker-relayed interactive text session."
-        agent.charge = 1
-        agent.relay_points_per_minute = 2
+        agent.interactive = True
+        agent.charge = 120
         agent.output.console = RelaySession(
             name="python-repl",
             help="Interactive text session relayed through the broker.",

@@ -49,11 +49,11 @@ def _negotiation_content(**extra: object) -> dict[str, object]:
 def _relay_time_billing(**extra: object) -> dict[str, object]:
     billing: dict[str, object] = {
         "mode": "relay_time",
-        "points_per_minute": 7,
+        "points_per_hour": 420,
         "max_duration_required": True,
         "max_duration_minutes": 5,
         "estimated_charge": 35,
-        "unit": "points/min",
+        "unit": "points/h",
     }
     billing.update(extra)
     return billing
@@ -219,8 +219,38 @@ def test_broker_negotiate_parses_relay_time_billing() -> None:
     assert "billing" in content
     billing = content["billing"]
     assert billing["mode"] == "relay_time"
-    assert billing["points_per_minute"] == 7
-    assert billing["unit"] == "points/min"
+    assert billing["points_per_hour"] == 420
+    assert billing["unit"] == "points/h"
+
+
+@responses.activate
+def test_broker_negotiate_allows_missing_relay_time_billing_limits() -> None:
+    broker = Broker(broker_url=BROKER_URL, auth="token")
+    billing_without_limits = {
+        key: value
+        for key, value in _relay_time_billing().items()
+        if key not in {"max_duration_minutes", "estimated_charge"}
+    }
+    responses.add(
+        responses.POST,
+        f"{BROKER_URL}/api/v1/client/negotiate",
+        json={
+            "negotiation_id": "n1",
+            "state": "need_revision",
+            "content": _negotiation_content(billing=billing_without_limits),
+        },
+        status=200,
+    )
+
+    response = broker.negotiate("agent-1", {"x": 1})
+
+    content = response["content"]
+    assert "billing" in content
+    billing = content["billing"]
+    assert billing["mode"] == "relay_time"
+    assert billing["points_per_hour"] == 420
+    assert "max_duration_minutes" not in billing
+    assert "estimated_charge" not in billing
 
 
 @responses.activate

@@ -116,7 +116,7 @@ NegotiationFeedbackKind = Literal["agent", "validation"]
 JobErrorDetailLevel = Literal["summary", "traceback"]
 ContractRunPhase = Literal["starting", "running", "done", "error", "terminated"]
 BillingMode = Literal["relay_time"]
-BillingUnit = Literal["points/min"]
+BillingUnit = Literal["points/h"]
 NegotiationState = Literal[
     "begin",
     "request",
@@ -199,13 +199,16 @@ class NegotiationFeedback(TypedDict):
 NegotiationDecision = tuple[NegotiationStatus, NegotiationFeedback]
 
 
-class NegotiationBilling(TypedDict):
+class RelayTimeBillingDeclaration(TypedDict):
     mode: BillingMode
-    points_per_minute: int | float
+    points_per_hour: int | float
     max_duration_required: bool
+    unit: BillingUnit
+
+
+class NegotiationBilling(RelayTimeBillingDeclaration, total=False):
     max_duration_minutes: int | float | None
     estimated_charge: int | float | None
-    unit: BillingUnit
 
 
 class NegotiationContent(TypedDict):
@@ -819,24 +822,27 @@ def _normalize_negotiation_billing(
             context, f"field 'mode' is not 'relay_time': {mode!r}", payload
         )
     unit = _require_str(payload, "unit", context)
-    if unit != "points/min":
+    if unit != "points/h":
         _raise_malformed_response(
-            context, f"field 'unit' is not 'points/min': {unit!r}", payload
+            context, f"field 'unit' is not 'points/h': {unit!r}", payload
         )
-    return {
+    billing: NegotiationBilling = {
         "mode": "relay_time",
-        "points_per_minute": _require_number(payload, "points_per_minute", context),
+        "points_per_hour": _require_number(payload, "points_per_hour", context),
         "max_duration_required": _require_bool(
             payload, "max_duration_required", context
         ),
-        "max_duration_minutes": _require_optional_number(
-            payload, "max_duration_minutes", context
-        ),
-        "estimated_charge": _require_optional_number(
-            payload, "estimated_charge", context
-        ),
-        "unit": "points/min",
+        "unit": "points/h",
     }
+    if "max_duration_minutes" in payload:
+        billing["max_duration_minutes"] = _require_optional_number(
+            payload, "max_duration_minutes", context
+        )
+    if "estimated_charge" in payload:
+        billing["estimated_charge"] = _require_optional_number(
+            payload, "estimated_charge", context
+        )
+    return billing
 
 
 def _normalize_agent_info_payload(value: object, *, context: str) -> AgentInfo:
@@ -2540,9 +2546,9 @@ class AgentInterface:
         self.name: str | None = None
         """Display name shown in broker listings."""
         self.charge: int = 10000
-        """Default charge in points before any charge_func override."""
-        self.relay_points_per_minute: int | float | None = None
-        """Interactive relay price in points/minute; batch `charge` remains separate."""
+        """Default charge: points for batch jobs, points/hour for interactive jobs."""
+        self.interactive: bool = False
+        """Whether this agent declares an interactive job instead of a batch job."""
         self.job_error_detail_level: JobErrorDetailLevel = "traceback"
         """How much structured error detail to expose when a job fails."""
         self.convention: str = ""
@@ -2588,21 +2594,19 @@ class AgentInterface:
                 getattr(self, item_type), "_get_template"
             )()
 
-        relay_points_per_minute = self._active_relay_points_per_minute(config_dict)
-        config_dict["charge"] = (
-            relay_points_per_minute
-            if relay_points_per_minute is not None
-            else self.charge
-        )
-        if relay_points_per_minute is not None:
-            config_dict["billing"] = {
+        if not isinstance(self.charge, int) or isinstance(self.charge, bool):
+            raise TypeError("charge must be int")
+
+        points_per_hour = self._active_interactive_points_per_hour(config_dict)
+        config_dict["charge"] = self.charge
+        if points_per_hour is not None:
+            billing: RelayTimeBillingDeclaration = {
                 "mode": "relay_time",
-                "points_per_minute": relay_points_per_minute,
-                "max_duration_required": True,
-                "max_duration_minutes": None,
-                "estimated_charge": None,
-                "unit": "points/min",
+                "points_per_hour": points_per_hour,
+                "max_duration_required": points_per_hour > 0,
+                "unit": "points/h",
             }
+            config_dict["billing"] = billing
         config_dict["user_info_request"] = [
             field.value for field in self.user_info_request
         ]
@@ -2621,10 +2625,10 @@ class AgentInterface:
 
         return config_dict
 
-    def _active_relay_points_per_minute(
+    def _active_interactive_points_per_hour(
         self, config_dict: Mapping[str, Any]
-    ) -> int | float | None:
-        if self.relay_points_per_minute is None:
+    ) -> int | None:
+        if not self.interactive:
             return None
         output = config_dict.get("output")
         if not isinstance(output, Mapping):
@@ -2636,8 +2640,8 @@ class AgentInterface:
             value in ("relay_file", "relay_media", "relay_session")
             for value in output_types.values()
         ):
-            return self.relay_points_per_minute
-        return None
+            return self.charge
+        raise RuntimeError("interactive jobs require a relay output")
 
     def has_func(self, func_name: str) -> bool:
         return func_name in self.func_dict
@@ -5322,50 +5326,36 @@ class Agent:
         self.interface.description = description
 
     @property
-    def charge(self):
+    def charge(self) -> int:
         """Default charge used when no `charge_func` is provided.
 
+        For batch jobs, this is total points per job. For interactive jobs
+        (`agent.interactive = True`), this is points/hour.
         Note: The broker platform fee is 20% plus 10% per requested user info
         field (deducted from the agent payout).
         """
         return self.interface.charge
 
     @charge.setter
-    def charge(self, charge: int):
+    def charge(self, charge: int) -> None:
+        if not isinstance(charge, int) or isinstance(charge, bool):
+            raise TypeError("charge must be int")
         self.interface.charge = charge
 
     @property
-    def relay_points_per_minute(self) -> int | float | None:
-        """Interactive relay price in points/minute.
+    def interactive(self) -> bool:
+        """Declare this agent as an interactive job.
 
-        This is used for relay_file, relay_media, and relay_session outputs and
-        leaves `charge` available for ordinary batch jobs.
+        Interactive jobs use `charge` as points/hour and require a relay
+        output. Batch jobs use `charge` as total points per job.
         """
-        return self.interface.relay_points_per_minute
+        return self.interface.interactive
 
-    @relay_points_per_minute.setter
-    def relay_points_per_minute(self, points_per_minute: int | float | None) -> None:
-        if points_per_minute is None:
-            self.interface.relay_points_per_minute = None
-            return
-        if not isinstance(points_per_minute, (int, float)) or isinstance(
-            points_per_minute, bool
-        ):
-            raise TypeError("relay_points_per_minute must be a number or None")
-        if points_per_minute <= 0:
-            raise ValueError("relay_points_per_minute must be > 0")
-        self.interface.relay_points_per_minute = points_per_minute
-
-    @property
-    def interactive_points_per_minute(self) -> int | float | None:
-        """Alias for `relay_points_per_minute`."""
-        return self.relay_points_per_minute
-
-    @interactive_points_per_minute.setter
-    def interactive_points_per_minute(
-        self, points_per_minute: int | float | None
-    ) -> None:
-        self.relay_points_per_minute = points_per_minute
+    @interactive.setter
+    def interactive(self, interactive: bool) -> None:
+        if not isinstance(interactive, bool):
+            raise TypeError("interactive must be bool")
+        self.interface.interactive = interactive
 
     @property
     def job_error_detail_level(self) -> JobErrorDetailLevel:

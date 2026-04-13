@@ -77,7 +77,6 @@ def build_agent(file_path: Path) -> Agent:
         agent.agent_auth = agent_auth
         agent.description = "Streams a large local file through the broker relay path."
         agent.charge = 1
-        agent.relay_points_per_minute = 1
         agent.output.archive = RelayFile(
             name=file_path.name,
             content_type="application/octet-stream",

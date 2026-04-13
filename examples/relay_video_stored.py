@@ -94,8 +94,8 @@ def build_agent(file_path: Path) -> Agent:
             "Returns a playable video handle that the broker can relay without"
             " storing the media bytes permanently."
         )
-        agent.charge = 1
-        agent.relay_points_per_minute = 1
+        agent.interactive = True
+        agent.charge = 60
         agent.output.preview = RelayMedia(
             name=file_path.name,
             content_type=content_type,
