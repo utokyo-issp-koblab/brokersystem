@@ -595,7 +595,7 @@ def test_serve_relay_asset_sends_binary_chunks_and_eof(tmp_path) -> None:
     agent = build_agent()
     asset_dir = tmp_path / "hls"
     asset_dir.mkdir()
-    (asset_dir / "index.m3u8").write_text("#EXTM3U\nsegment000.ts\n", encoding="utf-8")
+    (asset_dir / "index.m3u8").write_bytes(b"#EXTM3U\nsegment000.ts\n")
     metadata = agent.register_relay_assets(
         RelayAssetSource(root_dir=asset_dir, entry_path="index.m3u8"),
         "preview.m3u8",

@@ -1,24 +1,28 @@
-[tool.poetry]
+[project]
 name = "brokersystem"
 version = "0.3.7"
 description = "A Python module for communicating with brokersystem"
 license = "ISC"
-authors = ["chocolate <you@example.com>"]
+authors = [
+    { name = "chocolate", email = "you@example.com" },
+]
 readme = "README.md"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "requests~=2.31",
+    "logzero~=1.7",
+    "pandas>=2.0,<4.0",
+    "pillow>=10.0",
+    "websocket-client~=1.8",
+]
 
-[tool.poetry.dependencies]
-python = "^3.11"
-requests = "^2.31"
-logzero = "^1.7"
-pandas = "^2.0"
-pillow = ">=10.0"
-websocket-client = "^1.8"
-
-[tool.poetry.group.dev.dependencies]
-pytest = "^7.4"
-responses = "^0.25"
-black = "^26.1.0"
-pyright = "^1.1.408"
+[dependency-groups]
+dev = [
+    "pytest~=7.4",
+    "responses~=0.25",
+    "black~=26.1",
+    "pyright~=1.1",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -30,5 +34,5 @@ include = ["brokersystem", "tests"]
 
 
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
